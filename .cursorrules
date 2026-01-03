@@ -31,6 +31,8 @@
 - Ask for clarification when requirements are ambiguous
 - Verify dependencies and versions before implementing
 - Test changes locally when possible before committing
+- **ALWAYS run full pre-commit validation before committing** - don't assume "it compiles" is enough
+- **CI failures are expensive** - catch issues locally to avoid wasting hours on failed deployments
 
 ### Code Quality Standards
 - All code must pass `cargo fmt` and `cargo clippy` checks
@@ -38,6 +40,45 @@
 - Follow Rust naming conventions (snake_case for functions/variables, PascalCase for types)
 - Prefer `Result<T>` over panics for error handling
 - Use appropriate error types (avoid generic `anyhow` where specific errors are better)
+
+### Pre-Commit Validation (MANDATORY)
+**Before committing ANY code changes, you MUST run ALL of these checks locally:**
+1. **Formatting Check**: `cargo fmt --all -- --check`
+   - Must pass with no diffs
+   - If it fails, run `cargo fmt --all` and review changes
+2. **Clippy Check**: `cargo clippy --all-targets --all-features -- -D warnings`
+   - Must pass with zero warnings (warnings are treated as errors)
+   - Fix all clippy suggestions before committing
+3. **Test Check**: `cargo test --locked --all-features`
+   - All tests must pass
+   - Use `--locked` to ensure Cargo.lock is up to date
+4. **Build Check**: `cargo build --release --locked`
+   - Release build must succeed
+   - Use `--locked` to match CI environment
+5. **Cargo.lock Validation**: 
+   - Verify `Cargo.lock` exists and is committed (NOT in .gitignore)
+   - Run `cargo generate-lockfile` if lockfile is missing
+   - Ensure lockfile is up to date with Cargo.toml
+6. **Cargo.toml Validation**:
+   - Verify all workspace dependencies are correctly specified
+   - Check for version conflicts or incompatible features
+   - Ensure feature flags are properly configured
+7. **Docker Build Validation** (if Dockerfile changed):
+   - Verify Dockerfile syntax: `docker buildx build --dry-run .`
+   - Ensure Cargo.lock is included in Docker context
+   - Check that all COPY commands reference existing files
+8. **Fly.io Config Validation**:
+   - Verify `fly.toml` and `fly.dev.toml` exist
+   - Ensure app names are different between dev and prod
+   - Check that ENVIRONMENT variables are correctly set
+   - Validate that release_command paths exist
+9. **Environment Separation Check**:
+   - Verify dev and prod configs use different app names
+   - Ensure SSM paths use correct environment normalization (/dev vs /prod)
+   - Check that deployment workflows reference correct config files
+
+**Failure to run these checks before committing will result in CI failures and wasted time.**
+**If any check fails locally, DO NOT commit until it's fixed.**
 
 ### File Organization
 - Keep related code together
@@ -90,4 +131,41 @@
 - Build Docker images in GitHub Actions, not remotely
 - Deploy pre-built images to Fly.io using `--image` flag
 - Enforce environment separation at workflow level
+- All CI checks must pass before merging (fmt, clippy, test, build, Docker)
+
+### Pre-Commit Checklist (Run Before Every Commit)
+**This checklist MUST be completed before committing code:**
+
+```bash
+# 1. Format check
+cargo fmt --all -- --check || (cargo fmt --all && echo "Formatting fixed, review changes")
+
+# 2. Clippy check (warnings as errors)
+cargo clippy --all-targets --all-features -- -D warnings
+
+# 3. Test check (with lockfile)
+cargo test --locked --all-features
+
+# 4. Build check (release with lockfile)
+cargo build --release --locked
+
+# 5. Verify Cargo.lock exists and is committed
+git ls-files Cargo.lock || (cargo generate-lockfile && git add Cargo.lock)
+
+# 6. Verify Cargo.lock is not in .gitignore
+grep -q "^Cargo.lock$" .gitignore && echo "ERROR: Cargo.lock should NOT be in .gitignore for applications"
+
+# 7. Check for common issues
+cargo tree --duplicates  # Check for duplicate dependencies
+cargo outdated  # Check for outdated dependencies (optional)
+
+# 8. If Dockerfile changed, validate it
+docker buildx build --dry-run . 2>&1 | grep -i error || echo "Dockerfile syntax OK"
+
+# 9. Verify Fly.io configs
+[ -f fly.toml ] && [ -f fly.dev.toml ] || echo "WARNING: Missing Fly.io config files"
+[ "$(grep '^app = ' fly.toml | cut -d'"' -f2)" != "$(grep '^app = ' fly.dev.toml | cut -d'"' -f2)" ] || echo "ERROR: Dev and prod app names must be different"
+```
+
+**If ANY of these checks fail, DO NOT commit. Fix the issues first.**
 
