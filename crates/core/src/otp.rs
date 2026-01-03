@@ -10,13 +10,7 @@ pub struct OtpService {
 impl OtpService {
     pub fn new(secret: &str) -> anyhow::Result<Self> {
         let secret = Secret::Encoded(secret.to_string());
-        let totp = TOTP::new(
-            totp_rs::Algorithm::SHA1,
-            6,
-            1,
-            30,
-            secret.to_bytes()?,
-        )?;
+        let totp = TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret.to_bytes()?)?;
         Ok(Self { totp })
     }
 
@@ -28,4 +22,3 @@ impl OtpService {
         self.totp.check_current(code).unwrap_or(false)
     }
 }
-

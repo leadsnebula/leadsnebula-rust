@@ -3,6 +3,7 @@ use webauthn_rs::prelude::*;
 
 #[cfg(feature = "webauthn")]
 pub struct WebAuthnService {
+    #[allow(dead_code)] // Placeholder implementation
     webauthn: Webauthn,
 }
 
@@ -16,3 +17,4 @@ impl WebAuthnService {
         Ok(Self { webauthn })
     }
 }
+
