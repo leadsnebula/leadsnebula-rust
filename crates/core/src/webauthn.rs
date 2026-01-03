@@ -17,4 +17,3 @@ impl WebAuthnService {
         Ok(Self { webauthn })
     }
 }
-
