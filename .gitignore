@@ -1,0 +1,46 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# Documentation (external only - no .md files except README.md)
+# Note: This is handled by .cursorrules, but adding here for safety
+# *.md
+# !README.md
+
+# Docker
+.dockerignore
+
+# Fly.io
+.fly/
+
+# Test coverage
+/coverage/
+
+# Backup files
+*~
+*.orig

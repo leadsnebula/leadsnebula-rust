@@ -1,0 +1,121 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.cursorrules'
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: 'Type "deploy-production" to confirm'
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to Production Environment
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify environment and config
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.confirm_production }}" != "deploy-production" ]; then
+              echo "ERROR: Production deployment requires confirmation. Type 'deploy-production' in the input field."
+              exit 1
+            fi
+          fi
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "ERROR: This workflow only deploys from main branch"
+            exit 1
+          fi
+          if [ ! -f "fly.toml" ]; then
+            echo "ERROR: fly.toml not found"
+            exit 1
+          fi
+          if [ -f "fly.dev.toml" ]; then
+            DEV_APP=$(grep '^app = ' fly.dev.toml | cut -d'"' -f2)
+            PROD_APP=$(grep '^app = ' fly.toml | cut -d'"' -f2)
+            if [ "$DEV_APP" = "$PROD_APP" ]; then
+              echo "ERROR: fly.toml and fly.dev.toml have the same app name - environments not separated"
+              exit 1
+            fi
+          fi
+          APP_NAME=$(grep '^app = ' fly.toml | cut -d'"' -f2)
+          if [ -z "$APP_NAME" ]; then
+            echo "ERROR: Could not extract app name from fly.toml"
+            exit 1
+          fi
+          echo "APP_NAME=${APP_NAME}" >> $GITHUB_ENV
+          echo "Deploying to: ${APP_NAME}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-production
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Install Fly CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io Production
+        run: |
+          VERIFY_APP=$(grep '^app = ' fly.toml | cut -d'"' -f2)
+          if [ "$VERIFY_APP" != "${{ env.APP_NAME }}" ]; then
+            echo "ERROR: App name mismatch detected before deployment"
+            exit 1
+          fi
+          if [ -f "fly.dev.toml" ]; then
+            DEV_APP=$(grep '^app = ' fly.dev.toml | cut -d'"' -f2)
+            if [ "$VERIFY_APP" = "$DEV_APP" ]; then
+              echo "ERROR: Production and dev apps are the same - cross-environment deployment prevented"
+              exit 1
+            fi
+          fi
+          flyctl deploy \
+            --image ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-production \
+            --config fly.toml \
+            --app ${{ env.APP_NAME }} \
+            --remote-only=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Health check
+        run: |
+          for i in {1..10}; do
+            sleep $((2 ** (i-1)))
+            if curl -f https://${{ env.APP_NAME }}.fly.dev/health; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Health check attempt $i failed, retrying..."
+          done
+          echo "Health check failed after 10 attempts"
+          exit 1
+

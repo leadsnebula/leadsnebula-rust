@@ -1,0 +1,39 @@
+[package]
+name = "leadsnebula-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "create-user"
+path = "src/bin/create-user.rs"
+
+[[bin]]
+name = "run-migrations"
+path = "src/bin/run-migrations.rs"
+
+[[bin]]
+name = "update-password"
+path = "src/bin/update-password.rs"
+
+[[bin]]
+name = "update-redis-url"
+path = "src/bin/update-redis-url.rs"
+
+[[bin]]
+name = "fetch-ssm-values"
+path = "src/bin/fetch-ssm-values.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "migrate"] }
+leadsnebula_core = { path = "../core" }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+

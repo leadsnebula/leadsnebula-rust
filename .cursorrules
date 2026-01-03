@@ -1,0 +1,93 @@
+# LeadsNebula Rust Application Rules
+
+## Core Principles
+
+### Simplicity and Elegance First
+- Prioritize simple, elegant solutions over complex ones
+- Avoid over-engineering
+- Prefer standard library and well-established patterns
+- Code should be self-documenting through clear naming
+
+### No Clutter Policy
+- No temporary solutions (unless troubleshooting or debugging)
+- No band-aids or workarounds
+- Remove debug code, test endpoints, and unused files immediately
+- Keep the codebase lean and focused
+
+### Professional Organization
+- Follow Rust conventions and best practices
+- Use workspace structure for multi-crate projects
+- Organize code into logical modules
+- Maintain consistent naming and structure
+
+### Documentation Policy (External Only)
+- No documentation files in the repository root (except README.md)
+- All documentation maintained externally (wiki, knowledge base, etc.)
+- README.md should be minimal and focused on essential development information only
+- Code should be self-documenting through clear naming and structure
+
+### No Assumptions
+- Never make assumptions about requirements or implementation
+- Ask for clarification when requirements are ambiguous
+- Verify dependencies and versions before implementing
+- Test changes locally when possible before committing
+
+### Code Quality Standards
+- All code must pass `cargo fmt` and `cargo clippy` checks
+- Use `--locked` flag for all cargo commands in CI/CD
+- Follow Rust naming conventions (snake_case for functions/variables, PascalCase for types)
+- Prefer `Result<T>` over panics for error handling
+- Use appropriate error types (avoid generic `anyhow` where specific errors are better)
+
+### File Organization
+- Keep related code together
+- Use modules to organize functionality
+- Avoid deep nesting (max 3-4 levels)
+- Group imports logically (std, external, internal)
+
+### Lean Application Philosophy
+- Only include dependencies that are actively used
+- Use feature flags for optional heavy dependencies
+- Remove unused transitive dependencies regularly
+- Optimize for build time and binary size
+
+### No Hardcoding Policy
+- Never hardcode values that should be configurable
+- Use configuration files, environment variables, or computed values
+- Configuration files are the single source of truth
+- Avoid duplicating values across multiple places
+- Prefer reading from config over hardcoding in code or workflows
+- Extract values from config files dynamically rather than hardcoding
+
+## Implementation Guidelines
+
+### Dependencies
+- Minimize dependencies
+- Use feature flags for optional components (Sentry, WebAuthn, OTP)
+- Audit and remove unused transitive dependencies regularly
+- Prefer well-maintained crates with active communities
+
+### Error Handling
+- Use `Result<T, E>` for recoverable errors
+- Use appropriate error types (avoid generic errors where specific ones are better)
+- Log errors appropriately (use Sentry for production)
+- Provide meaningful error messages
+
+### Configuration
+- Load configuration from SSM Parameter Store in production
+- Fall back to environment variables in development
+- Use batched SSM fetches to reduce latency
+- Cache configuration values appropriately
+
+### Testing
+- Write tests for critical functionality
+- Use integration tests for API endpoints
+- Keep tests fast and focused
+
+### CI/CD
+- All workflows must use `Swatinem/rust-cache@v2` for dependency caching
+- Use `--locked` flag for all cargo commands
+- Build Docker images in GitHub Actions, not remotely
+- Deploy pre-built images to Fly.io using `--image` flag
+- Enforce environment separation at workflow level
+

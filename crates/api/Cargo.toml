@@ -1,0 +1,36 @@
+[package]
+name = "leadsnebula-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "leadsnebula-api"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+leadsnebula_core = { path = "../core" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+dotenv = { workspace = true }
+
+# Optional features
+sentry = { version = "0.32", optional = true }
+sentry-tower = { version = "0.32", optional = true }
+
+[features]
+default = []
+sentry = ["dep:sentry", "dep:sentry-tower", "leadsnebula_core/sentry"]
+
