@@ -141,8 +141,28 @@ if [ -f "Dockerfile" ]; then
     echo ""
 fi
 
-# 8. Fly.io config validation
-echo "8️⃣  Validating Fly.io configs..."
+# 8. GitHub Actions workflow validation
+if [ -d ".github/workflows" ]; then
+    echo "8️⃣  Validating GitHub Actions workflows..."
+    for workflow in .github/workflows/*.yml; do
+        if [ -f "$workflow" ]; then
+            # Check if workflow pushes to GHCR but doesn't have packages: write permission
+            if grep -q "ghcr.io" "$workflow" && grep -q "push: true" "$workflow"; then
+                if ! grep -q "packages: write" "$workflow"; then
+                    echo "❌ $workflow pushes to GHCR but missing 'packages: write' permission"
+                    echo "   Add 'permissions: { packages: write }' to the job"
+                    ERRORS=$((ERRORS + 1))
+                else
+                    echo "✅ $workflow has correct GHCR permissions"
+                fi
+            fi
+        fi
+    done
+    echo ""
+fi
+
+# 9. Fly.io config validation
+echo "9️⃣  Validating Fly.io configs..."
 if [ ! -f "fly.toml" ]; then
     echo "⚠️  fly.toml not found (may be OK for dev-only setup)"
 elif [ ! -f "fly.dev.toml" ]; then
@@ -167,8 +187,8 @@ else
 fi
 echo ""
 
-# 9. Check for duplicate dependencies
-echo "9️⃣  Checking for duplicate dependencies..."
+# 10. Check for duplicate dependencies
+echo "🔟 Checking for duplicate dependencies..."
 if cargo tree --duplicates 2>/dev/null | grep -q "(*)$"; then
     echo "⚠️  Duplicate dependencies found. Review with 'cargo tree --duplicates'"
 else
