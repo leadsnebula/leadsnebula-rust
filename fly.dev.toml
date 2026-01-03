@@ -1,0 +1,59 @@
+# Fly.io configuration for leadsnebula-rust-dev
+# Development environment
+
+app = "leadsnebula-rust-dev"
+primary_region = "lax"
+
+# Release command runs migrations before starting the app
+release_command = "/app/run-migrations"
+
+[build]
+
+[env]
+  ENVIRONMENT = "development"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0  # Can scale to zero in dev
+  processes = ["app"]
+  # Idle timeout: 5 hours (18000 seconds) - machines stay running longer
+  idle_timeout = "5h"
+
+[[services]]
+  internal_port = 8080
+  processes = ["app"]
+  protocol = "tcp"
+  script_checks = []
+
+  [[services.http_checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+    tls_skip_verify = false
+
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+    type = "connections"
+
+  [[services.ports]]
+    force_https = true
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512  # Lower memory for dev
+

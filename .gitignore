@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+# Note: Cargo.lock is committed for binaries (not ignored)
+
+# Environment
+.env
+.env.local
+.env.*.local
+# Note: .env.local.example is committed as a template
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Helper scripts (not committed to avoid code contamination)
+scripts/

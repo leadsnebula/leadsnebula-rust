@@ -1,0 +1,57 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SSMReadParameters",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/leadsnebula/production/rust/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/production/shared/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/staging/rust/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/staging/shared/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/development/rust/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/development/shared/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/prod/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/dev/*"
+      ]
+    },
+    {
+      "Sid": "SSMWriteParameters",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:DeleteParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/leadsnebula/production/rust/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/production/shared/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/staging/rust/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/staging/shared/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/development/rust/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/development/shared/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/prod/*",
+        "arn:aws:ssm:*:*:parameter/leadsnebula/dev/*"
+      ]
+    },
+    {
+      "Sid": "KMSDecryptForSSM",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.*.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+
+

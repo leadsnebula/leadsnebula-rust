@@ -1,0 +1,100 @@
+# Cursor AI Rules for LeadsNebula Rust Project
+
+## Core Principles
+
+### Simplicity and Elegance First
+- Prioritize simplicity and elegance in all solutions
+- Prefer clean, minimal code over complex workarounds
+- Avoid over-engineering
+- Choose the simplest solution that works correctly
+
+### No Clutter Policy
+- Keep the repository root clean - only essential files
+- No temporary files, test files, or debugging artifacts in the repo
+- No band-aid solutions or quick fixes that should be permanent
+- Remove temporary code after debugging/troubleshooting is complete
+- No unnecessary comments, TODOs, or dead code
+
+### Professional Organization
+- Follow Rust best practices and conventions
+- Maintain clean code structure
+- Organize code logically and consistently
+- Use appropriate abstractions, but don't over-abstract
+
+### Documentation Policy
+- **DO NOT create documentation files in the repository**
+- Documentation lives externally (wiki, Notion, knowledge base, etc.)
+- The only exception is README.md, which should be minimal and focused
+- If documentation must be created, ask first and place in `docs/` subdirectory only
+- Never create multiple documentation files for the same topic
+
+### No Assumptions
+- **Never make assumptions about user preferences**
+- Always ask before:
+  - Creating new files (especially documentation)
+  - Adding dependencies
+  - Making architectural decisions
+  - Creating temporary solutions
+  - Adding features not explicitly requested
+- When in doubt, ask the user
+
+### Code Quality Standards
+- No temporary solutions unless explicitly for troubleshooting/debugging
+- Remove all temporary code after debugging is complete
+- No band-aid fixes - implement proper solutions
+- Clean up after yourself - remove unused code, imports, files
+- Follow DRY (Don't Repeat Yourself) principles
+- Write self-documenting code (code should be clear without excessive comments)
+
+### File Organization
+- Keep root directory minimal: only essential files (README.md, Cargo.toml, Dockerfile, etc.)
+- Organize code in appropriate crates/modules
+- Use consistent naming conventions
+- Group related functionality together
+
+### Before Taking Action
+- If an action might violate these rules, **consult the user first**
+- Ask about preferences for:
+  - File locations
+  - Code organization
+  - Documentation needs
+  - Dependencies
+  - Architecture decisions
+
+### Lean Application Philosophy
+- Every line of code should have a purpose
+- Remove unused code, imports, and dependencies
+- Avoid feature bloat
+- Keep the codebase maintainable and understandable
+- Prefer standard library solutions over external dependencies when possible
+
+### No Hardcoding Policy
+- Never hardcode values that should be configurable
+- Use configuration files, environment variables, or computed values
+- Configuration files are the single source of truth
+- Avoid duplicating values across multiple places
+- Prefer reading from config over hardcoding in code or workflows
+
+## Specific Rules
+
+1. **Never create .md files in root** (except README.md updates when explicitly requested)
+2. **Never create temporary files** that should be cleaned up later
+3. **Always ask before** creating new files or making organizational changes
+4. **Remove debugging code** after troubleshooting is complete
+5. **Clean up imports** and unused code in every change
+6. **Follow Rust conventions** (cargo fmt, cargo clippy standards)
+7. **Keep commits focused** - one logical change per commit
+8. **No TODO comments** unless explicitly requested
+9. **No dead code** - remove unused functions, structs, etc.
+
+## When to Ask
+
+Ask the user before:
+- Creating any new file (especially documentation)
+- Adding a new dependency
+- Making architectural changes
+- Creating temporary solutions
+- Adding features not explicitly requested
+- Making changes that affect project structure
+- Any action that might create clutter or violate these principles
+

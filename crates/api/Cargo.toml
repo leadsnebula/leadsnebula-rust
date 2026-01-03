@@ -1,0 +1,47 @@
+[package]
+name = "leadsnebula-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "leadsnebula-api"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sentry.workspace = true
+sentry-tower.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+
+# Internal crates
+leadsnebula-core = { path = "../core" }
+leadsnebula-models = { path = "../models" }
+leadsnebula-services = { path = "../services" }
+leadsnebula-utils = { path = "../utils" }
+
+# Local development
+dotenvy.workspace = true
+qrcode.workspace = true
+webauthn-rs.workspace = true
+rand.workspace = true
+base64.workspace = true
+
+# Redis and rate limiting
+redis.workspace = true
+parking_lot.workspace = true

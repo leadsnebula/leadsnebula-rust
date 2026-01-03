@@ -1,0 +1,66 @@
+# Fly.io configuration for leadsnebula-rust
+# Production-ready configuration following Fly.io best practices
+
+app = "leadsnebula-rust"
+primary_region = "lax"
+
+# Release command runs migrations before starting the app
+# This is the proper way to handle database migrations on Fly.io
+# The command runs in a separate one-off VM before the app starts
+release_command = "/app/run-migrations"
+
+[build]
+
+[env]
+  ENVIRONMENT = "production"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+  # Idle timeout: 3 hours (10800 seconds) - production machines stay running longer
+  idle_timeout = "3h"
+
+[[services]]
+  internal_port = 8080
+  processes = ["app"]
+  protocol = "tcp"
+  script_checks = []
+
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+    tls_skip_verify = false
+
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+    type = "connections"
+
+  [[services.ports]]
+    force_https = true
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.tcp_checks]]
+    grace_period = "1s"
+    interval = "15s"
+    restart_limit = 0
+    timeout = "2s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024
