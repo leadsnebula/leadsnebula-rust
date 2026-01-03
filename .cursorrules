@@ -64,9 +64,14 @@
    - Check for version conflicts or incompatible features
    - Ensure feature flags are properly configured
 7. **Docker Build Validation** (if Dockerfile changed):
-   - Verify Dockerfile syntax: `docker buildx build --dry-run .`
-   - Ensure Cargo.lock is included in Docker context
+   - **CRITICAL**: Verify Rust version in Dockerfile supports Cargo.lock version
+     - Cargo.lock version 4 requires Rust 1.78+ (use `rust:bookworm` or `rust:latest`)
+     - Check Cargo.lock version: `head -3 Cargo.lock | grep version`
+     - Verify Dockerfile uses compatible Rust version
+   - Build Docker image locally: `docker buildx build --platform linux/amd64 .`
+   - Ensure Cargo.lock is included in Docker context (COPY Cargo.toml Cargo.lock ./)
    - Check that all COPY commands reference existing files
+   - Test that `cargo fetch --locked` works in Docker build
 8. **Fly.io Config Validation**:
    - Verify `fly.toml` and `fly.dev.toml` exist
    - Ensure app names are different between dev and prod

@@ -2,7 +2,8 @@
 # Optimized for fast builds with cache mounts and parallel compilation
 
 # Builder stage
-FROM rust:1.75-bookworm AS builder
+# Use latest stable Rust to support Cargo.lock version 4
+FROM rust:bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

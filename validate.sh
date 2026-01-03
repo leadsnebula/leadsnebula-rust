@@ -82,10 +82,25 @@ echo ""
 if [ -f "Dockerfile" ]; then
     echo "7️⃣  Validating Dockerfile..."
     if command -v docker > /dev/null 2>&1; then
-        if docker buildx build --dry-run . > /dev/null 2>&1; then
-            echo "✅ Dockerfile syntax OK"
+        # Check if Docker daemon is running
+        if ! docker info > /dev/null 2>&1; then
+            echo "⚠️  Docker daemon not running, skipping Docker build validation"
         else
-            echo "⚠️  Dockerfile validation skipped (docker not available or build failed)"
+            # Try to build the Docker image (just validation, don't push)
+            echo "   Building Docker image for validation (this may take a while)..."
+            if docker buildx build --load --platform linux/amd64 -t leadsnebula-rust:validate . > /tmp/docker-build.log 2>&1; then
+                echo "✅ Dockerfile builds successfully"
+                # Clean up test image
+                docker rmi leadsnebula-rust:validate > /dev/null 2>&1 || true
+            else
+                echo "❌ Docker build failed. Check /tmp/docker-build.log for details."
+                echo "   Common issues:"
+                echo "   - Rust version mismatch (Cargo.lock version 4 requires Rust 1.78+)"
+                echo "   - Missing files in COPY commands"
+                echo "   - Cargo.lock not included in build context"
+                tail -20 /tmp/docker-build.log
+                ERRORS=$((ERRORS + 1))
+            fi
         fi
     else
         echo "⚠️  Docker not available, skipping Dockerfile validation"
