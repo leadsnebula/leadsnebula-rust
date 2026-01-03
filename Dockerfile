@@ -48,9 +48,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/create-user /app/binaries/ && \
     cp /app/target/release/update-password /app/binaries/
 
-# Verify binaries were copied
-RUN ls -la /app/binaries/* || (echo "ERROR: Binaries not found after copy" && exit 1)
-
 # Runtime stage
 FROM debian:bookworm-slim
 

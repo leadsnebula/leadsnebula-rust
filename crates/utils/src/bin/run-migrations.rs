@@ -1,16 +1,36 @@
 use anyhow::Result;
 use leadsnebula_core::services::database::create_pool;
+use leadsnebula_core::ssm::SsmService;
 use sqlx::migrate::Migrator;
 use sqlx::PgPool;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable must be set");
+    // Load DATABASE_URL from SSM (like main app) or fall back to env var
+    let environment = std::env::var("ENVIRONMENT")
+        .or_else(|_| std::env::var("ENV"))
+        .unwrap_or_else(|_| "development".to_string());
+
+    let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
+    let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
+    let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
+    let params = ssm.get_parameters_by_path(&config_path).await?;
+
+    let database_url = params
+        .get(&format!("/leadsnebula/{}/rust/db/connection_url", env_normalized))
+        .cloned()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DATABASE_URL not found in SSM at /leadsnebula/{}/rust/db/connection_url and not in environment variables",
+                env_normalized
+            )
+        })?;
 
     let pool = create_pool(&database_url).await?;
 

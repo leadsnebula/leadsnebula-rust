@@ -87,6 +87,33 @@ jobs:
       - name: Install Fly CLI
         uses: superfly/flyctl-actions/setup-flyctl@master
 
+      - name: Validate Fly.io app and secrets
+        run: |
+          echo "Validating Fly.io app: ${{ env.APP_NAME }}..."
+          
+          # Check if app exists and is accessible
+          if ! flyctl status --app ${{ env.APP_NAME }} > /dev/null 2>&1; then
+            echo "❌ App ${{ env.APP_NAME }} not found or not accessible"
+            echo "Create it with: flyctl apps create ${{ env.APP_NAME }}"
+            exit 1
+          fi
+          
+          # Verify required secrets are documented
+          # Note: flyctl secrets list doesn't show values, so we verify app exists
+          # and provide clear documentation about required secrets
+          echo "✅ App ${{ env.APP_NAME }} is accessible"
+          echo ""
+          echo "⚠️  Required secrets (verify manually or set if missing):"
+          echo "   - ENVIRONMENT (e.g., 'development' or 'production')"
+          echo "   - AWS_ACCESS_KEY_ID (for SSM access)"
+          echo "   - AWS_SECRET_ACCESS_KEY (for SSM access)"
+          echo "   - AWS_REGION (e.g., 'us-east-1')"
+          echo ""
+          echo "Set secrets with: flyctl secrets set KEY=value --app ${{ env.APP_NAME }}"
+          echo "List secrets with: flyctl secrets list --app ${{ env.APP_NAME }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
       - name: Deploy to Fly.io Production
         run: |
           VERIFY_APP=$(grep '^app = ' fly.toml | cut -d'"' -f2)
