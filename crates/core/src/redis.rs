@@ -15,7 +15,7 @@ pub struct RedisClient {
 impl RedisClient {
     pub async fn new(redis_url: &str, env: String, pool_size: u32) -> anyhow::Result<Self> {
         let manager = RedisConnectionManager::new(redis_url)?;
-        
+
         let pool = Pool::builder()
             .max_size(pool_size)
             .min_idle(Some(2))
@@ -48,7 +48,7 @@ impl RedisClient {
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
         let prefixed_key = self.prefix_key(key);
         let mut conn = self.pool.get().await?;
-        
+
         match conn.get::<_, Option<String>>(&prefixed_key).await {
             Ok(value) => Ok(value),
             Err(e) => {
@@ -62,16 +62,22 @@ impl RedisClient {
         self.set_with_ttl(key, value, 0).await
     }
 
-    pub async fn set_with_ttl(&self, key: &str, value: &str, ttl_seconds: u64) -> anyhow::Result<()> {
+    pub async fn set_with_ttl(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_seconds: u64,
+    ) -> anyhow::Result<()> {
         let prefixed_key = self.prefix_key(key);
         let mut conn = self.pool.get().await?;
-        
+
         if ttl_seconds > 0 {
-            conn.set_ex::<_, _, ()>(&prefixed_key, value, ttl_seconds).await?;
+            conn.set_ex::<_, _, ()>(&prefixed_key, value, ttl_seconds)
+                .await?;
         } else {
             conn.set::<_, _, ()>(&prefixed_key, value).await?;
         }
-        
+
         Ok(())
     }
 
@@ -107,4 +113,3 @@ impl RedisClient {
         Ok(result)
     }
 }
-
