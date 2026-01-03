@@ -58,7 +58,22 @@ elif ! git ls-files --error-unmatch Cargo.lock > /dev/null 2>&1; then
     echo "❌ Cargo.lock is not tracked by git. Run 'git add Cargo.lock' and commit it."
     ERRORS=$((ERRORS + 1))
 else
-    echo "✅ Cargo.lock OK"
+    # Check Cargo.lock version and verify Dockerfile Rust version compatibility
+    LOCK_VERSION=$(grep "^version = " Cargo.lock | head -1 | cut -d' ' -f3)
+    if [ "$LOCK_VERSION" = "4" ]; then
+        # Cargo.lock v4 requires Rust 1.78+
+        if [ -f "Dockerfile" ]; then
+            DOCKER_RUST=$(grep "^FROM rust:" Dockerfile | head -1 | cut -d: -f2 | cut -d' ' -f1)
+            if echo "$DOCKER_RUST" | grep -qE "^1\.(7[0-7]|[0-6][0-9])"; then
+                echo "❌ Cargo.lock version 4 requires Rust 1.78+, but Dockerfile uses rust:$DOCKER_RUST"
+                echo "   Update Dockerfile to use 'rust:bookworm' or 'rust:latest'"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "✅ Cargo.lock version $LOCK_VERSION compatible with Dockerfile Rust version"
+            fi
+        fi
+    fi
+    echo "✅ Cargo.lock OK (version $LOCK_VERSION)"
 fi
 
 # Check if Cargo.lock is in .gitignore
