@@ -96,6 +96,15 @@ echo ""
 # 7. Docker validation (if Dockerfile exists)
 if [ -f "Dockerfile" ]; then
     echo "7️⃣  Validating Dockerfile..."
+    
+    # Check for common Dockerfile issues
+    if grep -q "COPY --from=builder.*target/release" Dockerfile && grep -q "type=cache.*target=/app/target" Dockerfile; then
+        echo "❌ Dockerfile uses cache mount for /app/target but COPYs from target/release"
+        echo "   Cache mounts are ephemeral - binaries won't be available for COPY"
+        echo "   Fix: Copy binaries to persistent location (e.g., /app/binaries/) during build"
+        ERRORS=$((ERRORS + 1))
+    fi
+    
     if command -v docker > /dev/null 2>&1; then
         # Check if Docker daemon is running
         if ! docker info > /dev/null 2>&1; then
@@ -105,6 +114,14 @@ if [ -f "Dockerfile" ]; then
             echo "   Building Docker image for validation (this may take a while)..."
             if docker buildx build --load --platform linux/amd64 -t leadsnebula-rust:validate . > /tmp/docker-build.log 2>&1; then
                 echo "✅ Dockerfile builds successfully"
+                # Verify binaries exist in the image
+                if docker run --rm leadsnebula-rust:validate ls -la /app/leadsnebula-api /app/run-migrations /app/create-user /app/update-password > /dev/null 2>&1; then
+                    echo "✅ All required binaries present in Docker image"
+                else
+                    echo "❌ One or more binaries missing in Docker image"
+                    docker run --rm leadsnebula-rust:validate ls -la /app/ 2>&1 | head -10
+                    ERRORS=$((ERRORS + 1))
+                fi
                 # Clean up test image
                 docker rmi leadsnebula-rust:validate > /dev/null 2>&1 || true
             else
@@ -112,8 +129,9 @@ if [ -f "Dockerfile" ]; then
                 echo "   Common issues:"
                 echo "   - Rust version mismatch (Cargo.lock version 4 requires Rust 1.78+)"
                 echo "   - Missing files in COPY commands"
+                echo "   - Cache mount prevents binaries from being accessible"
                 echo "   - Cargo.lock not included in build context"
-                tail -20 /tmp/docker-build.log
+                tail -30 /tmp/docker-build.log
                 ERRORS=$((ERRORS + 1))
             fi
         fi

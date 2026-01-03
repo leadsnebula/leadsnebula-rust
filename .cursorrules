@@ -68,7 +68,13 @@
      - Cargo.lock version 4 requires Rust 1.78+ (use `rust:bookworm` or `rust:latest`)
      - Check Cargo.lock version: `head -3 Cargo.lock | grep version`
      - Verify Dockerfile uses compatible Rust version
+   - **CRITICAL**: Check cache mount + COPY pattern
+     - If using `--mount=type=cache,target=/app/target`, binaries are ephemeral
+     - Must copy binaries to persistent location (e.g., `/app/binaries/`) during build
+     - COPY must reference persistent location, not cache mount path
+     - Pattern: `cp /app/target/release/* /app/binaries/` then `COPY --from=builder /app/binaries/*`
    - Build Docker image locally: `docker buildx build --platform linux/amd64 .`
+   - Verify binaries exist in final image: `docker run --rm <image> ls -la /app/*`
    - Ensure Cargo.lock is included in Docker context (COPY Cargo.toml Cargo.lock ./)
    - Check that all COPY commands reference existing files
    - Test that `cargo fetch --locked` works in Docker build
