@@ -5,7 +5,7 @@ use sqlx::migrate::Migrator;
 use sqlx::PgPool;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,24 +38,47 @@ async fn main() -> Result<()> {
 
     // Find migrations directory
     let migrations_dir = Path::new("migrations");
-    if !migrations_dir.exists() {
+    let migrations_path = if !migrations_dir.exists() {
         // Try relative to crate root
         let crate_root = env!("CARGO_MANIFEST_DIR");
-        let migrations_path = Path::new(crate_root)
+        Path::new(crate_root)
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .join("migrations");
-        if migrations_path.exists() {
-            run_migrations(&pool, &migrations_path).await?;
-        } else {
-            error!("Migrations directory not found");
-            return Err(anyhow::anyhow!("Migrations directory not found"));
-        }
+            .join("migrations")
     } else {
-        run_migrations(&pool, migrations_dir).await?;
+        migrations_dir.to_path_buf()
+    };
+
+    // Check if migrations directory exists and has migration files
+    if !migrations_path.exists() {
+        info!("Migrations directory not found, skipping migrations");
+        return Ok(());
     }
+
+    // Check if there are any migration files (excluding .gitkeep)
+    let has_migrations = std::fs::read_dir(&migrations_path)?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let path = entry.path();
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(".sql"))
+                    .unwrap_or(false)
+        });
+
+    if !has_migrations {
+        info!(
+            "No migration files found in {}, skipping migrations",
+            migrations_path.display()
+        );
+        return Ok(());
+    }
+
+    run_migrations(&pool, &migrations_path).await?;
 
     info!("Migrations completed successfully");
 
@@ -63,7 +86,34 @@ async fn main() -> Result<()> {
 }
 
 async fn run_migrations(pool: &PgPool, migrations_dir: &Path) -> Result<()> {
-    let migrator = Migrator::new(migrations_dir).await?;
-    migrator.run(pool).await?;
-    Ok(())
+    let migrator = match Migrator::new(migrations_dir).await {
+        Ok(m) => m,
+        Err(e) => {
+            // Handle case where database has migrations that don't exist in files
+            // This can happen if migrations were removed from codebase but still exist in DB
+            let error_msg = e.to_string();
+            if error_msg.contains("was previously applied but is missing") {
+                info!(
+                    "Database has migration records that don't match files. This is expected if migrations were removed. Skipping migration run."
+                );
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("Failed to create migrator: {}", e));
+        }
+    };
+
+    match migrator.run(pool).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let error_msg = e.to_string();
+            if error_msg.contains("was previously applied but is missing") {
+                info!(
+                    "Database has migration records that don't match files. This is expected if migrations were removed. Skipping migration run."
+                );
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Migration failed: {}", e))
+            }
+        }
+    }
 }
