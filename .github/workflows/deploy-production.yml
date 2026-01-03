@@ -18,6 +18,9 @@ jobs:
     name: Deploy to Production Environment
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
