@@ -26,8 +26,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL environment variable must be set");
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable must be set");
 
     let pool = create_pool(&database_url).await?;
 
@@ -67,4 +67,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

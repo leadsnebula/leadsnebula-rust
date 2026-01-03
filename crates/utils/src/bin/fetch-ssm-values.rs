@@ -19,22 +19,40 @@ async fn main() -> Result<()> {
     let ssm = SsmService::new(args.environment.clone(), None).await?;
     let env_normalized = leadsnebula_core::normalize_env_for_ssm(&args.environment);
     let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
-    
+
     let params = ssm.get_parameters_by_path(&config_path).await?;
-    
+
     // Map SSM paths to env var names
     let mappings = vec![
-        (format!("/leadsnebula/{}/rust/db/connection_url", env_normalized), "DATABASE_URL"),
-        (format!("/leadsnebula/{}/rust/redis/connection_url", env_normalized), "REDIS_URL"),
-        (format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized), "JWT_SECRET"),
-        (format!("/leadsnebula/{}/rust/monitoring/sentry_dsn", env_normalized), "SENTRY_DSN"),
-        (format!("/leadsnebula/{}/rust/email/from_address", env_normalized), "FROM_EMAIL"),
+        (
+            format!("/leadsnebula/{}/rust/db/connection_url", env_normalized),
+            "DATABASE_URL",
+        ),
+        (
+            format!("/leadsnebula/{}/rust/redis/connection_url", env_normalized),
+            "REDIS_URL",
+        ),
+        (
+            format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized),
+            "JWT_SECRET",
+        ),
+        (
+            format!("/leadsnebula/{}/rust/monitoring/sentry_dsn", env_normalized),
+            "SENTRY_DSN",
+        ),
+        (
+            format!("/leadsnebula/{}/rust/email/from_address", env_normalized),
+            "FROM_EMAIL",
+        ),
     ];
-    
+
     println!("# Values fetched from SSM Parameter Store");
-    println!("# Environment: {} (normalized: {})", args.environment, env_normalized);
+    println!(
+        "# Environment: {} (normalized: {})",
+        args.environment, env_normalized
+    );
     println!();
-    
+
     for (ssm_path, env_var) in mappings {
         if let Some(value) = params.get(&ssm_path) {
             println!("{}={}", env_var, value);
@@ -42,7 +60,6 @@ async fn main() -> Result<()> {
             println!("# {} not found in SSM", env_var);
         }
     }
-    
+
     Ok(())
 }
-

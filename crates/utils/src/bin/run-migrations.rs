@@ -9,8 +9,8 @@ use tracing::{error, info};
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL environment variable must be set");
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable must be set");
 
     let pool = create_pool(&database_url).await?;
 
@@ -21,7 +21,12 @@ async fn main() -> Result<()> {
     if !migrations_dir.exists() {
         // Try relative to crate root
         let crate_root = env!("CARGO_MANIFEST_DIR");
-        let migrations_path = Path::new(crate_root).parent().unwrap().parent().unwrap().join("migrations");
+        let migrations_path = Path::new(crate_root)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("migrations");
         if migrations_path.exists() {
             run_migrations(&pool, &migrations_path).await?;
         } else {
@@ -42,4 +47,3 @@ async fn run_migrations(pool: &PgPool, migrations_dir: &Path) -> Result<()> {
     migrator.run(pool).await?;
     Ok(())
 }
-

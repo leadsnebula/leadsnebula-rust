@@ -1,6 +1,6 @@
 use leadsnebula_core::redis::RedisClient;
-use leadsnebula_core::ssm::SsmService;
 use leadsnebula_core::services::database::create_pool;
+use leadsnebula_core::ssm::SsmService;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::info;
@@ -55,12 +55,18 @@ impl AppConfig {
             })?;
 
         let redis_url = params
-            .get(&format!("/leadsnebula/{}/rust/redis/connection_url", env_normalized))
+            .get(&format!(
+                "/leadsnebula/{}/rust/redis/connection_url",
+                env_normalized
+            ))
             .cloned()
             .or_else(|| std::env::var("REDIS_URL").ok());
 
         let jwt_secret = params
-            .get(&format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized))
+            .get(&format!(
+                "/leadsnebula/{}/rust/auth/jwt_secret",
+                env_normalized
+            ))
             .cloned()
             .or_else(|| std::env::var("JWT_SECRET").ok())
             .ok_or_else(|| {
@@ -71,17 +77,26 @@ impl AppConfig {
             })?;
 
         let sentry_dsn = params
-            .get(&format!("/leadsnebula/{}/rust/monitoring/sentry_dsn", env_normalized))
+            .get(&format!(
+                "/leadsnebula/{}/rust/monitoring/sentry_dsn",
+                env_normalized
+            ))
             .cloned()
             .or_else(|| std::env::var("SENTRY_DSN").ok());
 
         let from_email = params
-            .get(&format!("/leadsnebula/{}/rust/email/from_address", env_normalized))
+            .get(&format!(
+                "/leadsnebula/{}/rust/email/from_address",
+                env_normalized
+            ))
             .cloned()
             .or_else(|| std::env::var("FROM_EMAIL").ok())
             .unwrap_or_else(|| "noreply@leadsnebula.com".to_string());
 
-        info!("Configuration loaded successfully for environment: {}", environment);
+        info!(
+            "Configuration loaded successfully for environment: {}",
+            environment
+        );
 
         Ok(Self {
             database_url,
@@ -105,17 +120,25 @@ impl AppState {
 
         // Create Redis client if URL is provided
         let redis = if let Some(redis_url) = &config.redis_url {
-            info!("Connecting to Redis at {}...", redis_url.split('@').last().unwrap_or("(hidden)"));
+            info!(
+                "Connecting to Redis at {}...",
+                redis_url.split('@').last().unwrap_or("(hidden)")
+            );
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                RedisClient::new(redis_url, config.environment.clone())
-            ).await {
+                RedisClient::new(redis_url, config.environment.clone()),
+            )
+            .await
+            {
                 Ok(Ok(client)) => {
                     info!("Redis connection created successfully");
                     Some(Arc::new(client))
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!("Failed to connect to Redis: {}. Continuing without Redis cache.", e);
+                    tracing::warn!(
+                        "Failed to connect to Redis: {}. Continuing without Redis cache.",
+                        e
+                    );
                     None
                 }
                 Err(_) => {
@@ -139,4 +162,3 @@ impl AppState {
         })
     }
 }
-

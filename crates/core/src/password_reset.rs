@@ -15,13 +15,12 @@ impl PasswordResetService {
         }
     }
 
-    pub async fn send_reset_email(
-        &self,
-        user: &User,
-        reset_token: &str,
-    ) -> anyhow::Result<()> {
-        let reset_url = format!("https://app.leadsnebula.com/reset-password?token={}", reset_token);
-        
+    pub async fn send_reset_email(&self, user: &User, reset_token: &str) -> anyhow::Result<()> {
+        let reset_url = format!(
+            "https://app.leadsnebula.com/reset-password?token={}",
+            reset_token
+        );
+
         let subject = "Reset your password";
         let body_text = format!(
             "Click the following link to reset your password: {}",
@@ -37,4 +36,3 @@ impl PasswordResetService {
             .await
     }
 }
-

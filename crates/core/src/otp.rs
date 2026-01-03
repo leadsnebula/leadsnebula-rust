@@ -16,8 +16,6 @@ impl OtpService {
             1,
             30,
             secret.to_bytes()?,
-            Some("LeadsNebula".to_string()),
-            "user@leadsnebula.com".to_string(),
         )?;
         Ok(Self { totp })
     }
@@ -30,3 +28,4 @@ impl OtpService {
         self.totp.check_current(code).unwrap_or(false)
     }
 }
+

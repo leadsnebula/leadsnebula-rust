@@ -1,10 +1,4 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
 use leadsnebula_core::auth::{verify_password, JwtService};
 use leadsnebula_core::models::user::User;
 use serde::{Deserialize, Serialize};
@@ -83,8 +77,8 @@ async fn login(
     }
 
     // Verify password
-    let password_valid = verify_password(&payload.password, &user.encrypted_password)
-        .unwrap_or(false);
+    let password_valid =
+        verify_password(&payload.password, &user.encrypted_password).unwrap_or(false);
 
     if !password_valid {
         return Ok(Json(LoginResponse {
@@ -113,4 +107,3 @@ async fn login(
         error: None,
     }))
 }
-

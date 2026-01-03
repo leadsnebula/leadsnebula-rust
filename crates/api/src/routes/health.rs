@@ -14,4 +14,3 @@ async fn health_check() -> axum::Json<serde_json::Value> {
         "timestamp": chrono::Utc::now().to_rfc3339(),
     }))
 }
-

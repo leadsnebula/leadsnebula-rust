@@ -14,13 +14,16 @@ pub struct SsmService {
 }
 
 impl SsmService {
-    pub async fn new(env: String, redis: Option<Arc<crate::redis::RedisClient>>) -> anyhow::Result<Self> {
+    pub async fn new(
+        env: String,
+        redis: Option<Arc<crate::redis::RedisClient>>,
+    ) -> anyhow::Result<Self> {
         // Configure AWS SDK - unset AWS_WEB_IDENTITY_TOKEN_FILE to skip web identity token provider
         // which requires sleep_impl. We'll use environment variables for credentials instead.
         std::env::remove_var("AWS_WEB_IDENTITY_TOKEN_FILE");
         std::env::remove_var("AWS_ROLE_ARN");
         std::env::remove_var("AWS_ROLE_SESSION_NAME");
-        
+
         // Load config with explicit sleep_impl
         use aws_smithy_async::rt::sleep::TokioSleep;
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -36,7 +39,11 @@ impl SsmService {
         })
     }
 
-    pub async fn get_parameter(&self, path: &str, with_decryption: bool) -> anyhow::Result<Option<String>> {
+    pub async fn get_parameter(
+        &self,
+        path: &str,
+        with_decryption: bool,
+    ) -> anyhow::Result<Option<String>> {
         // Try cache first
         if let Some(redis) = &self.redis {
             let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
@@ -51,7 +58,8 @@ impl SsmService {
         let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 
         loop {
-            match self.client
+            match self
+                .client
                 .get_parameter()
                 .name(path)
                 .with_decryption(with_decryption)
@@ -64,8 +72,13 @@ impl SsmService {
 
                         // Cache the value
                         if let Some(redis) = &self.redis {
-                            let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
-                            let ttl = if path.contains("/encryption/") { 604800 } else { 86400 }; // 7 days for encryption keys, 1 day for others
+                            let cache_key =
+                                format!("{}:ssm:{}:{}", self.env, path, with_decryption);
+                            let ttl = if path.contains("/encryption/") {
+                                604800
+                            } else {
+                                86400
+                            }; // 7 days for encryption keys, 1 day for others
                             let _ = redis.set_with_ttl(&cache_key, &value, ttl).await;
                         }
 
@@ -82,13 +95,20 @@ impl SsmService {
                         continue;
                     }
                     error!("SSM error for {}: {}", path, e);
-                    return Err(anyhow::anyhow!("Failed to fetch SSM parameter {}: {}", path, e));
+                    return Err(anyhow::anyhow!(
+                        "Failed to fetch SSM parameter {}: {}",
+                        path,
+                        e
+                    ));
                 }
             }
         }
     }
 
-    pub async fn get_parameters_by_path(&self, path_prefix: &str) -> anyhow::Result<HashMap<String, String>> {
+    pub async fn get_parameters_by_path(
+        &self,
+        path_prefix: &str,
+    ) -> anyhow::Result<HashMap<String, String>> {
         // Try cache first
         if let Some(redis) = &self.redis {
             let cache_key = format!("{}:ssm:path:{}", self.env, path_prefix);
@@ -105,7 +125,8 @@ impl SsmService {
         let mut next_token: Option<String> = None;
 
         loop {
-            let mut request = self.client
+            let mut request = self
+                .client
                 .get_parameters_by_path()
                 .path(path_prefix)
                 .recursive(true)
@@ -156,4 +177,3 @@ impl SsmService {
         }
     }
 }
-

@@ -3,7 +3,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use anyhow::anyhow;
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 
 pub struct EncryptionService {
     cipher: Aes256Gcm,
@@ -25,24 +25,24 @@ impl EncryptionService {
             .cipher
             .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
-        
+
         // Combine nonce and ciphertext: nonce (12 bytes) + ciphertext
         let mut combined = nonce.to_vec();
         combined.extend_from_slice(&ciphertext);
-        
+
         Ok(general_purpose::STANDARD.encode(combined))
     }
 
     pub fn decrypt(&self, ciphertext: &str) -> anyhow::Result<String> {
         let combined = general_purpose::STANDARD.decode(ciphertext)?;
-        
+
         if combined.len() < 12 {
             return Err(anyhow!("Invalid ciphertext length"));
         }
-        
+
         let nonce = Nonce::from_slice(&combined[..12]);
         let ciphertext_bytes = &combined[12..];
-        
+
         let plaintext = self
             .cipher
             .decrypt(nonce, ciphertext_bytes)
@@ -50,4 +50,3 @@ impl EncryptionService {
         Ok(String::from_utf8(plaintext)?)
     }
 }
-
