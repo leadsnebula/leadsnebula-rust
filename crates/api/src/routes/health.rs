@@ -14,6 +14,7 @@ pub fn health_routes() -> Router<AppState> {
 }
 
 // Simple liveness check - just confirms the app is running
+// This endpoint doesn't require AppState, so it works even if app initialization fails
 async fn liveness_check() -> Response {
     let body = json!({
         "status": "alive",

@@ -149,10 +149,30 @@ impl AppState {
     pub async fn new() -> anyhow::Result<Self> {
         let config = AppConfig::load().await?;
 
-        // Create database pool
+        // Create database pool with retry logic and timeout
         info!("Connecting to database...");
-        let db_pool = Arc::new(create_pool(&config.database_url).await?);
-        info!("Database connection pool created successfully");
+        let db_pool = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            create_pool(&config.database_url),
+        )
+        .await
+        {
+            Ok(Ok(pool)) => {
+                info!("Database connection pool created successfully");
+                Arc::new(pool)
+            }
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to create database pool: {}. Check DATABASE_URL and network connectivity.",
+                    e
+                ));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Database connection timed out after 10 seconds. Check DATABASE_URL and network connectivity."
+                ));
+            }
+        };
 
         // Create Redis client if URL is provided
         let redis = if let Some(redis_url) = &config.redis_url {

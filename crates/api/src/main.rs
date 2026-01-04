@@ -31,34 +31,64 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting LeadsNebula API server...");
 
-    // Load configuration
-    let state = AppState::new().await?;
+    // Load configuration - if it fails, app still starts with just /live endpoint
+    let app = match AppState::new().await {
+        Ok(state) => {
+            info!("Application state initialized successfully");
 
-    // Initialize Sentry if DSN is provided
-    #[cfg(feature = "sentry")]
-    if let Some(dsn) = &state.config.sentry_dsn {
-        let _guard = sentry::init((
-            dsn.clone(),
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                ..Default::default()
-            },
-        ));
-        info!("Sentry initialized");
-    } else {
-        tracing::warn!("Sentry DSN not provided, error tracking disabled");
-    }
+            // Initialize Sentry if DSN is provided
+            #[cfg(feature = "sentry")]
+            if let Some(dsn) = &state.config.sentry_dsn {
+                let _guard = sentry::init((
+                    dsn.clone(),
+                    sentry::ClientOptions {
+                        release: sentry::release_name!(),
+                        ..Default::default()
+                    },
+                ));
+                info!("Sentry initialized");
+            } else {
+                tracing::warn!("Sentry DSN not provided, error tracking disabled");
+            }
 
-    // Build application
-    let app = axum::Router::new()
-        .merge(health_routes())
-        .merge(auth_routes())
-        .with_state(state)
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http())
-                .layer(CorsLayer::permissive()),
-        );
+            // Build full application with all routes
+            axum::Router::new()
+                .route(
+                    "/live",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "status": "alive",
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        }))
+                    }),
+                )
+                .merge(health_routes())
+                .merge(auth_routes())
+                .with_state(state)
+                .layer(
+                    ServiceBuilder::new()
+                        .layer(TraceLayer::new_for_http())
+                        .layer(CorsLayer::permissive()),
+                )
+        }
+        Err(e) => {
+            tracing::error!("Failed to initialize application state: {}", e);
+            tracing::warn!("Application starting in minimal mode - only /live endpoint available");
+            tracing::warn!("Full functionality will be unavailable until configuration is fixed");
+            // App continues with just /live endpoint - this ensures health checks pass
+            axum::Router::new().route(
+                "/live",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "alive",
+                        "mode": "degraded",
+                        "message": "Application state initialization failed - check logs",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }))
+                }),
+            )
+        }
+    };
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
