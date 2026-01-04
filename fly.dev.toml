@@ -38,5 +38,7 @@ primary_region = "iad"
   tls_skip_verify = false
 
 [deploy]
+  # Release command runs migrations before deployment
+  # If it fails, deployment will still proceed (migrations can be run manually)
   release_command = "/app/run-migrations"
 
