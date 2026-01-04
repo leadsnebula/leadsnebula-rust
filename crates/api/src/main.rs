@@ -32,7 +32,10 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting LeadsNebula API server...");
 
     // Load configuration - if it fails, app still starts with just /live endpoint
-    let app = match AppState::new().await {
+    // Use separate variables to handle different router types
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 8080))).await?;
+
+    match AppState::new().await {
         Ok(state) => {
             info!("Application state initialized successfully");
 
@@ -52,8 +55,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Build full application with all routes
-            // Note: /live is included in health_routes for consistency
-            axum::Router::new()
+            let app = axum::Router::new()
                 .route("/live", axum::routing::get(routes::health::liveness_check))
                 .merge(health_routes())
                 .merge(auth_routes())
@@ -62,33 +64,38 @@ async fn main() -> anyhow::Result<()> {
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
                         .layer(CorsLayer::permissive()),
-                )
+                );
+
+            info!("Server listening on 0.0.0.0:8080");
+            axum::serve(listener, app.into_make_service()).await?;
         }
         Err(e) => {
             tracing::error!("Failed to initialize application state: {}", e);
             tracing::warn!("Application starting in minimal mode - only /live endpoint available");
             tracing::warn!("Full functionality will be unavailable until configuration is fixed");
             // App continues with just /live endpoint - this ensures health checks pass
-            axum::Router::new().route(
-                "/live",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({
-                        "status": "alive",
-                        "mode": "degraded",
-                        "message": "Application state initialization failed - check logs",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    }))
-                }),
-            )
+            let app = axum::Router::new()
+                .route(
+                    "/live",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "status": "alive",
+                            "mode": "degraded",
+                            "message": "Application state initialization failed - check logs",
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        }))
+                    }),
+                )
+                .layer(
+                    ServiceBuilder::new()
+                        .layer(TraceLayer::new_for_http())
+                        .layer(CorsLayer::permissive()),
+                );
+
+            info!("Server listening on 0.0.0.0:8080");
+            axum::serve(listener, app.into_make_service()).await?;
         }
-    };
-
-    // Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    info!("Server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    }
 
     Ok(())
 }

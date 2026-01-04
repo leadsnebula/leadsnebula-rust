@@ -131,18 +131,31 @@ jobs:
       - name: Health check
         run: |
           echo "Waiting for deployment to stabilize before health checks..."
-          sleep 20
+          sleep 30
+          echo "Checking machine status..."
+          # Wait for machine to be in "started" state
+          for i in {1..30}; do
+            STATUS=$(flyctl status --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.Machines[0].State // "unknown"' || echo "unknown")
+            if [ "$STATUS" = "started" ]; then
+              echo "✅ Machine is started"
+              break
+            fi
+            echo "Machine status: $STATUS (attempt $i/30)..."
+            sleep 2
+          done
           echo "Starting health checks..."
           # Use /live endpoint which works even in degraded mode
-          for i in {1..10}; do
-            if curl -f -s --max-time 5 https://${{ env.APP_NAME }}.fly.dev/live > /dev/null 2>&1; then
+          # Wait a bit more for the proxy to be ready
+          sleep 5
+          for i in {1..15}; do
+            if curl -f -s --max-time 10 https://${{ env.APP_NAME }}.fly.dev/live > /dev/null 2>&1; then
               echo "✅ Health check passed on attempt $i"
               exit 0
             fi
             echo "Health check attempt $i failed, retrying in $((i * 2)) seconds..."
             sleep $((i * 2))
           done
-          echo "❌ Health check failed after 10 attempts"
+          echo "❌ Health check failed after 15 attempts"
           echo "Checking app status and logs..."
           flyctl status --app ${{ env.APP_NAME }} || true
           echo "=== Recent logs ==="
