@@ -63,17 +63,28 @@ impl AppConfig {
             .cloned()
             .or_else(|| std::env::var("REDIS_URL").ok());
 
+        // Try multiple possible SSM paths for JWT_SECRET (supporting different path structures)
+        // Also try prod path as fallback for dev environment
         let jwt_secret = params
-            .get(&format!(
-                "/leadsnebula/{}/rust/auth/jwt_secret",
-                env_normalized
-            ))
+            .get(&format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized))
+            .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt/secret_key", env_normalized)))
+            .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt_secret", env_normalized)))
+            .or_else(|| {
+                // Fallback to prod path if dev environment
+                if env_normalized == "dev" {
+                    params.get("/leadsnebula/prod/rust/jwt/secret_key")
+                        .or_else(|| params.get("/leadsnebula/prod/rust/auth/jwt_secret"))
+                } else {
+                    None
+                }
+            })
             .cloned()
             .or_else(|| std::env::var("JWT_SECRET").ok())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "JWT_SECRET not found in SSM at /leadsnebula/{}/rust/auth/jwt_secret",
-                    env_normalized
+                    "JWT_SECRET not found in SSM. Tried paths: /leadsnebula/{}/rust/auth/jwt_secret, /leadsnebula/{}/rust/jwt/secret_key, /leadsnebula/{}/rust/jwt_secret{}",
+                    env_normalized, env_normalized, env_normalized,
+                    if env_normalized == "dev" { ", /leadsnebula/prod/rust/jwt/secret_key, /leadsnebula/prod/rust/auth/jwt_secret" } else { "" }
                 )
             })?;
 
