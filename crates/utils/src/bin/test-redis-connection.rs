@@ -33,7 +33,11 @@ async fn main() -> Result<()> {
     let redis_url = params
         .get("/leadsnebula/prod/rust/redis/connection_url")
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Redis URL not found in SSM at /leadsnebula/prod/rust/redis/connection_url"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Redis URL not found in SSM at /leadsnebula/prod/rust/redis/connection_url"
+            )
+        })?;
 
     let display_url = redis_url
         .split_once("://")
@@ -44,7 +48,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "(hidden)".to_string());
 
     info!("Redis URL: {}...", display_url);
-    info!("Scheme: {}", if redis_url.starts_with("rediss://") { "TLS (rediss://)" } else { "Plain (redis://)" });
+    info!(
+        "Scheme: {}",
+        if redis_url.starts_with("rediss://") {
+            "TLS (rediss://)"
+        } else {
+            "Plain (redis://)"
+        }
+    );
 
     // Test 1: Client::open()
     info!("🔵 Test 1: Creating Redis client with Client::open()...");
@@ -61,11 +72,14 @@ async fn main() -> Result<()> {
     };
 
     // Test 2: client.get_connection_manager() - direct connection (using recommended method)
-    info!("🔵 Test 2: Getting ConnectionManager via client.get_connection_manager() (recommended method for TLS)...");
+    info!("🔵 Test 2: Getting ConnectionManager via client.get_connection_manager() (recommended method)...");
     let start = Instant::now();
     let mut conn: ConnectionManager = match client.get_connection_manager().await {
         Ok(c) => {
-            info!("✅ client.get_connection_manager() succeeded in {:?}", start.elapsed());
+            info!(
+                "✅ client.get_connection_manager() succeeded in {:?}",
+                start.elapsed()
+            );
             c
         }
         Err(e) => {
@@ -81,7 +95,10 @@ async fn main() -> Result<()> {
             if let Some(source) = e.source() {
                 error!("Error source: {}", source);
             }
-            return Err(anyhow::anyhow!("client.get_connection_manager() failed: {}", e));
+            return Err(anyhow::anyhow!(
+                "client.get_connection_manager() failed: {}",
+                e
+            ));
         }
     };
 
@@ -102,7 +119,7 @@ async fn main() -> Result<()> {
     info!("🔵 Test 4: Testing SET/GET operations...");
     let test_key = format!("test:direct:{}", chrono::Utc::now().timestamp());
     let test_value = "test_value";
-    
+
     let start = Instant::now();
     match conn.set::<_, _, ()>(&test_key, test_value).await {
         Ok(_) => {
@@ -119,7 +136,10 @@ async fn main() -> Result<()> {
         Ok(Some(value)) => {
             info!("✅ GET succeeded in {:?}: {}", start.elapsed(), value);
             if value != test_value {
-                error!("❌ Value mismatch: expected '{}', got '{}'", test_value, value);
+                error!(
+                    "❌ Value mismatch: expected '{}', got '{}'",
+                    test_value, value
+                );
                 return Err(anyhow::anyhow!("Value mismatch"));
             }
         }
@@ -140,4 +160,3 @@ async fn main() -> Result<()> {
     info!("✅✅✅ All Redis connection tests passed!");
     Ok(())
 }
-

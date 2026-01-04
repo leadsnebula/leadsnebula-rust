@@ -201,7 +201,7 @@ impl AppState {
                 }
             );
 
-            // First connection attempt with 30 second timeout (TLS handshake can be slow)
+            // First connection attempt with 30 second timeout
             info!("🔵 Starting Redis connection attempt (30s timeout)...");
             let start_time = std::time::Instant::now();
             let connect_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {

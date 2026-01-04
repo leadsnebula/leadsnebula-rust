@@ -18,10 +18,10 @@ impl ManageConnection for RedisConnectionManager {
     type Error = RedisError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        info!("🔵 Step 5: Getting ConnectionManager via client.get_connection_manager() (this may take time for TLS handshake)...");
+        info!("🔵 Step 5: Getting ConnectionManager via client.get_connection_manager()...");
         let start = std::time::Instant::now();
         // Use client.get_connection_manager() instead of ConnectionManager::new()
-        // This method handles TLS configuration properly for rediss:// URLs
+        // This method properly handles both redis:// and rediss:// URLs
         let result = self.client.get_connection_manager().await;
         let elapsed = start.elapsed();
         info!(
@@ -80,7 +80,7 @@ impl RedisClient {
             }
         );
 
-        // Create Redis client from URL - this handles TLS automatically for rediss:// URLs
+        // Create Redis client from URL - handles both redis:// and rediss:// URLs automatically
         info!("🔵 Step 2: Calling Client::open()...");
         let client = Client::open(redis_url).map_err(|e| {
             error!(
@@ -113,7 +113,7 @@ impl RedisClient {
         let pool = Pool::builder()
             .max_size(pool_size)
             .min_idle(Some(2))
-            .connection_timeout(Duration::from_secs(30)) // Increased to 30s for TLS handshake
+            .connection_timeout(Duration::from_secs(30)) // 30s timeout for connection establishment
             .test_on_check_out(true)
             .idle_timeout(Some(Duration::from_secs(60)))
             .build(manager)
