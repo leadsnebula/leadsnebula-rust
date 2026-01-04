@@ -124,7 +124,7 @@ jobs:
             --config fly.dev.toml \
             --app ${{ env.APP_NAME }} \
             --remote-only=false \
-            --no-release-command
+            --skip-release-command
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
