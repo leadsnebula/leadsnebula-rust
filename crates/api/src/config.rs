@@ -178,7 +178,10 @@ impl AppState {
         let redis = if let Some(redis_url) = &config.redis_url {
             info!(
                 "Connecting to Redis at {}...",
-                redis_url.split('@').next_back().unwrap_or("(hidden)")
+                redis_url
+                    .split_once("://")
+                    .map(|(_, host_port)| host_port)
+                    .unwrap_or("(hidden)")
             );
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
