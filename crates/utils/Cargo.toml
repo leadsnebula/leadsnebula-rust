@@ -25,10 +25,15 @@ path = "src/bin/update-redis-url.rs"
 name = "fetch-ssm-values"
 path = "src/bin/fetch-ssm-values.rs"
 
+[[bin]]
+name = "test-redis-connection"
+path = "src/bin/test-redis-connection.rs"
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "migrate"] }
+redis = { workspace = true }
 leadsnebula_core = { path = "../core" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }

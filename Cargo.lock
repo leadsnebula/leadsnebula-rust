@@ -1989,6 +1989,7 @@ dependencies = [
  "chrono",
  "clap",
  "leadsnebula_core",
+ "redis",
  "sqlx",
  "tokio",
  "tracing",

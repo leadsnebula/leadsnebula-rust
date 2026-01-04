@@ -41,12 +41,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     CARGO_BUILD_JOBS=4 \
     CARGO_INCREMENTAL=1 \
-    cargo build --release --locked --bin leadsnebula-api --bin run-migrations --bin create-user --bin update-password && \
+    cargo build --release --locked --bin leadsnebula-api --bin run-migrations --bin create-user --bin update-password --bin test-redis-connection && \
     mkdir -p /app/binaries && \
     cp /app/target/release/leadsnebula-api /app/binaries/ && \
     cp /app/target/release/run-migrations /app/binaries/ && \
     cp /app/target/release/create-user /app/binaries/ && \
-    cp /app/target/release/update-password /app/binaries/
+    cp /app/target/release/update-password /app/binaries/ && \
+    cp /app/target/release/test-redis-connection /app/binaries/
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -69,6 +70,7 @@ COPY --from=builder /app/binaries/leadsnebula-api /app/leadsnebula-api
 COPY --from=builder /app/binaries/run-migrations /app/run-migrations
 COPY --from=builder /app/binaries/create-user /app/create-user
 COPY --from=builder /app/binaries/update-password /app/update-password
+COPY --from=builder /app/binaries/test-redis-connection /app/test-redis-connection
 
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations
