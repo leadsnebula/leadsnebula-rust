@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     // Load Redis URL from SSM
     let env_normalized = leadsnebula_core::normalize_env_for_ssm(&args.environment);
     let ssm = Arc::new(SsmService::new(args.environment.clone(), None).await?);
-    
+
     // Try prod path first (as per config.rs logic)
     let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
     let params = ssm.get_parameters_by_path(&config_path).await?;
@@ -45,7 +45,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "(hidden)".to_string());
 
     info!("Redis URL: {}...", display_url);
-    info!("Scheme: {}", if redis_url.starts_with("rediss://") { "TLS (rediss://)" } else { "Plain (redis://)" });
+    info!(
+        "Scheme: {}",
+        if redis_url.starts_with("rediss://") {
+            "TLS (rediss://)"
+        } else {
+            "Plain (redis://)"
+        }
+    );
 
     // Test 1: Client::open()
     info!("🔵 Test 1: Creating Redis client with Client::open()...");
@@ -66,7 +73,10 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let mut conn: ConnectionManager = match ConnectionManager::new(client).await {
         Ok(c) => {
-            info!("✅ ConnectionManager::new() succeeded in {:?}", start.elapsed());
+            info!(
+                "✅ ConnectionManager::new() succeeded in {:?}",
+                start.elapsed()
+            );
             c
         }
         Err(e) => {
@@ -103,7 +113,7 @@ async fn main() -> Result<()> {
     info!("🔵 Test 4: Testing SET/GET operations...");
     let test_key = format!("test:direct:{}", chrono::Utc::now().timestamp());
     let test_value = "test_value";
-    
+
     let start = Instant::now();
     match conn.set::<_, _, ()>(&test_key, test_value).await {
         Ok(_) => {
@@ -120,7 +130,10 @@ async fn main() -> Result<()> {
         Ok(Some(value)) => {
             info!("✅ GET succeeded in {:?}: {}", start.elapsed(), value);
             if value != test_value {
-                error!("❌ Value mismatch: expected '{}', got '{}'", test_value, value);
+                error!(
+                    "❌ Value mismatch: expected '{}', got '{}'",
+                    test_value, value
+                );
                 return Err(anyhow::anyhow!("Value mismatch"));
             }
         }
@@ -141,4 +154,3 @@ async fn main() -> Result<()> {
     info!("✅✅✅ All Redis connection tests passed!");
     Ok(())
 }
-

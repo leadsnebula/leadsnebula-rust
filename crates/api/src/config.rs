@@ -1,6 +1,6 @@
 use leadsnebula_core::redis::RedisClient;
-use leadsnebula_core::ssm::SsmService;
 use leadsnebula_core::services::database::create_pool;
+use leadsnebula_core::ssm::SsmService;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::info;
@@ -45,7 +45,9 @@ impl AppConfig {
 
         // For dev environment, also fetch from prod path as fallback
         if env_normalized == "dev" {
-            let prod_params = ssm.get_parameters_by_path("/leadsnebula/prod/rust/").await?;
+            let prod_params = ssm
+                .get_parameters_by_path("/leadsnebula/prod/rust/")
+                .await?;
             params.extend(prod_params);
         }
 
@@ -93,12 +95,18 @@ impl AppConfig {
             })?;
 
         let sentry_dsn = params
-            .get(&format!("/leadsnebula/{}/rust/monitoring/sentry_dsn", env_normalized))
+            .get(&format!(
+                "/leadsnebula/{}/rust/monitoring/sentry_dsn",
+                env_normalized
+            ))
             .cloned()
             .or_else(|| std::env::var("SENTRY_DSN").ok());
 
         let from_email = params
-            .get(&format!("/leadsnebula/{}/rust/email/from_address", env_normalized))
+            .get(&format!(
+                "/leadsnebula/{}/rust/email/from_address",
+                env_normalized
+            ))
             .cloned()
             .or_else(|| std::env::var("FROM_EMAIL").ok())
             .unwrap_or_else(|| "noreply@leadsnebula.com".to_string());
@@ -110,10 +118,17 @@ impl AppConfig {
                 env_normalized
             ))
             .and_then(|s| s.parse::<u32>().ok())
-            .or_else(|| std::env::var("REDIS_POOL_SIZE").ok().and_then(|s| s.parse::<u32>().ok()))
+            .or_else(|| {
+                std::env::var("REDIS_POOL_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
             .unwrap_or(15);
 
-        info!("Configuration loaded successfully for environment: {}", environment);
+        info!(
+            "Configuration loaded successfully for environment: {}",
+            environment
+        );
 
         Ok(Self {
             database_url,
@@ -164,10 +179,16 @@ impl AppState {
                 .and_then(|(scheme, rest)| {
                     rest.split_once('@')
                         .map(|(_, host_port)| format!("{}://{}", scheme, host_port))
-                        .or_else(|| Some(format!("{}://{}", scheme, rest.split('/').next().unwrap_or("(hidden)"))))
+                        .or_else(|| {
+                            Some(format!(
+                                "{}://{}",
+                                scheme,
+                                rest.split('/').next().unwrap_or("(hidden)")
+                            ))
+                        })
                 })
                 .unwrap_or_else(|| "(hidden)".to_string());
-            
+
             info!("Connecting to Redis at {}...", display_url);
             tracing::debug!(
                 "Redis connection URL scheme: {}",
@@ -194,7 +215,7 @@ impl AppState {
             .await;
             let elapsed = start_time.elapsed();
             info!("🔵 Redis connection attempt completed in {:?}", elapsed);
-            
+
             match connect_result {
                 Ok(Ok(client)) => {
                     info!("✅ Redis connection created successfully");
@@ -211,15 +232,28 @@ impl AppState {
                     }
                 }
                 Ok(Err(e)) => {
-                    let error_source = e.source().map(|s| s.to_string()).unwrap_or_else(|| "unknown".to_string());
-                    tracing::warn!("❌ Failed to connect to Redis: {} (source: {}). Retrying in 2 seconds...", e, error_source);
+                    let error_source = e
+                        .source()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::warn!(
+                        "❌ Failed to connect to Redis: {} (source: {}). Retrying in 2 seconds...",
+                        e,
+                        error_source
+                    );
                     // Retry once after 2 seconds
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     info!("Retrying Redis connection...");
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        RedisClient::new(redis_url, config.environment.clone(), config.redis_pool_size)
-                    ).await {
+                        RedisClient::new(
+                            redis_url,
+                            config.environment.clone(),
+                            config.redis_pool_size,
+                        ),
+                    )
+                    .await
+                    {
                         Ok(Ok(client)) => {
                             info!("✅ Redis connection created successfully on retry");
                             match client.ping().await {
@@ -244,16 +278,26 @@ impl AppState {
                     }
                 }
                 Err(_) => {
-                    tracing::warn!("❌ Redis connection timed out after 30 seconds. Retrying in 2 seconds...");
+                    tracing::warn!(
+                        "❌ Redis connection timed out after 30 seconds. Retrying in 2 seconds..."
+                    );
                     // Retry once after 2 seconds
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     info!("Retrying Redis connection after timeout...");
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        RedisClient::new(redis_url, config.environment.clone(), config.redis_pool_size)
-                    ).await {
+                        RedisClient::new(
+                            redis_url,
+                            config.environment.clone(),
+                            config.redis_pool_size,
+                        ),
+                    )
+                    .await
+                    {
                         Ok(Ok(client)) => {
-                            info!("✅ Redis connection created successfully on retry after timeout");
+                            info!(
+                                "✅ Redis connection created successfully on retry after timeout"
+                            );
                             match client.ping().await {
                                 Ok(pong) => {
                                     info!("Redis ping successful on retry: {}", pong);
@@ -292,4 +336,3 @@ impl AppState {
         })
     }
 }
-
