@@ -18,17 +18,14 @@ impl ManageConnection for RedisConnectionManager {
     type Error = RedisError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        info!(
-            "🔵 Step 5: Calling ConnectionManager::new() (this may take time for TLS handshake)..."
-        );
+        info!("🔵 Step 5: Getting ConnectionManager via client.get_connection_manager() (this may take time for TLS handshake)...");
         let start = std::time::Instant::now();
-        let result = ConnectionManager::new(self.client.clone()).await;
+        // Use client.get_connection_manager() instead of ConnectionManager::new()
+        // This method handles TLS configuration properly for rediss:// URLs
+        let result = self.client.get_connection_manager().await;
         let elapsed = start.elapsed();
-        info!(
-            "🔵 Step 5: ConnectionManager::new() completed in {:?}",
-            elapsed
-        );
-
+        info!("🔵 Step 5: client.get_connection_manager() completed in {:?}", elapsed);
+        
         result.map_err(|e| {
             // Log detailed error information for debugging
             error!(
@@ -69,17 +66,11 @@ pub struct RedisClient {
 impl RedisClient {
     pub async fn new(redis_url: &str, env: String, pool_size: u32) -> anyhow::Result<Self> {
         info!("🔵 Step 1: Creating Redis client from URL...");
-        debug!(
-            "Creating Redis connection manager with URL scheme: {}",
-            if redis_url.starts_with("rediss://") {
-                "TLS (rediss://)"
-            } else if redis_url.starts_with("redis://") {
-                "Plain (redis://)"
-            } else {
-                "Unknown"
-            }
-        );
-
+        debug!("Creating Redis connection manager with URL scheme: {}", 
+            if redis_url.starts_with("rediss://") { "TLS (rediss://)" } 
+            else if redis_url.starts_with("redis://") { "Plain (redis://)" } 
+            else { "Unknown" });
+        
         // Create Redis client from URL - this handles TLS automatically for rediss:// URLs
         info!("🔵 Step 2: Calling Client::open()...");
         let client = Client::open(redis_url).map_err(|e| {
@@ -97,19 +88,14 @@ impl RedisClient {
             anyhow::anyhow!("Redis client error: {}", e)
         })?;
         info!("✅ Step 2: Client::open() succeeded");
-
-        info!(
-            "🔵 Step 3: Creating Redis connection manager (TLS: {})...",
-            redis_url.starts_with("rediss://")
-        );
-
+        
+        info!("🔵 Step 3: Creating Redis connection manager (TLS: {})...", 
+            redis_url.starts_with("rediss://"));
+        
         // Create our custom ManageConnection wrapper
         let manager = RedisConnectionManager { client };
-
-        info!(
-            "🔵 Step 4: Building Redis connection pool (size: {}, min_idle: 2)...",
-            pool_size
-        );
+        
+        info!("🔵 Step 4: Building Redis connection pool (size: {}, min_idle: 2)...", pool_size);
         let pool = Pool::builder()
             .max_size(pool_size)
             .min_idle(Some(2))
@@ -130,10 +116,7 @@ impl RedisClient {
                 anyhow::anyhow!("Redis pool build error: {}", e)
             })?;
 
-        info!(
-            "Redis connection pool created successfully (max_size: {})",
-            pool_size
-        );
+        info!("Redis connection pool created successfully (max_size: {})", pool_size);
         Ok(Self {
             pool: Arc::new(pool),
             env: normalize_env_for_redis(&env).to_string(),
@@ -146,14 +129,16 @@ impl RedisClient {
 
     pub async fn ping(&self) -> anyhow::Result<String> {
         debug!("Pinging Redis...");
-        let mut conn = self.pool.get().await.map_err(|e| {
-            error!("Failed to get Redis connection from pool: {}", e);
-            anyhow::anyhow!("Redis pool error: {}", e)
-        })?;
-        let result: String = conn.ping().await.map_err(|e| {
-            error!("Redis PING command failed: {}", e);
-            anyhow::anyhow!("Redis PING error: {}", e)
-        })?;
+        let mut conn = self.pool.get().await
+            .map_err(|e| {
+                error!("Failed to get Redis connection from pool: {}", e);
+                anyhow::anyhow!("Redis pool error: {}", e)
+            })?;
+        let result: String = conn.ping().await
+            .map_err(|e| {
+                error!("Redis PING command failed: {}", e);
+                anyhow::anyhow!("Redis PING error: {}", e)
+            })?;
         debug!("Redis PING successful: {}", result);
         Ok(result)
     }
@@ -165,7 +150,7 @@ impl RedisClient {
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
         let prefixed_key = self.prefix_key(key);
         let mut conn = self.pool.get().await?;
-
+        
         match conn.get::<_, Option<String>>(&prefixed_key).await {
             Ok(value) => Ok(value),
             Err(e) => {
@@ -179,22 +164,16 @@ impl RedisClient {
         self.set_with_ttl(key, value, 0).await
     }
 
-    pub async fn set_with_ttl(
-        &self,
-        key: &str,
-        value: &str,
-        ttl_seconds: u64,
-    ) -> anyhow::Result<()> {
+    pub async fn set_with_ttl(&self, key: &str, value: &str, ttl_seconds: u64) -> anyhow::Result<()> {
         let prefixed_key = self.prefix_key(key);
         let mut conn = self.pool.get().await?;
-
+        
         if ttl_seconds > 0 {
-            conn.set_ex::<_, _, ()>(&prefixed_key, value, ttl_seconds)
-                .await?;
+            conn.set_ex::<_, _, ()>(&prefixed_key, value, ttl_seconds).await?;
         } else {
             conn.set::<_, _, ()>(&prefixed_key, value).await?;
         }
-
+        
         Ok(())
     }
 
@@ -238,30 +217,24 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Redis URL in environment
     async fn test_redis_tls_connection() {
-        let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL must be set for this test");
-
+        let redis_url = std::env::var("REDIS_URL")
+            .expect("REDIS_URL must be set for this test");
+        
         // Test that we can create a client and connection manager
         let client = Client::open(redis_url.as_str()).expect("Failed to create Redis client");
-        let mut conn = ConnectionManager::new(client)
-            .await
-            .expect("Failed to create connection manager");
-
+        let mut conn = ConnectionManager::new(client).await.expect("Failed to create connection manager");
+        
         // Test PING
-        let result: String = redis::cmd("PING")
-            .query_async(&mut conn)
-            .await
-            .expect("PING failed");
+        let result: String = redis::cmd("PING").query_async(&mut conn).await.expect("PING failed");
         assert_eq!(result, "PONG");
-
+        
         // Test SET/GET
-        let _: () = conn
-            .set("test_key", "test_value")
-            .await
-            .expect("SET failed");
+        let _: () = conn.set("test_key", "test_value").await.expect("SET failed");
         let value: Option<String> = conn.get("test_key").await.expect("GET failed");
         assert_eq!(value, Some("test_value".to_string()));
-
+        
         // Cleanup
         let _: () = conn.del("test_key").await.expect("DEL failed");
     }
 }
+

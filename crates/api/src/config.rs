@@ -204,14 +204,16 @@ impl AppState {
             // First connection attempt with 30 second timeout (TLS handshake can be slow)
             info!("🔵 Starting Redis connection attempt (30s timeout)...");
             let start_time = std::time::Instant::now();
-            let connect_result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+            let connect_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                // Log immediately at start of async block to verify it's called
+                info!("🔵 Inside timeout wrapper - calling RedisClient::new()...");
                 RedisClient::new(
                     redis_url,
                     config.environment.clone(),
                     config.redis_pool_size,
-                ),
-            )
+                )
+                .await
+            })
             .await;
             let elapsed = start_time.elapsed();
             info!("🔵 Redis connection attempt completed in {:?}", elapsed);
