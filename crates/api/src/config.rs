@@ -228,9 +228,14 @@ impl AppState {
                     }
                 }
                 Ok(Err(e)) => {
+                    let error_source = e
+                        .source()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
                     tracing::warn!(
-                        "❌ Failed to connect to Redis: {}. Retrying in 2 seconds...",
-                        e
+                        "❌ Failed to connect to Redis: {} (source: {}). Retrying in 2 seconds...",
+                        e,
+                        error_source
                     );
                     // Retry once after 2 seconds
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

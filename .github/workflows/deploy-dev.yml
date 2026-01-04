@@ -103,6 +103,21 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+      - name: Validate SSM Redis configuration
+        run: |
+          echo "Validating Redis URL in SSM..."
+          # This will be checked at runtime, but we can verify AWS credentials are available
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "⚠️  AWS credentials not set in GitHub secrets - SSM access may fail at runtime"
+            echo "Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION"
+          else
+            echo "✅ AWS credentials available for SSM access"
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+
       - name: Deploy to Fly.io Dev
         run: |
           VERIFY_APP=$(grep '^app = ' fly.dev.toml | cut -d'"' -f2)
@@ -118,44 +133,67 @@ jobs:
             fi
           fi
           echo "Deploying new image to Fly.io..."
-          # Skip release command to avoid timeouts - migrations can be run manually if needed
-          flyctl deploy \
-            --image ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-dev \
-            --config fly.dev.toml \
-            --app ${{ env.APP_NAME }} \
-            --remote-only=false \
-            --skip-release-command
+          # Retry deploy up to 3 times in case of transient Fly.io API issues
+          for attempt in {1..3}; do
+            if flyctl deploy \
+              --image ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-dev \
+              --config fly.dev.toml \
+              --app ${{ env.APP_NAME }} \
+              --remote-only=false \
+              --skip-release-command; then
+              echo "✅ Deployment successful on attempt $attempt"
+              break
+            else
+              if [ "$attempt" -eq 3 ]; then
+                echo "❌ Deployment failed after 3 attempts"
+                exit 1
+              fi
+              echo "⚠️  Deployment attempt $attempt failed, retrying in 30 seconds..."
+              sleep 30
+            fi
+          done
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Health check
         run: |
           echo "Waiting for deployment to stabilize before health checks..."
-          sleep 30
+          sleep 20
           echo "Checking machine status..."
-          # Wait for machine to be in "started" state
-          for i in {1..30}; do
-            STATUS=$(flyctl status --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.Machines[0].State // "unknown"' || echo "unknown")
+          # Wait for machine to be in "started" state using machines list (more reliable)
+          for i in {1..10}; do
+            # Use machines list instead of status --json for more reliable state detection
+            STATUS=$(flyctl machines list --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.[0].state // "unknown"' || echo "unknown")
             if [ "$STATUS" = "started" ]; then
               echo "✅ Machine is started"
               break
             fi
-            echo "Machine status: $STATUS (attempt $i/30)..."
-            sleep 2
+            if [ "$i" -eq 10 ]; then
+              echo "⚠️  Machine status still $STATUS after 10 attempts, proceeding with health checks anyway"
+            else
+              echo "Machine status: $STATUS (attempt $i/10)..."
+              sleep 3
+            fi
           done
           echo "Starting health checks..."
           # Use /live endpoint which works even in degraded mode
           # Wait a bit more for the proxy to be ready
           sleep 5
-          for i in {1..15}; do
+          for i in {1..8}; do
             if curl -f -s --max-time 10 https://${{ env.APP_NAME }}.fly.dev/live > /dev/null 2>&1; then
               echo "✅ Health check passed on attempt $i"
+              # Verify app is not in degraded mode
+              RESPONSE=$(curl -s --max-time 10 https://${{ env.APP_NAME }}.fly.dev/live 2>/dev/null || echo "")
+              if echo "$RESPONSE" | grep -q '"mode".*"degraded"'; then
+                echo "⚠️  WARNING: App is running in degraded mode (Redis/DB may be unavailable)"
+                echo "Response: $RESPONSE"
+              fi
               exit 0
             fi
-            echo "Health check attempt $i failed, retrying in $((i * 2)) seconds..."
-            sleep $((i * 2))
+            echo "Health check attempt $i failed, retrying in $i seconds..."
+            sleep $i
           done
-          echo "❌ Health check failed after 15 attempts"
+          echo "❌ Health check failed after 8 attempts"
           echo "Checking app status and logs..."
           flyctl status --app ${{ env.APP_NAME }} || true
           echo "=== Recent logs ==="

@@ -142,31 +142,42 @@ jobs:
       - name: Health check
         run: |
           echo "Waiting for deployment to stabilize before health checks..."
-          sleep 30
+          sleep 20
           echo "Checking machine status..."
-          # Wait for machine to be in "started" state
-          for i in {1..30}; do
-            STATUS=$(flyctl status --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.Machines[0].State // "unknown"' || echo "unknown")
+          # Wait for machine to be in "started" state using machines list (more reliable)
+          for i in {1..10}; do
+            # Use machines list instead of status --json for more reliable state detection
+            STATUS=$(flyctl machines list --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.[0].state // "unknown"' || echo "unknown")
             if [ "$STATUS" = "started" ]; then
               echo "✅ Machine is started"
               break
             fi
-            echo "Machine status: $STATUS (attempt $i/30)..."
-            sleep 2
+            if [ "$i" -eq 10 ]; then
+              echo "⚠️  Machine status still $STATUS after 10 attempts, proceeding with health checks anyway"
+            else
+              echo "Machine status: $STATUS (attempt $i/10)..."
+              sleep 3
+            fi
           done
           echo "Starting health checks..."
           # Use /live endpoint which works even in degraded mode
           # Wait a bit more for the proxy to be ready
           sleep 5
-          for i in {1..15}; do
+          for i in {1..8}; do
             if curl -f -s --max-time 10 https://${{ env.APP_NAME }}.fly.dev/live > /dev/null 2>&1; then
               echo "✅ Health check passed on attempt $i"
+              # Verify app is not in degraded mode
+              RESPONSE=$(curl -s --max-time 10 https://${{ env.APP_NAME }}.fly.dev/live 2>/dev/null || echo "")
+              if echo "$RESPONSE" | grep -q '"mode".*"degraded"'; then
+                echo "⚠️  WARNING: App is running in degraded mode (Redis/DB may be unavailable)"
+                echo "Response: $RESPONSE"
+              fi
               exit 0
             fi
-            echo "Health check attempt $i failed, retrying in $((i * 2)) seconds..."
-            sleep $((i * 2))
+            echo "Health check attempt $i failed, retrying in $i seconds..."
+            sleep $i
           done
-          echo "❌ Health check failed after 15 attempts"
+          echo "❌ Health check failed after 8 attempts"
           echo "Checking app status and logs..."
           flyctl status --app ${{ env.APP_NAME }} || true
           echo "=== Recent logs ==="

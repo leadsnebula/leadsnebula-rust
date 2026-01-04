@@ -196,6 +196,31 @@ else
 fi
 echo ""
 
+# 11. Validate Redis configuration in code
+echo "1️⃣1️⃣  Validating Redis configuration..."
+REDIS_TIMEOUT=$(grep -r "Duration::from_secs" crates/api/src/config.rs crates/core/src/redis.rs 2>/dev/null | grep -i redis | grep -o "from_secs([0-9]*)" | head -1 | grep -o "[0-9]*" || echo "")
+if [ -n "$REDIS_TIMEOUT" ] && [ "$REDIS_TIMEOUT" -lt 10 ]; then
+    echo "⚠️  Redis connection timeout is $REDIS_TIMEOUT seconds (recommended: >= 15s for Upstash)"
+else
+    echo "✅ Redis timeout configuration OK"
+fi
+
+# Check for Redis URL fallback to env var (should be SSM only)
+if grep -r "REDIS_URL" crates/api/src/config.rs 2>/dev/null | grep -q "std::env::var"; then
+    echo "⚠️  Redis URL has environment variable fallback - should use SSM only"
+    ERRORS=$((ERRORS + 1))
+else
+    echo "✅ Redis URL uses SSM only (no env var fallback)"
+fi
+
+# Check for rediss:// TLS scheme in code comments/docs
+if grep -r "rediss://\|6380" crates/api/src/config.rs crates/core/src/redis.rs 2>/dev/null | grep -q -i "rediss\|6380"; then
+    echo "✅ Redis TLS configuration documented"
+else
+    echo "⚠️  Redis TLS configuration (rediss://, port 6380) not documented in code"
+fi
+echo ""
+
 # Summary
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if [ $ERRORS -eq 0 ]; then
