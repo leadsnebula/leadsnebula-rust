@@ -14,7 +14,6 @@ aws-sdk-sesv2 = { workspace = true }
 aws-config = { workspace = true }
 aws-smithy-async = { workspace = true }
 bb8 = { workspace = true }
-bb8-redis = { workspace = true }
 redis = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }

@@ -34,6 +34,16 @@
 - **ALWAYS run full pre-commit validation before committing** - don't assume "it compiles" is enough
 - **CI failures are expensive** - catch issues locally to avoid wasting hours on failed deployments
 
+### Investigation and Research Principles
+- **Never hesitate to perform internet research** when investigating issues or implementing features
+- **Run investigative commands proactively** - use CLI tools (AWS CLI, flyctl, cargo, etc.) to gather real data
+- **Verify configurations directly** - don't rely on assumptions about what's configured
+- **Use multiple sources** - combine codebase search, web research, and CLI verification
+- **Test connectivity and configurations** - verify network connections, SSM parameters, and service status directly
+- **Document findings** - create investigation reports when solving complex issues
+- **Follow the evidence** - let investigation results guide solutions, not assumptions
+- **Be thorough** - check dependencies, versions, features, and configurations systematically
+
 ### Code Quality Standards
 - All code must pass `cargo fmt` and `cargo clippy` checks
 - Use `--locked` flag for all cargo commands in CI/CD

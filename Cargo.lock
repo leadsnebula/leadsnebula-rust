@@ -735,16 +735,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bb8-redis"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1063effc7f6cf848bcbcc6e31b5962be75215835587d3109607c643d616f66"
-dependencies = [
- "bb8",
- "redis",
-]
-
-[[package]]
 name = "bcrypt"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2018,7 +2008,6 @@ dependencies = [
  "aws-smithy-async",
  "base64 0.21.7",
  "bb8",
- "bb8-redis",
  "bcrypt",
  "chrono",
  "hex",
