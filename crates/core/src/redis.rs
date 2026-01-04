@@ -2,6 +2,7 @@ use crate::normalize_env_for_redis;
 use bb8::{ManageConnection, Pool};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client, RedisError};
+use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -17,7 +18,23 @@ impl ManageConnection for RedisConnectionManager {
     type Error = RedisError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        ConnectionManager::new(self.client.clone()).await
+        ConnectionManager::new(self.client.clone())
+            .await
+            .map_err(|e| {
+                // Log detailed error information for debugging
+                error!(
+                    "Redis ConnectionManager::new() failed: {} (kind: {:?}, is_connection_refusal: {}, is_timeout: {}, is_io_error: {})",
+                    e,
+                    e.kind(),
+                    e.is_connection_refusal(),
+                    e.is_timeout(),
+                    e.is_io_error()
+                );
+                if let Some(source) = e.source() {
+                    error!("Redis error source: {}", source);
+                }
+                e
+            })
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
@@ -54,7 +71,17 @@ impl RedisClient {
 
         // Create Redis client from URL - this handles TLS automatically for rediss:// URLs
         let client = Client::open(redis_url).map_err(|e| {
-            error!("Failed to create Redis client: {}", e);
+            error!(
+                "Failed to create Redis client: {} (kind: {:?}, is_connection_refusal: {}, is_timeout: {}, is_io_error: {})",
+                e,
+                e.kind(),
+                e.is_connection_refusal(),
+                e.is_timeout(),
+                e.is_io_error()
+            );
+            if let Some(source) = e.source() {
+                error!("Redis Client::open() error source: {}", source);
+            }
             anyhow::anyhow!("Redis client error: {}", e)
         })?;
 
@@ -73,13 +100,20 @@ impl RedisClient {
         let pool = Pool::builder()
             .max_size(pool_size)
             .min_idle(Some(2))
-            .connection_timeout(Duration::from_secs(15)) // Increased from 10 to 15 seconds
+            .connection_timeout(Duration::from_secs(30)) // Increased to 30s for TLS handshake
             .test_on_check_out(true)
             .idle_timeout(Some(Duration::from_secs(60)))
             .build(manager)
             .await
             .map_err(|e| {
-                error!("Failed to build Redis connection pool: {}", e);
+                let error_source = e
+                    .source()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                error!(
+                    "Failed to build Redis connection pool: {} (source: {})",
+                    e, error_source
+                );
                 anyhow::anyhow!("Redis pool build error: {}", e)
             })?;
 

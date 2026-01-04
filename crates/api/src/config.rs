@@ -201,9 +201,9 @@ impl AppState {
                 }
             );
 
-            // First connection attempt with 15 second timeout
+            // First connection attempt with 30 second timeout (TLS handshake can be slow)
             let connect_result = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(30),
                 RedisClient::new(
                     redis_url,
                     config.environment.clone(),
@@ -241,7 +241,7 @@ impl AppState {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     info!("Retrying Redis connection...");
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
+                        std::time::Duration::from_secs(30),
                         RedisClient::new(
                             redis_url,
                             config.environment.clone(),
@@ -268,20 +268,20 @@ impl AppState {
                             None
                         }
                         Err(_) => {
-                            tracing::warn!("❌ Redis connection timed out after retry (15 seconds). Continuing without Redis cache.");
+                            tracing::warn!("❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache.");
                             None
                         }
                     }
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "❌ Redis connection timed out after 15 seconds. Retrying in 2 seconds..."
+                        "❌ Redis connection timed out after 30 seconds. Retrying in 2 seconds..."
                     );
                     // Retry once after 2 seconds
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     info!("Retrying Redis connection after timeout...");
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
+                        std::time::Duration::from_secs(30),
                         RedisClient::new(
                             redis_url,
                             config.environment.clone(),
@@ -310,7 +310,7 @@ impl AppState {
                             None
                         }
                         Err(_) => {
-                            tracing::warn!("❌ Redis connection timed out after retry (15 seconds). Continuing without Redis cache.");
+                            tracing::warn!("❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache.");
                             None
                         }
                     }
