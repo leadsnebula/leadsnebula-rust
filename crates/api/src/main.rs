@@ -69,17 +69,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!("Application starting in minimal mode - only /live endpoint available");
             tracing::warn!("Full functionality will be unavailable until configuration is fixed");
             // App continues with just /live endpoint - this ensures health checks pass
-            axum::Router::new().route(
-                "/live",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({
-                        "status": "alive",
-                        "mode": "degraded",
-                        "message": "Application state initialization failed - check logs",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    }))
-                }),
-            )
+            axum::Router::new().route("/live", axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "status": "alive",
+                    "mode": "degraded",
+                    "message": "Application state initialization failed - check logs",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }))
+            }))
         }
     };
 
@@ -88,7 +85,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service()).await?;
 
     Ok(())
 }
+

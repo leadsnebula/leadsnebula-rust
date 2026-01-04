@@ -31,12 +31,14 @@ primary_region = "iad"
 [[services.http_checks]]
   interval = "10s"
   timeout = "2s"
-  grace_period = "5s"
+  grace_period = "10s"
   method = "GET"
-  path = "/health"
+  path = "/live"
   protocol = "http"
   tls_skip_verify = false
 
 [deploy]
-  release_command = "/app/run-migrations"
+  # Release command disabled - using --no-release-command in workflow
+  # Migrations can be run manually if needed: flyctl ssh console -a leadsnebula-rust -C "/app/run-migrations"
+  # release_command = "/app/run-migrations"
 
