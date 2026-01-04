@@ -8,9 +8,16 @@ use serde_json::json;
 use crate::AppState;
 
 pub fn health_routes() -> Router<AppState> {
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/live", get(liveness_check))
+    Router::new().route("/health", get(health_check))
+}
+
+// Export liveness_check for use in main.rs when AppState is unavailable
+pub async fn liveness_check() -> Response {
+    let body = json!({
+        "status": "alive",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 // Simple liveness check - just confirms the app is running

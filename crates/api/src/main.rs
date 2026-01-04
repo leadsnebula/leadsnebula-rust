@@ -52,16 +52,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Build full application with all routes
+            // Note: /live is included in health_routes for consistency
             axum::Router::new()
-                .route(
-                    "/live",
-                    axum::routing::get(|| async {
-                        axum::Json(serde_json::json!({
-                            "status": "alive",
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        }))
-                    }),
-                )
+                .route("/live", axum::routing::get(routes::health::liveness_check))
                 .merge(health_routes())
                 .merge(auth_routes())
                 .with_state(state)
