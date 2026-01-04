@@ -8,7 +8,18 @@ use serde_json::json;
 use crate::AppState;
 
 pub fn health_routes() -> Router<AppState> {
-    Router::new().route("/health", get(health_check))
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/live", get(liveness_check))
+}
+
+// Simple liveness check - just confirms the app is running
+async fn liveness_check() -> Response {
+    let body = json!({
+        "status": "alive",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 async fn health_check(State(state): State<AppState>) -> Response {
@@ -18,21 +29,38 @@ async fn health_check(State(state): State<AppState>) -> Response {
         "redis": "ok",
     });
 
-    // Check database connection
-    if let Err(e) = sqlx::query("SELECT 1").execute(&*state.db_pool).await {
-        status = "unhealthy".to_string();
-        checks["database"] = json!(format!("error: {}", e));
+    // Check database connection with timeout
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query("SELECT 1").execute(&*state.db_pool),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            checks["database"] = json!("ok");
+        }
+        Ok(Err(e)) => {
+            status = "unhealthy".to_string();
+            checks["database"] = json!(format!("error: {}", e));
+        }
+        Err(_) => {
+            status = "unhealthy".to_string();
+            checks["database"] = json!("error: connection timeout");
+        }
     }
 
-    // Check Redis connection if available
+    // Check Redis connection if available (Redis failures don't make app unhealthy)
     if let Some(redis) = &state.redis {
-        match redis.ping().await {
-            Ok(_) => {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), redis.ping()).await {
+            Ok(Ok(_)) => {
                 checks["redis"] = json!("ok");
             }
-            Err(e) => {
-                status = "unhealthy".to_string();
-                checks["redis"] = json!(format!("error: {}", e));
+            Ok(Err(e)) => {
+                // Redis is optional, so don't mark as unhealthy
+                checks["redis"] = json!(format!("warning: {}", e));
+            }
+            Err(_) => {
+                checks["redis"] = json!("warning: connection timeout");
             }
         }
     } else {
