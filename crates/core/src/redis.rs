@@ -3,7 +3,7 @@ use bb8::Pool;
 use bb8_redis::{redis::AsyncCommands, RedisConnectionManager};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error;
+use tracing::{debug, error, info};
 
 pub type RedisPool = Pool<RedisConnectionManager>;
 
@@ -14,17 +14,43 @@ pub struct RedisClient {
 
 impl RedisClient {
     pub async fn new(redis_url: &str, env: String, pool_size: u32) -> anyhow::Result<Self> {
-        let manager = RedisConnectionManager::new(redis_url)?;
+        debug!(
+            "Creating Redis connection manager with URL scheme: {}",
+            if redis_url.starts_with("rediss://") {
+                "TLS (rediss://)"
+            } else if redis_url.starts_with("redis://") {
+                "Plain (redis://)"
+            } else {
+                "Unknown"
+            }
+        );
 
+        let manager = RedisConnectionManager::new(redis_url).map_err(|e| {
+            error!("Failed to create Redis connection manager: {}", e);
+            anyhow::anyhow!("Redis connection manager error: {}", e)
+        })?;
+
+        info!(
+            "Building Redis connection pool (size: {}, min_idle: 2)...",
+            pool_size
+        );
         let pool = Pool::builder()
             .max_size(pool_size)
             .min_idle(Some(2))
-            .connection_timeout(Duration::from_secs(10))
+            .connection_timeout(Duration::from_secs(15)) // Increased from 10 to 15 seconds
             .test_on_check_out(true)
             .idle_timeout(Some(Duration::from_secs(60)))
             .build(manager)
-            .await?;
+            .await
+            .map_err(|e| {
+                error!("Failed to build Redis connection pool: {}", e);
+                anyhow::anyhow!("Redis pool build error: {}", e)
+            })?;
 
+        info!(
+            "Redis connection pool created successfully (max_size: {})",
+            pool_size
+        );
         Ok(Self {
             pool: Arc::new(pool),
             env: normalize_env_for_redis(&env).to_string(),
@@ -36,8 +62,16 @@ impl RedisClient {
     }
 
     pub async fn ping(&self) -> anyhow::Result<String> {
-        let mut conn = self.pool.get().await?;
-        let result: String = conn.ping().await?;
+        debug!("Pinging Redis...");
+        let mut conn = self.pool.get().await.map_err(|e| {
+            error!("Failed to get Redis connection from pool: {}", e);
+            anyhow::anyhow!("Redis pool error: {}", e)
+        })?;
+        let result: String = conn.ping().await.map_err(|e| {
+            error!("Redis PING command failed: {}", e);
+            anyhow::anyhow!("Redis PING error: {}", e)
+        })?;
+        debug!("Redis PING successful: {}", result);
         Ok(result)
     }
 

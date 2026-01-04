@@ -63,13 +63,10 @@ impl AppConfig {
                 )
             })?;
 
+        // Redis URL: Always use prod path for both environments (shared Redis instance)
         let redis_url = params
-            .get(&format!(
-                "/leadsnebula/{}/rust/redis/connection_url",
-                env_normalized
-            ))
-            .cloned()
-            .or_else(|| std::env::var("REDIS_URL").ok());
+            .get("/leadsnebula/prod/rust/redis/connection_url")
+            .cloned();
 
         // Try multiple possible SSM paths for JWT_SECRET (supporting different path structures)
         // Also try prod path as fallback for dev environment
@@ -176,41 +173,146 @@ impl AppState {
 
         // Create Redis client if URL is provided
         let redis = if let Some(redis_url) = &config.redis_url {
-            info!(
-                "Connecting to Redis at {}...",
-                redis_url
-                    .split_once("://")
-                    .map(|(_, host_port)| host_port)
-                    .unwrap_or("(hidden)")
+            // Extract host/port for logging (hide credentials)
+            let display_url = redis_url
+                .split_once("://")
+                .and_then(|(scheme, rest)| {
+                    rest.split_once('@')
+                        .map(|(_, host_port)| format!("{}://{}", scheme, host_port))
+                        .or_else(|| {
+                            Some(format!(
+                                "{}://{}",
+                                scheme,
+                                rest.split('/').next().unwrap_or("(hidden)")
+                            ))
+                        })
+                })
+                .unwrap_or_else(|| "(hidden)".to_string());
+
+            info!("Connecting to Redis at {}...", display_url);
+            tracing::debug!(
+                "Redis connection URL scheme: {}",
+                if redis_url.starts_with("rediss://") {
+                    "TLS (rediss://)"
+                } else if redis_url.starts_with("redis://") {
+                    "Plain (redis://)"
+                } else {
+                    "Unknown"
+                }
             );
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+
+            // First connection attempt with 15 second timeout
+            let connect_result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
                 RedisClient::new(
                     redis_url,
                     config.environment.clone(),
                     config.redis_pool_size,
                 ),
             )
-            .await
-            {
+            .await;
+
+            match connect_result {
                 Ok(Ok(client)) => {
-                    info!("Redis connection created successfully");
-                    Some(Arc::new(client))
+                    info!("✅ Redis connection created successfully");
+                    // Verify connection with a ping
+                    match client.ping().await {
+                        Ok(pong) => {
+                            info!("Redis ping successful: {}", pong);
+                            Some(Arc::new(client))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Redis connection created but ping failed: {}. Continuing without Redis cache.", e);
+                            None
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
-                        "Failed to connect to Redis: {}. Continuing without Redis cache.",
+                        "❌ Failed to connect to Redis: {}. Retrying in 2 seconds...",
                         e
                     );
-                    None
+                    // Retry once after 2 seconds
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    info!("Retrying Redis connection...");
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        RedisClient::new(
+                            redis_url,
+                            config.environment.clone(),
+                            config.redis_pool_size,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(client)) => {
+                            info!("✅ Redis connection created successfully on retry");
+                            match client.ping().await {
+                                Ok(pong) => {
+                                    info!("Redis ping successful on retry: {}", pong);
+                                    Some(Arc::new(client))
+                                }
+                                Err(e2) => {
+                                    tracing::warn!("Redis connection created on retry but ping failed: {}. Continuing without Redis cache.", e2);
+                                    None
+                                }
+                            }
+                        }
+                        Ok(Err(e2)) => {
+                            tracing::warn!("❌ Redis connection failed after retry: {}. Continuing without Redis cache.", e2);
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!("❌ Redis connection timed out after retry (15 seconds). Continuing without Redis cache.");
+                            None
+                        }
+                    }
                 }
                 Err(_) => {
-                    tracing::warn!("Redis connection timed out after 5 seconds. Continuing without Redis cache.");
-                    None
+                    tracing::warn!(
+                        "❌ Redis connection timed out after 15 seconds. Retrying in 2 seconds..."
+                    );
+                    // Retry once after 2 seconds
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    info!("Retrying Redis connection after timeout...");
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        RedisClient::new(
+                            redis_url,
+                            config.environment.clone(),
+                            config.redis_pool_size,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(client)) => {
+                            info!(
+                                "✅ Redis connection created successfully on retry after timeout"
+                            );
+                            match client.ping().await {
+                                Ok(pong) => {
+                                    info!("Redis ping successful on retry: {}", pong);
+                                    Some(Arc::new(client))
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Redis connection created on retry but ping failed: {}. Continuing without Redis cache.", e);
+                                    None
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("❌ Redis connection failed after retry: {}. Continuing without Redis cache.", e);
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!("❌ Redis connection timed out after retry (15 seconds). Continuing without Redis cache.");
+                            None
+                        }
+                    }
                 }
             }
         } else {
-            info!("No Redis URL provided, skipping Redis connection");
+            info!("No Redis URL found in SSM, skipping Redis connection");
             None
         };
 
