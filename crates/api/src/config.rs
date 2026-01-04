@@ -41,7 +41,15 @@ impl AppConfig {
 
         // Fetch all configs in one batched call
         let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
-        let params = ssm.get_parameters_by_path(&config_path).await?;
+        let mut params = ssm.get_parameters_by_path(&config_path).await?;
+
+        // For dev environment, also fetch from prod path as fallback
+        if env_normalized == "dev" {
+            let prod_params = ssm
+                .get_parameters_by_path("/leadsnebula/prod/rust/")
+                .await?;
+            params.extend(prod_params);
+        }
 
         // Extract values from batched parameters
         let database_url = params
@@ -74,6 +82,7 @@ impl AppConfig {
                 if env_normalized == "dev" {
                     params.get("/leadsnebula/prod/rust/jwt/secret_key")
                         .or_else(|| params.get("/leadsnebula/prod/rust/auth/jwt_secret"))
+                        .or_else(|| params.get("/leadsnebula/prod/rust/jwt_secret"))
                 } else {
                     None
                 }
