@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub database_url: String,
     pub redis_url: Option<String>,
     pub redis_pool_size: u32,
+    pub redis_min_idle: u32,
     pub jwt_secret: String,
     #[allow(dead_code)] // Used by Sentry initialization in main.rs
     pub sentry_dsn: Option<String>,
@@ -125,6 +126,20 @@ impl AppConfig {
             })
             .unwrap_or(15);
 
+        // Redis min_idle (default: 2, configurable via SSM)
+        let redis_min_idle = params
+            .get(&format!(
+                "/leadsnebula/{}/rust/redis/min_idle",
+                env_normalized
+            ))
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                std::env::var("REDIS_MIN_IDLE")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .unwrap_or(2);
+
         info!(
             "Configuration loaded successfully for environment: {}",
             environment
@@ -134,6 +149,7 @@ impl AppConfig {
             database_url,
             redis_url,
             redis_pool_size,
+            redis_min_idle,
             jwt_secret,
             sentry_dsn,
             environment,
@@ -146,14 +162,39 @@ impl AppState {
     pub async fn new() -> anyhow::Result<Self> {
         let config = AppConfig::load().await?;
 
-        // Create database pool with retry logic and timeout
-        info!("Connecting to database...");
-        let db_pool = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            create_pool(&config.database_url),
-        )
-        .await
-        {
+        // Parallelize database and Redis initialization for faster startup
+        info!("Initializing database and Redis connections in parallel...");
+
+        let db_future = async {
+            info!("Connecting to database...");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                create_pool(&config.database_url),
+            )
+            .await
+        };
+
+        let redis_future = async {
+            if let Some(redis_url) = &config.redis_url {
+                Some(
+                    self::init_redis(
+                        redis_url,
+                        &config.environment,
+                        config.redis_pool_size,
+                        config.redis_min_idle,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        };
+
+        // Initialize both in parallel
+        let (db_result, redis_result) = tokio::join!(db_future, redis_future);
+
+        // Handle database result
+        let db_pool = match db_result {
             Ok(Ok(pool)) => {
                 info!("Database connection pool created successfully");
                 Arc::new(pool)
@@ -171,163 +212,26 @@ impl AppState {
             }
         };
 
-        // Create Redis client if URL is provided
-        let redis = if let Some(redis_url) = &config.redis_url {
-            // Extract host/port for logging (hide credentials)
-            let display_url = redis_url
-                .split_once("://")
-                .and_then(|(scheme, rest)| {
-                    rest.split_once('@')
-                        .map(|(_, host_port)| format!("{}://{}", scheme, host_port))
-                        .or_else(|| {
-                            Some(format!(
-                                "{}://{}",
-                                scheme,
-                                rest.split('/').next().unwrap_or("(hidden)")
-                            ))
-                        })
-                })
-                .unwrap_or_else(|| "(hidden)".to_string());
-
-            info!("Connecting to Redis at {}...", display_url);
-            tracing::debug!(
-                "Redis connection URL scheme: {}",
-                if redis_url.starts_with("rediss://") {
-                    "TLS (rediss://)"
-                } else if redis_url.starts_with("redis://") {
-                    "Plain (redis://)"
-                } else {
-                    "Unknown"
-                }
-            );
-
-            // First connection attempt with 30 second timeout
-            info!("🔵 Starting Redis connection attempt (30s timeout)...");
-            let start_time = std::time::Instant::now();
-            let connect_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                // Log immediately at start of async block to verify it's called
-                info!("🔵 Inside timeout wrapper - calling RedisClient::new()...");
-                RedisClient::new(
-                    redis_url,
-                    config.environment.clone(),
-                    config.redis_pool_size,
-                )
-                .await
-            })
-            .await;
-            let elapsed = start_time.elapsed();
-            info!("🔵 Redis connection attempt completed in {:?}", elapsed);
-
-            match connect_result {
-                Ok(Ok(client)) => {
-                    info!("✅ Redis connection created successfully");
-                    // Verify connection with a ping
-                    match client.ping().await {
-                        Ok(pong) => {
-                            info!("Redis ping successful: {}", pong);
-                            Some(Arc::new(client))
-                        }
-                        Err(e) => {
-                            tracing::warn!("Redis connection created but ping failed: {}. Continuing without Redis cache.", e);
-                            None
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    let error_source = e
-                        .source()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    tracing::warn!(
-                        "❌ Failed to connect to Redis: {} (source: {}). Retrying in 2 seconds...",
-                        e,
-                        error_source
-                    );
-                    // Retry once after 2 seconds
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    info!("Retrying Redis connection...");
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        RedisClient::new(
-                            redis_url,
-                            config.environment.clone(),
-                            config.redis_pool_size,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(client)) => {
-                            info!("✅ Redis connection created successfully on retry");
-                            match client.ping().await {
-                                Ok(pong) => {
-                                    info!("Redis ping successful on retry: {}", pong);
-                                    Some(Arc::new(client))
-                                }
-                                Err(e2) => {
-                                    tracing::warn!("Redis connection created on retry but ping failed: {}. Continuing without Redis cache.", e2);
-                                    None
-                                }
-                            }
-                        }
-                        Ok(Err(e2)) => {
-                            tracing::warn!("❌ Redis connection failed after retry: {}. Continuing without Redis cache.", e2);
-                            None
-                        }
-                        Err(_) => {
-                            tracing::warn!("❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache.");
-                            None
-                        }
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "❌ Redis connection timed out after 30 seconds. Retrying in 2 seconds..."
-                    );
-                    // Retry once after 2 seconds
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    info!("Retrying Redis connection after timeout...");
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        RedisClient::new(
-                            redis_url,
-                            config.environment.clone(),
-                            config.redis_pool_size,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(client)) => {
-                            info!(
-                                "✅ Redis connection created successfully on retry after timeout"
-                            );
-                            match client.ping().await {
-                                Ok(pong) => {
-                                    info!("Redis ping successful on retry: {}", pong);
-                                    Some(Arc::new(client))
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Redis connection created on retry but ping failed: {}. Continuing without Redis cache.", e);
-                                    None
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("❌ Redis connection failed after retry: {}. Continuing without Redis cache.", e);
-                            None
-                        }
-                        Err(_) => {
-                            tracing::warn!("❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache.");
-                            None
-                        }
-                    }
-                }
+        // Handle Redis result
+        let redis = match redis_result {
+            Some(Ok(Some(client))) => Some(client),
+            Some(Ok(None)) => {
+                tracing::warn!(
+                    "Redis initialization returned None. Continuing without Redis cache."
+                );
+                None
             }
-        } else {
-            info!("No Redis URL found in SSM, skipping Redis connection");
-            None
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "Redis initialization failed: {}. Continuing without Redis cache.",
+                    e
+                );
+                None
+            }
+            None => None,
         };
 
-        // Create SSM service with Redis for caching
+        // Create SSM service with Redis for caching (if available)
         let ssm = Arc::new(SsmService::new(config.environment.clone(), redis.clone()).await?);
 
         Ok(Self {
@@ -336,5 +240,166 @@ impl AppState {
             redis,
             ssm,
         })
+    }
+}
+
+// Helper function to initialize Redis (extracted for parallelization)
+async fn init_redis(
+    redis_url: &str,
+    environment: &str,
+    pool_size: u32,
+    min_idle: u32,
+) -> anyhow::Result<Option<Arc<RedisClient>>> {
+    // Extract host/port for logging (hide credentials)
+    let display_url = redis_url
+        .split_once("://")
+        .and_then(|(scheme, rest)| {
+            rest.split_once('@')
+                .map(|(_, host_port)| format!("{}://{}", scheme, host_port))
+                .or_else(|| {
+                    Some(format!(
+                        "{}://{}",
+                        scheme,
+                        rest.split('/').next().unwrap_or("(hidden)")
+                    ))
+                })
+        })
+        .unwrap_or_else(|| "(hidden)".to_string());
+
+    info!("Connecting to Redis at {}...", display_url);
+    tracing::debug!(
+        "Redis connection URL scheme: {}",
+        if redis_url.starts_with("rediss://") {
+            "TLS (rediss://)"
+        } else if redis_url.starts_with("redis://") {
+            "Plain (redis://)"
+        } else {
+            "Unknown"
+        }
+    );
+
+    // First connection attempt with 30 second timeout
+    info!("🔵 Starting Redis connection attempt (30s timeout)...");
+    let start_time = std::time::Instant::now();
+    let connect_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        info!("🔵 Inside timeout wrapper - calling RedisClient::new()...");
+        RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle).await
+    })
+    .await;
+    let elapsed = start_time.elapsed();
+    info!("🔵 Redis connection attempt completed in {:?}", elapsed);
+
+    match connect_result {
+        Ok(Ok(client)) => {
+            info!("✅ Redis connection created successfully");
+            // Verify connection with a ping
+            match client.ping().await {
+                Ok(pong) => {
+                    info!("Redis ping successful: {}", pong);
+                    Ok(Some(Arc::new(client)))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Redis connection created but ping failed: {}. Continuing without Redis cache.",
+                        e
+                    );
+                    Ok(None)
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            let error_source = e
+                .source()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::warn!(
+                "❌ Failed to connect to Redis: {} (source: {}). Retrying in 2 seconds...",
+                e,
+                error_source
+            );
+            // Retry once after 2 seconds
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            info!("Retrying Redis connection...");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle),
+            )
+            .await
+            {
+                Ok(Ok(client)) => {
+                    info!("✅ Redis connection created successfully on retry");
+                    match client.ping().await {
+                        Ok(pong) => {
+                            info!("Redis ping successful on retry: {}", pong);
+                            Ok(Some(Arc::new(client)))
+                        }
+                        Err(e2) => {
+                            tracing::warn!(
+                                "Redis connection created on retry but ping failed: {}. Continuing without Redis cache.",
+                                e2
+                            );
+                            Ok(None)
+                        }
+                    }
+                }
+                Ok(Err(e2)) => {
+                    tracing::warn!(
+                        "❌ Redis connection failed after retry: {}. Continuing without Redis cache.",
+                        e2
+                    );
+                    Ok(None)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache."
+                    );
+                    Ok(None)
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                "❌ Redis connection timed out after 30 seconds. Retrying in 2 seconds..."
+            );
+            // Retry once after 2 seconds
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            info!("Retrying Redis connection after timeout...");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle),
+            )
+            .await
+            {
+                Ok(Ok(client)) => {
+                    info!("✅ Redis connection created successfully on retry");
+                    match client.ping().await {
+                        Ok(pong) => {
+                            info!("Redis ping successful on retry: {}", pong);
+                            Ok(Some(Arc::new(client)))
+                        }
+                        Err(e2) => {
+                            tracing::warn!(
+                                "Redis connection created on retry but ping failed: {}. Continuing without Redis cache.",
+                                e2
+                            );
+                            Ok(None)
+                        }
+                    }
+                }
+                Ok(Err(e2)) => {
+                    tracing::warn!(
+                        "❌ Redis connection failed after retry: {}. Continuing without Redis cache.",
+                        e2
+                    );
+                    Ok(None)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache."
+                    );
+                    Ok(None)
+                }
+            }
+        }
     }
 }

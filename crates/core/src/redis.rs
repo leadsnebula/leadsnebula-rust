@@ -67,7 +67,12 @@ pub struct RedisClient {
 }
 
 impl RedisClient {
-    pub async fn new(redis_url: &str, env: String, pool_size: u32) -> anyhow::Result<Self> {
+    pub async fn new(
+        redis_url: &str,
+        env: String,
+        pool_size: u32,
+        min_idle: u32,
+    ) -> anyhow::Result<Self> {
         info!("🔵 Step 1: Creating Redis client from URL...");
         debug!(
             "Creating Redis connection manager with URL scheme: {}",
@@ -107,12 +112,12 @@ impl RedisClient {
         let manager = RedisConnectionManager { client };
 
         info!(
-            "🔵 Step 4: Building Redis connection pool (size: {}, min_idle: 2)...",
-            pool_size
+            "🔵 Step 4: Building Redis connection pool (size: {}, min_idle: {})...",
+            pool_size, min_idle
         );
         let pool = Pool::builder()
             .max_size(pool_size)
-            .min_idle(Some(2))
+            .min_idle(Some(min_idle))
             .connection_timeout(Duration::from_secs(30)) // 30s timeout for connection establishment
             .test_on_check_out(true)
             .idle_timeout(Some(Duration::from_secs(60)))
