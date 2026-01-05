@@ -1,4 +1,5 @@
-use bcrypt::{hash, verify, DEFAULT_COST};
+use argon2::password_hash::{rand_core::OsRng, SaltString};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,10 +56,36 @@ impl JwtService {
     }
 }
 
+/// Hash a password using Argon2id (recommended by OWASP for 2026)
+/// Uses secure defaults: memory cost 19 MiB, time cost 2, parallelism 1
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    hash(password, DEFAULT_COST).map_err(Into::into)
+    let salt = SaltString::generate(&mut OsRng);
+
+    // Configure Argon2id with secure parameters
+    // Memory: 19 MiB (19456 KiB), Time: 2 iterations, Parallelism: 1
+    // These match the parameters used in the Ruby/Devise setup
+    let argon2 = Argon2::default();
+
+    let password_hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("Argon2 hashing error: {}", e))?;
+
+    Ok(password_hash.to_string())
 }
 
+/// Verify a password against an Argon2id hash
+/// Supports Argon2id, Argon2i, and Argon2d variants
 pub fn verify_password(password: &str, hash: &str) -> anyhow::Result<bool> {
-    verify(password, hash).map_err(Into::into)
+    // Parse the hash string
+    let parsed_hash = PasswordHash::new(hash)
+        .map_err(|e| anyhow::anyhow!("Invalid Argon2 hash format: {}", e))?;
+
+    // Use Argon2 default (Argon2id)
+    let argon2 = Argon2::default();
+
+    match argon2.verify_password(password.as_bytes(), &parsed_hash) {
+        Ok(()) => Ok(true),
+        Err(argon2::password_hash::Error::Password) => Ok(false), // Wrong password, not an error
+        Err(e) => Err(anyhow::anyhow!("Argon2 verification error: {}", e)),
+    }
 }

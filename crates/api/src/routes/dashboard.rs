@@ -1,0 +1,3282 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Json,
+    routing::{delete, get, post, put},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::AppState;
+
+// Publishers API
+#[derive(Serialize)]
+pub struct PublisherResponse {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+    pub status: String,
+    pub api_key_prefix: String,
+    pub hmac_required: bool,
+    pub created_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreatePublisherRequest {
+    pub name: String,
+    pub email: String,
+    pub instance_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePublisherRequest {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub status: Option<String>,
+    pub hmac_required: Option<bool>,
+    pub representative_first_name: Option<String>,
+    pub representative_last_name: Option<String>,
+    pub address_street: Option<String>,
+    pub address_city: Option<String>,
+    pub address_state: Option<String>,
+    pub address_zip: Option<String>,
+    pub timezone: Option<String>,
+    pub ein_tin: Option<String>,
+}
+
+pub fn dashboard_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/dashboard/publishers", get(list_publishers))
+        .route("/api/v1/dashboard/publishers", post(create_publisher))
+        .route("/api/v1/dashboard/publishers/:id", get(get_publisher))
+        .route("/api/v1/dashboard/publishers/:id", post(update_publisher))
+        .route("/api/v1/dashboard/publishers/:id", delete(delete_publisher))
+        .route(
+            "/api/v1/dashboard/publishers/:id/regenerate-api-key",
+            post(regenerate_publisher_api_key),
+        )
+        .route(
+            "/api/v1/dashboard/publishers/:id/generate-hmac-secret",
+            post(generate_publisher_hmac_secret),
+        )
+        .route("/api/v1/dashboard/buyers", get(list_buyers))
+        .route("/api/v1/dashboard/buyers", post(create_buyer))
+        .route("/api/v1/dashboard/buyers/:id", get(get_buyer))
+        .route("/api/v1/dashboard/buyers/:id", post(update_buyer))
+        .route("/api/v1/dashboard/buyers/:id", delete(delete_buyer))
+        .route("/api/v1/dashboard/campaigns", get(list_campaigns))
+        .route("/api/v1/dashboard/campaigns", post(create_campaign))
+        .route("/api/v1/dashboard/campaigns/:id", get(get_campaign))
+        .route("/api/v1/dashboard/campaigns/:id", post(update_campaign))
+        .route("/api/v1/dashboard/campaigns/:id", delete(delete_campaign))
+        .route("/api/v1/dashboard/ping_trees", get(list_ping_trees))
+        .route("/api/v1/dashboard/ping_trees", post(create_ping_tree))
+        .route("/api/v1/dashboard/ping_trees/:id", get(get_ping_tree))
+        .route("/api/v1/dashboard/ping_trees/:id", post(update_ping_tree))
+        .route("/api/v1/dashboard/ping_trees/:id", delete(delete_ping_tree))
+        .route(
+            "/api/v1/dashboard/ping_trees/:id/campaigns",
+            post(add_campaign_to_ping_tree),
+        )
+        .route(
+            "/api/v1/dashboard/ping_trees/:id/campaigns/:campaign_id",
+            delete(remove_campaign_from_ping_tree),
+        )
+        .route("/api/v1/dashboard/verticals", get(list_verticals))
+        .route(
+            "/api/v1/dashboard/buyer_integrations",
+            get(list_buyer_integrations),
+        )
+        .route(
+            "/api/v1/dashboard/buyers/:buyer_id/rule_sets",
+            get(list_buyer_rule_sets),
+        )
+        .route(
+            "/api/v1/dashboard/buyers/:buyer_id/rule_sets",
+            post(create_buyer_rule_set),
+        )
+        .route(
+            "/api/v1/dashboard/buyers/:buyer_id/rule_sets/:rule_set_id",
+            get(get_buyer_rule_set),
+        )
+        .route(
+            "/api/v1/dashboard/buyers/:buyer_id/rule_sets/:rule_set_id",
+            put(update_buyer_rule_set),
+        )
+        .route(
+            "/api/v1/dashboard/buyers/:buyer_id/rule_sets/:rule_set_id",
+            delete(delete_buyer_rule_set),
+        )
+        .route(
+            "/api/v1/dashboard/buyers/:buyer_id/audit_logs",
+            get(list_buyer_audit_logs),
+        )
+        .route("/api/security", get(get_security_status))
+}
+
+// Security API (stub for now)
+async fn get_security_status(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::info;
+
+    info!("Security status requested");
+
+    // TODO: Implement actual security status check (OTP, passkeys, etc.)
+    // For now, return a basic response
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "otp_enabled": false,
+        "passkeys": []
+    })))
+}
+
+async fn list_publishers(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::{error, info};
+    // TODO: Get instance_ids from user's JWT token
+    // For now, get all publishers
+    let publishers = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE deleted_at IS NULL ORDER BY created_at DESC",
+    )
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing publishers: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Found {} publishers", publishers.len());
+
+    let response: Vec<PublisherResponse> = publishers
+        .iter()
+        .map(|p| PublisherResponse {
+            id: p.id.to_string(),
+            name: p.name.clone(),
+            email: p.email.clone(),
+            status: p.status.clone(),
+            api_key_prefix: p.api_key_prefix.clone(),
+            hmac_required: p.hmac_required,
+            created_at: p.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "publishers": response
+    })))
+}
+
+async fn create_publisher(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePublisherRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use rand::Rng;
+    use sha2::{Digest, Sha256};
+
+    // Get instance_id (from user's JWT or use first available)
+    let instance_id = if let Some(id) = payload.instance_id {
+        id
+    } else {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::BAD_REQUEST)?
+    };
+
+    // Generate API key
+    let api_key = format!("pk_live_{}", {
+        let mut rng = rand::thread_rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.gen_range(0..=255)).collect();
+        hex::encode(bytes)
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    let api_key_hash = hex::encode(hasher.finalize());
+
+    let publisher_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO publishers (
+            id, name, email, api_key_hash, api_key_prefix, status,
+            instance_id, is_documentation_test, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, 'pk_live_', 'active',
+            $5, false, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(publisher_id)
+    .bind(&payload.name)
+    .bind(&payload.email)
+    .bind(&api_key_hash)
+    .bind(instance_id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "publisher": {
+            "id": publisher_id.to_string(),
+            "name": payload.name,
+            "email": payload.email,
+            "status": "active",
+            "api_key_prefix": "pk_live_"
+        },
+        "api_key": api_key,
+        "message": "Publisher created successfully. Save your API key - it will not be shown again!"
+    })))
+}
+
+async fn get_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "publisher": {
+            "id": publisher.id.to_string(),
+            "name": publisher.name,
+            "email": publisher.email,
+            "status": publisher.status,
+            "api_key_prefix": publisher.api_key_prefix,
+            "hmac_required": publisher.hmac_required,
+            "hmac_secret_prefix": publisher.hmac_secret_prefix,
+            "hmac_secret_generated": publisher.hmac_secret_hash.is_some(),
+            "total_requests": publisher.total_requests,
+            "last_request_at": publisher.last_request_at.map(|dt| dt.to_rfc3339()),
+            "representative_first_name": publisher.representative_first_name,
+            "representative_last_name": publisher.representative_last_name,
+            "address_street": publisher.address_street,
+            "address_city": publisher.address_city,
+            "address_state": publisher.address_state,
+            "address_zip": publisher.address_zip,
+            "timezone": publisher.timezone,
+            "ein_tin": publisher.ein_tin,
+            "created_at": publisher.created_at.to_rfc3339()
+        }
+    })))
+}
+
+async fn update_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdatePublisherRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Build update query dynamically
+    let mut query_builder = sqlx::QueryBuilder::new("UPDATE publishers SET ");
+
+    let mut has_updates = false;
+
+    if let Some(name) = &payload.name {
+        query_builder.push("name = ");
+        query_builder.push_bind(name);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(email) = &payload.email {
+        query_builder.push("email = ");
+        query_builder.push_bind(email);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(status) = &payload.status {
+        query_builder.push("status = ");
+        query_builder.push_bind(status);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(hmac_required) = &payload.hmac_required {
+        query_builder.push("hmac_required = ");
+        query_builder.push_bind(hmac_required);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(rep_first) = &payload.representative_first_name {
+        query_builder.push("representative_first_name = ");
+        query_builder.push_bind(rep_first);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(rep_last) = &payload.representative_last_name {
+        query_builder.push("representative_last_name = ");
+        query_builder.push_bind(rep_last);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_street) = &payload.address_street {
+        query_builder.push("address_street = ");
+        query_builder.push_bind(addr_street);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_city) = &payload.address_city {
+        query_builder.push("address_city = ");
+        query_builder.push_bind(addr_city);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_state) = &payload.address_state {
+        query_builder.push("address_state = ");
+        query_builder.push_bind(addr_state);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_zip) = &payload.address_zip {
+        query_builder.push("address_zip = ");
+        query_builder.push_bind(addr_zip);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(tz) = &payload.timezone {
+        query_builder.push("timezone = ");
+        query_builder.push_bind(tz);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(ein) = &payload.ein_tin {
+        query_builder.push("ein_tin = ");
+        query_builder.push_bind(ein);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if !has_updates {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    query_builder.push("updated_at = NOW() WHERE id = ");
+    query_builder.push_bind(id);
+    query_builder.push(" AND deleted_at IS NULL");
+
+    let query = query_builder.build();
+    query.execute(state.db_pool.as_ref()).await.map_err(|e| {
+        error!("Database error updating publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Publisher updated successfully"
+    })))
+}
+
+async fn delete_publisher(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sqlx::query("UPDATE publishers SET deleted_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Publisher deleted successfully"
+    })))
+}
+
+async fn regenerate_publisher_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use rand::Rng;
+    use sha2::{Digest, Sha256};
+    use tracing::error;
+
+    // Verify publisher exists
+    let _publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Generate new API key
+    let api_key = format!("pk_live_{}", {
+        let mut rng = rand::thread_rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.gen_range(0..=255)).collect();
+        hex::encode(bytes)
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    let api_key_hash = hex::encode(hasher.finalize());
+
+    // Update publisher with new API key
+    sqlx::query(
+        "UPDATE publishers SET api_key_hash = $1, api_key_prefix = 'pk_live_', updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL"
+    )
+    .bind(&api_key_hash)
+    .bind(id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error updating API key: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "api_key": api_key,
+        "message": "API key regenerated successfully"
+    })))
+}
+
+async fn generate_publisher_hmac_secret(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use rand::Rng;
+    use sha2::{Digest, Sha256};
+    use tracing::error;
+
+    // Verify publisher exists
+    let _publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Generate new HMAC secret (128 hex characters = 64 bytes)
+    let hmac_secret = {
+        let mut rng = rand::thread_rng();
+        let bytes: Vec<u8> = (0..64).map(|_| rng.gen_range(0..=255)).collect();
+        hex::encode(bytes)
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(hmac_secret.as_bytes());
+    let hmac_secret_hash = hex::encode(hasher.finalize());
+    let hmac_secret_prefix = hmac_secret.chars().take(20).collect::<String>();
+
+    // Update publisher with new HMAC secret
+    sqlx::query(
+        "UPDATE publishers SET hmac_secret_hash = $1, hmac_secret_prefix = $2, updated_at = NOW() WHERE id = $3 AND deleted_at IS NULL"
+    )
+    .bind(&hmac_secret_hash)
+    .bind(&hmac_secret_prefix)
+    .bind(id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error updating HMAC secret: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "hmac_secret": hmac_secret,
+        "message": "HMAC secret generated successfully"
+    })))
+}
+
+// Buyers API
+async fn list_buyers(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::{error, info};
+    let active_buyers = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
+        "SELECT * FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC",
+    )
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing active buyers: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let deleted_buyers = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
+        "SELECT * FROM buyers WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+    )
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing deleted buyers: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!(
+        "Found {} active buyers, {} deleted buyers",
+        active_buyers.len(),
+        deleted_buyers.len()
+    );
+
+    // Load vertical info for all buyers
+    use sqlx::Row;
+    let active_response: Vec<serde_json::Value> = active_buyers
+        .iter()
+        .map(|b| {
+            let mut buyer_json = serde_json::json!({
+                "id": b.id.to_string(),
+                "name": b.name,
+                "status": b.status,
+                "created_at": b.created_at.to_rfc3339(),
+                "post_type": b.post_type,
+                "vertical_id": b.vertical_id.map(|v| v.to_string())
+            });
+
+            // Load vertical info if vertical_id exists
+            if let Some(vertical_id) = b.vertical_id {
+                // We'll load this in a separate query for efficiency
+                // For now, just include the ID - frontend can load details if needed
+                buyer_json["vertical"] = serde_json::json!({
+                    "id": vertical_id.to_string()
+                });
+            }
+
+            buyer_json
+        })
+        .collect();
+
+    // Load all verticals in one query
+    let verticals_map: std::collections::HashMap<Uuid, serde_json::Value> =
+        sqlx::query("SELECT id, name, slug FROM verticals")
+            .fetch_all(state.db_pool.as_ref())
+            .await
+            .ok()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        let id: Uuid = row.try_get("id").unwrap_or(Uuid::nil());
+                        let name: String = row.try_get("name").unwrap_or_default();
+                        let slug: String = row.try_get("slug").unwrap_or_default();
+                        (
+                            id,
+                            serde_json::json!({
+                                "id": id.to_string(),
+                                "name": name,
+                                "slug": slug
+                            }),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    // Process deleted buyers similarly
+    let deleted_response: Vec<serde_json::Value> = deleted_buyers
+        .iter()
+        .map(|b| {
+            let mut buyer_json = serde_json::json!({
+                "id": b.id.to_string(),
+                "name": b.name,
+                "status": b.status,
+                "created_at": b.created_at.to_rfc3339(),
+                "deleted_at": b.deleted_at.map(|d| d.to_rfc3339()),
+                "post_type": b.post_type,
+                "vertical_id": b.vertical_id.map(|v| v.to_string())
+            });
+
+            if let Some(vertical_id) = b.vertical_id {
+                buyer_json["vertical"] = serde_json::json!({
+                    "id": vertical_id.to_string()
+                });
+            }
+
+            buyer_json
+        })
+        .collect();
+
+    // Enrich active buyer response with vertical info
+    let active_response_enriched: Vec<serde_json::Value> = active_response
+        .into_iter()
+        .map(|mut buyer_json| {
+            if let Some(vertical_id_str) = buyer_json.get("vertical_id").and_then(|v| v.as_str()) {
+                if let Ok(vertical_id) = Uuid::parse_str(vertical_id_str) {
+                    if let Some(vertical_info) = verticals_map.get(&vertical_id) {
+                        buyer_json["vertical"] = vertical_info.clone();
+                    }
+                }
+            }
+            buyer_json
+        })
+        .collect();
+
+    // Enrich deleted buyer response with vertical info
+    let deleted_response_enriched: Vec<serde_json::Value> = deleted_response
+        .into_iter()
+        .map(|mut buyer_json| {
+            if let Some(vertical_id_str) = buyer_json.get("vertical_id").and_then(|v| v.as_str()) {
+                if let Ok(vertical_id) = Uuid::parse_str(vertical_id_str) {
+                    if let Some(vertical_info) = verticals_map.get(&vertical_id) {
+                        buyer_json["vertical"] = vertical_info.clone();
+                    }
+                }
+            }
+            buyer_json
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "buyers": active_response_enriched,
+        "deleted_buyers": deleted_response_enriched
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateBuyerRequest {
+    pub name: String,
+    #[serde(default)]
+    pub instance_id: Option<Uuid>,
+    #[serde(default)]
+    pub post_type: Option<String>,
+    #[serde(default)]
+    pub vertical_id: Option<Uuid>,
+    #[serde(default)]
+    pub buyer_type: Option<String>,
+    #[serde(default)]
+    pub email_address: Option<String>,
+    #[serde(default)]
+    pub ein_tin: Option<String>,
+    #[serde(default)]
+    pub address_street: Option<String>,
+    #[serde(default)]
+    pub address_city: Option<String>,
+    #[serde(default)]
+    pub address_state: Option<String>,
+    #[serde(default)]
+    pub address_zip: Option<String>,
+    #[serde(default)]
+    pub representative_first_name: Option<String>,
+    #[serde(default)]
+    pub representative_last_name: Option<String>,
+}
+
+async fn create_buyer(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateBuyerRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let instance_id = if let Some(id) = payload.instance_id {
+        id
+    } else {
+        let result = sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
+            .fetch_optional(state.db_pool.as_ref())
+            .await;
+
+        result
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::BAD_REQUEST)?
+    };
+
+    // Validate post_type
+    let post_type = payload.post_type.as_deref().unwrap_or("full_post");
+    if post_type != "full_post" && post_type != "ping_post" {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": format!("Invalid post_type: {}. Must be 'full_post' or 'ping_post'", post_type)
+        })));
+    }
+
+    // Validate buyer_type - it's optional, but if provided must be valid
+    let buyer_type = payload.buyer_type.as_deref();
+    if let Some(bt) = buyer_type {
+        if bt != "internal" && bt != "external" {
+            return Ok(Json(serde_json::json!({
+                "success": false,
+                "error": format!("Invalid buyer_type: {}. Must be 'internal' or 'external'", bt)
+            })));
+        }
+    }
+
+    // Validate vertical_id - it's optional but recommended
+    if payload.vertical_id.is_none() {
+        // Allow creation without vertical_id, but it should be set later
+    }
+
+    // Check for duplicate active buyer names (only allow duplicates if existing buyer is deleted)
+    let existing_buyer = sqlx::query(
+        "SELECT id, name, deleted_at FROM buyers WHERE instance_id = $1 AND name = $2 AND deleted_at IS NULL LIMIT 1"
+    )
+    .bind(instance_id)
+    .bind(&payload.name)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        use tracing::error;
+        error!("Database error checking for duplicate buyer name: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if existing_buyer.is_some() {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": format!("A buyer with the name '{}' already exists. Please choose a different name.", payload.name)
+        })));
+    }
+
+    let buyer_id = Uuid::new_v4();
+
+    let insert_result = sqlx::query(
+        r#"
+        INSERT INTO buyers (
+            id, name, instance_id, status, post_type, vertical_id, buyer_type,
+            email_address, ein_tin, address_street, address_city, address_state, address_zip,
+            representative_first_name, representative_last_name,
+            created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, 'incomplete', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(buyer_id)
+    .bind(&payload.name)
+    .bind(instance_id)
+    .bind(post_type)
+    .bind(payload.vertical_id)
+    .bind(buyer_type)
+    .bind(payload.email_address.as_ref())
+    .bind(payload.ein_tin.as_ref())
+    .bind(payload.address_street.as_ref())
+    .bind(payload.address_city.as_ref())
+    .bind(payload.address_state.as_ref())
+    .bind(payload.address_zip.as_ref())
+    .bind(payload.representative_first_name.as_ref())
+    .bind(payload.representative_last_name.as_ref())
+    .execute(state.db_pool.as_ref())
+    .await;
+
+    match insert_result {
+        Ok(_) => {}
+        Err(e) => {
+            // Check if it's a unique constraint violation - duplicate names should be allowed
+            let error_str = e.to_string();
+            if error_str.contains("duplicate key")
+                && (error_str.contains("instance_id_and_name")
+                    || error_str.contains("idx_buyers_instance_name"))
+            {
+                // This shouldn't happen if the constraint was removed, but handle it gracefully
+                use tracing::warn;
+                warn!("Duplicate buyer name constraint violation (constraint should be removed): {}. Error: {}", payload.name, error_str);
+                // Return a user-friendly error message
+                // Note: The constraint has been removed from the database, but the server connection pool may be stale
+                // Restart the server to refresh the connection pool
+                return Ok(Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("A buyer with the name '{}' already exists. Please restart the API server to refresh the database connection pool (the constraint has been removed from the database).", payload.name)
+                })));
+            }
+
+            // Log other database errors
+            use tracing::error;
+            error!("Database error creating buyer: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    // If buyer_type is internal and vertical_id is set, auto-select Pulsar integration
+    if buyer_type == Some("internal") && payload.vertical_id.is_some() {
+        // Find or create Pulsar integration for this vertical
+        use sqlx::Row;
+        if let Some(vertical_id) = payload.vertical_id {
+            // Get vertical slug for unique slug generation
+            let vertical_slug = sqlx::query("SELECT slug, name FROM verticals WHERE id = $1")
+                .bind(vertical_id)
+                .fetch_optional(state.db_pool.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| {
+                    let slug: String = row.try_get("slug").ok()?;
+                    Some((
+                        slug,
+                        row.try_get::<String, _>("name").ok().unwrap_or_default(),
+                    ))
+                });
+
+            if let Some((v_slug, v_name)) = vertical_slug {
+                // First try to find existing Pulsar integration for this vertical
+                // Since slug is unique, we'll search by vertical_id and is_internal=true
+                let pulsar_id = sqlx::query("SELECT id FROM buyer_integrations WHERE vertical_id = $1 AND is_internal = true AND status = 'available' LIMIT 1")
+                    .bind(vertical_id)
+                    .fetch_optional(state.db_pool.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.try_get::<Uuid, _>("id").ok());
+
+                // If not found, create it with name matching vertical (e.g., "Solar")
+                let pulsar_id = if let Some(id) = pulsar_id {
+                    id
+                } else {
+                    let new_id = Uuid::new_v4();
+                    // Use vertical name as integration name (e.g., "Solar")
+                    let integration_name = v_name.clone();
+                    // Create unique slug: pulsar-{vertical-slug}
+                    let integration_slug = format!("pulsar-{}", v_slug);
+
+                    sqlx::query(
+                        r#"
+                        INSERT INTO buyer_integrations (id, name, slug, vertical_id, description, is_internal, status, default_timeout, created_at, updated_at)
+                        VALUES ($1, $2, $3, $4, 'Internal Pulsar qualification engine', true, 'available', 1.2, NOW(), NOW())
+                        RETURNING id
+                        "#
+                    )
+                    .bind(new_id)
+                    .bind(&integration_name)
+                    .bind(&integration_slug)
+                    .bind(vertical_id)
+                    .fetch_optional(state.db_pool.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.try_get::<Uuid, _>("id").ok())
+                    .unwrap_or(new_id)
+                };
+
+                // Update buyer with Pulsar integration
+                let _ = sqlx::query("UPDATE buyers SET buyer_integration_id = $1 WHERE id = $2")
+                    .bind(pulsar_id)
+                    .bind(buyer_id)
+                    .execute(state.db_pool.as_ref())
+                    .await;
+            }
+        }
+    }
+
+    // Reload buyer to get all fields including buyer_integration_id if auto-selected
+    let created_buyer = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
+        "SELECT * FROM buyers WHERE id = $1",
+    )
+    .bind(buyer_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
+    // Log audit for buyer creation - include all created fields in "after"
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(instance_id),
+        None, // TODO: Extract user_id from request extensions
+        "buyer_created",
+        Some("Buyer"),
+        Some(buyer_id),
+        serde_json::json!({
+            "action": "create",
+            "after": {
+                "name": payload.name,
+                "buyer_type": buyer_type,
+                "vertical_id": payload.vertical_id.map(|v| v.to_string()),
+                "post_type": post_type,
+                "email_address": payload.email_address,
+                "ein_tin": payload.ein_tin,
+                "address_street": payload.address_street,
+                "address_city": payload.address_city,
+                "address_state": payload.address_state,
+                "address_zip": payload.address_zip,
+                "representative_first_name": payload.representative_first_name,
+                "representative_last_name": payload.representative_last_name,
+            }
+        }),
+        serde_json::json!({}),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "buyer": {
+            "id": buyer_id.to_string(),
+            "name": payload.name,
+            "status": created_buyer.as_ref().map(|b| &b.status).unwrap_or(&"incomplete".to_string()),
+            "buyer_type": buyer_type,
+            "post_type": post_type,
+            "vertical_id": payload.vertical_id.map(|v| v.to_string()),
+            "buyer_integration_id": created_buyer.as_ref().and_then(|b| b.buyer_integration_id.map(|v| v.to_string()))
+        },
+        "message": "Buyer created successfully"
+    })))
+}
+
+async fn get_buyer(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Allow viewing deleted buyers (remove deleted_at filter)
+    let buyer = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
+        "SELECT * FROM buyers WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Load vertical info if vertical_id exists
+    let vertical_info = if let Some(vertical_id) = buyer.vertical_id {
+        sqlx::query_as::<_, leadsnebula_core::models::vertical::Vertical>(
+            "SELECT * FROM verticals WHERE id = $1",
+        )
+        .bind(vertical_id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten()
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id.to_string(),
+                "name": v.name,
+                "slug": v.slug
+            })
+        })
+    } else {
+        None
+    };
+
+    // Load integration info if buyer_integration_id exists
+    let integration_info = if let Some(integration_id) = buyer.buyer_integration_id {
+        sqlx::query("SELECT id, name, slug FROM buyer_integrations WHERE id = $1")
+            .bind(integration_id)
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|row: sqlx::postgres::PgRow| {
+                use sqlx::Row;
+                serde_json::json!({
+                    "id": row.try_get::<Uuid, _>("id").unwrap_or(Uuid::nil()).to_string(),
+                    "name": row.try_get::<String, _>("name").unwrap_or_default(),
+                    "slug": row.try_get::<String, _>("slug").unwrap_or_default()
+                })
+            })
+    } else {
+        None
+    };
+
+    // Check if buyer can be activated (all general info filled + integration selected)
+    let can_activate = !buyer.name.is_empty()
+        && buyer.email_address.is_some()
+        && buyer.ein_tin.is_some()
+        && buyer.address_street.is_some()
+        && buyer.address_city.is_some()
+        && buyer.address_state.is_some()
+        && buyer.address_zip.is_some()
+        && buyer.representative_first_name.is_some()
+        && buyer.representative_last_name.is_some()
+        && buyer.buyer_integration_id.is_some();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "buyer": {
+            "id": buyer.id.to_string(),
+            "name": buyer.name,
+            "status": buyer.status,
+            "created_at": buyer.created_at.to_rfc3339(),
+            "deleted_at": buyer.deleted_at.map(|d| d.to_rfc3339()),
+            "buyer_type": buyer.buyer_type,
+            "vertical_id": buyer.vertical_id.map(|v| v.to_string()),
+            "vertical": vertical_info,
+            "buyer_integration_id": buyer.buyer_integration_id.map(|v| v.to_string()),
+            "integration": integration_info,
+            "post_type": buyer.post_type,
+            "email_address": buyer.email_address,
+            "ein_tin": buyer.ein_tin,
+            "address_street": buyer.address_street,
+            "address_city": buyer.address_city,
+            "address_state": buyer.address_state,
+            "address_zip": buyer.address_zip,
+            "representative_first_name": buyer.representative_first_name,
+            "representative_last_name": buyer.representative_last_name,
+            "can_activate": can_activate
+        }
+    })))
+}
+
+async fn update_buyer(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Extension(user): axum::extract::Extension<leadsnebula_core::models::user::User>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Check if buyer is deleted - prevent updates to deleted buyers
+    let buyer_check = sqlx::query("SELECT deleted_at FROM buyers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(row) = buyer_check {
+        use sqlx::Row;
+        if let Ok(Some(_deleted_at)) =
+            row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Get buyer before update for audit log
+    let buyer_before = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
+        "SELECT * FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
+    // Build update query dynamically like update_publisher
+    let mut query_builder = sqlx::QueryBuilder::new("UPDATE buyers SET ");
+    let mut has_updates = false;
+    let mut changed_fields = serde_json::Map::new();
+
+    if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            if buyer.name != name {
+                changed_fields.insert(
+                    "name".to_string(),
+                    serde_json::json!({
+                        "before": buyer.name,
+                        "after": name
+                    }),
+                );
+            }
+        }
+        query_builder.push("name = ");
+        query_builder.push_bind(name);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(email) = payload.get("email_address").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            let before_email = buyer.email_address.as_deref().unwrap_or("");
+            if before_email != email {
+                changed_fields.insert(
+                    "email_address".to_string(),
+                    serde_json::json!({
+                        "before": before_email,
+                        "after": email
+                    }),
+                );
+            }
+        }
+        query_builder.push("email_address = ");
+        query_builder.push_bind(email);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(ein_tin) = payload.get("ein_tin").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            let before_ein_tin = buyer.ein_tin.as_deref().unwrap_or("");
+            if before_ein_tin != ein_tin {
+                changed_fields.insert(
+                    "ein_tin".to_string(),
+                    serde_json::json!({
+                        "before": before_ein_tin,
+                        "after": ein_tin
+                    }),
+                );
+            }
+        }
+        query_builder.push("ein_tin = ");
+        query_builder.push_bind(ein_tin);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_street) = payload.get("address_street").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            let before_addr_street = buyer.address_street.as_deref().unwrap_or("");
+            if before_addr_street != addr_street {
+                changed_fields.insert(
+                    "address_street".to_string(),
+                    serde_json::json!({
+                        "before": before_addr_street,
+                        "after": addr_street
+                    }),
+                );
+            }
+        }
+        query_builder.push("address_street = ");
+        query_builder.push_bind(addr_street);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_city) = payload.get("address_city").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            let before_addr_city = buyer.address_city.as_deref().unwrap_or("");
+            if before_addr_city != addr_city {
+                changed_fields.insert(
+                    "address_city".to_string(),
+                    serde_json::json!({
+                        "before": before_addr_city,
+                        "after": addr_city
+                    }),
+                );
+            }
+        }
+        query_builder.push("address_city = ");
+        query_builder.push_bind(addr_city);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_state) = payload.get("address_state").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            let before_addr_state = buyer.address_state.as_deref().unwrap_or("");
+            if before_addr_state != addr_state {
+                changed_fields.insert(
+                    "address_state".to_string(),
+                    serde_json::json!({
+                        "before": before_addr_state,
+                        "after": addr_state
+                    }),
+                );
+            }
+        }
+        query_builder.push("address_state = ");
+        query_builder.push_bind(addr_state);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(addr_zip) = payload.get("address_zip").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            let before_addr_zip = buyer.address_zip.as_deref().unwrap_or("");
+            if before_addr_zip != addr_zip {
+                changed_fields.insert(
+                    "address_zip".to_string(),
+                    serde_json::json!({
+                        "before": before_addr_zip,
+                        "after": addr_zip
+                    }),
+                );
+            }
+        }
+        query_builder.push("address_zip = ");
+        query_builder.push_bind(addr_zip);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(rep_first) = payload
+        .get("representative_first_name")
+        .and_then(|v| v.as_str())
+    {
+        if let Some(ref buyer) = buyer_before {
+            let before_rep_first = buyer.representative_first_name.as_deref().unwrap_or("");
+            if before_rep_first != rep_first {
+                changed_fields.insert(
+                    "representative_first_name".to_string(),
+                    serde_json::json!({
+                        "before": before_rep_first,
+                        "after": rep_first
+                    }),
+                );
+            }
+        }
+        query_builder.push("representative_first_name = ");
+        query_builder.push_bind(rep_first);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(rep_last) = payload
+        .get("representative_last_name")
+        .and_then(|v| v.as_str())
+    {
+        if let Some(ref buyer) = buyer_before {
+            let before_rep_last = buyer.representative_last_name.as_deref().unwrap_or("");
+            if before_rep_last != rep_last {
+                changed_fields.insert(
+                    "representative_last_name".to_string(),
+                    serde_json::json!({
+                        "before": before_rep_last,
+                        "after": rep_last
+                    }),
+                );
+            }
+        }
+        query_builder.push("representative_last_name = ");
+        query_builder.push_bind(rep_last);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+    if let Some(buyer_integration_id) = payload.get("buyer_integration_id") {
+        if buyer_integration_id.is_null()
+            || (buyer_integration_id.is_string()
+                && buyer_integration_id.as_str().unwrap_or("").is_empty())
+        {
+            query_builder.push("buyer_integration_id = NULL, ");
+            has_updates = true;
+        } else if let Some(id_str) = buyer_integration_id.as_str() {
+            if !id_str.is_empty() {
+                if let Ok(id) = Uuid::parse_str(id_str) {
+                    query_builder.push("buyer_integration_id = ");
+                    query_builder.push_bind(id);
+                    query_builder.push(", ");
+                    has_updates = true;
+                }
+            }
+        }
+    }
+    if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
+        if let Some(ref buyer) = buyer_before {
+            if buyer.status != status {
+                changed_fields.insert(
+                    "status".to_string(),
+                    serde_json::json!({
+                        "before": buyer.status,
+                        "after": status
+                    }),
+                );
+            }
+        }
+        query_builder.push("status = ");
+        query_builder.push_bind(status);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if !has_updates {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "Buyer updated successfully"
+        })));
+    }
+
+    // Add updated_at and WHERE clause
+    query_builder.push(" updated_at = NOW() WHERE id = ");
+    query_builder.push_bind(id);
+    query_builder.push(" AND deleted_at IS NULL");
+
+    let query = query_builder.build();
+
+    let update_result = query.execute(state.db_pool.as_ref()).await;
+
+    update_result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Log audit for buyer update - log even if changed_fields is empty (to track all updates)
+    if has_updates {
+        let instance_id = buyer_before.as_ref().map(|b| b.instance_id);
+
+        // Determine action type based on what changed
+        let action_type = if changed_fields.contains_key("status") {
+            let new_status = changed_fields
+                .get("status")
+                .and_then(|v| v.get("after").and_then(|a| a.as_str()))
+                .unwrap_or("");
+            if new_status == "active" {
+                "buyer_activated"
+            } else if new_status == "suspended" {
+                "buyer_deactivated"
+            } else {
+                "buyer_updated"
+            }
+        } else {
+            "buyer_updated"
+        };
+
+        // Build full audit log with all data points (not just changed ones) - matching Ruby Security page format
+        // Build buyer_before_full from the buyer_before object
+        let buyer_before_full = buyer_before.as_ref().map(|b| {
+            let mut json = serde_json::Map::new();
+            json.insert("name".to_string(), serde_json::json!(b.name));
+            json.insert(
+                "email_address".to_string(),
+                serde_json::json!(b.email_address),
+            );
+            json.insert("ein_tin".to_string(), serde_json::json!(b.ein_tin));
+            json.insert(
+                "address_street".to_string(),
+                serde_json::json!(b.address_street),
+            );
+            json.insert(
+                "address_city".to_string(),
+                serde_json::json!(b.address_city),
+            );
+            json.insert(
+                "address_state".to_string(),
+                serde_json::json!(b.address_state),
+            );
+            json.insert("address_zip".to_string(), serde_json::json!(b.address_zip));
+            json.insert(
+                "representative_first_name".to_string(),
+                serde_json::json!(b.representative_first_name),
+            );
+            json.insert(
+                "representative_last_name".to_string(),
+                serde_json::json!(b.representative_last_name),
+            );
+            json.insert("status".to_string(), serde_json::json!(b.status));
+            json.insert("post_type".to_string(), serde_json::json!(b.post_type));
+            json.insert("buyer_type".to_string(), serde_json::json!(b.buyer_type));
+            json.insert(
+                "vertical_id".to_string(),
+                serde_json::json!(b.vertical_id.map(|v| v.to_string())),
+            );
+            json.insert(
+                "buyer_integration_id".to_string(),
+                serde_json::json!(b.buyer_integration_id.map(|v| v.to_string())),
+            );
+            serde_json::Value::Object(json)
+        });
+
+        // Build buyer_after_full from buyer_before + changed_fields (more reliable than fetching from DB)
+        let buyer_after_full = buyer_before.as_ref().map(|b| {
+            let mut json = serde_json::Map::new();
+            // Start with all fields from buyer_before
+            json.insert("name".to_string(), serde_json::json!(b.name));
+            json.insert(
+                "email_address".to_string(),
+                serde_json::json!(b.email_address),
+            );
+            json.insert("ein_tin".to_string(), serde_json::json!(b.ein_tin));
+            json.insert(
+                "address_street".to_string(),
+                serde_json::json!(b.address_street),
+            );
+            json.insert(
+                "address_city".to_string(),
+                serde_json::json!(b.address_city),
+            );
+            json.insert(
+                "address_state".to_string(),
+                serde_json::json!(b.address_state),
+            );
+            json.insert("address_zip".to_string(), serde_json::json!(b.address_zip));
+            json.insert(
+                "representative_first_name".to_string(),
+                serde_json::json!(b.representative_first_name),
+            );
+            json.insert(
+                "representative_last_name".to_string(),
+                serde_json::json!(b.representative_last_name),
+            );
+            json.insert("status".to_string(), serde_json::json!(b.status));
+            json.insert("post_type".to_string(), serde_json::json!(b.post_type));
+            json.insert("buyer_type".to_string(), serde_json::json!(b.buyer_type));
+            json.insert(
+                "vertical_id".to_string(),
+                serde_json::json!(b.vertical_id.map(|v| v.to_string())),
+            );
+            json.insert(
+                "buyer_integration_id".to_string(),
+                serde_json::json!(b.buyer_integration_id.map(|v| v.to_string())),
+            );
+
+            // Override with changed values from changed_fields
+            for (key, change_obj) in &changed_fields {
+                if let Some(after_val) = change_obj.get("after") {
+                    match key.as_str() {
+                        "name" => json.insert("name".to_string(), after_val.clone()),
+                        "email_address" => {
+                            json.insert("email_address".to_string(), after_val.clone())
+                        }
+                        "ein_tin" => json.insert("ein_tin".to_string(), after_val.clone()),
+                        "address_street" => {
+                            json.insert("address_street".to_string(), after_val.clone())
+                        }
+                        "address_city" => {
+                            json.insert("address_city".to_string(), after_val.clone())
+                        }
+                        "address_state" => {
+                            json.insert("address_state".to_string(), after_val.clone())
+                        }
+                        "address_zip" => json.insert("address_zip".to_string(), after_val.clone()),
+                        "representative_first_name" => {
+                            json.insert("representative_first_name".to_string(), after_val.clone())
+                        }
+                        "representative_last_name" => {
+                            json.insert("representative_last_name".to_string(), after_val.clone())
+                        }
+                        "status" => json.insert("status".to_string(), after_val.clone()),
+                        "post_type" => json.insert("post_type".to_string(), after_val.clone()),
+                        "buyer_type" => json.insert("buyer_type".to_string(), after_val.clone()),
+                        "vertical_id" => json.insert("vertical_id".to_string(), after_val.clone()),
+                        "buyer_integration_id" => {
+                            json.insert("buyer_integration_id".to_string(), after_val.clone())
+                        }
+                        _ => None,
+                    };
+                }
+            }
+
+            serde_json::Value::Object(json)
+        });
+
+        // Extract compliance-required information from headers (ISO 27001, SOC 2, NIST)
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Extract request ID from headers (X-Request-ID, X-Correlation-ID, or generate)
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // Extract session ID if available
+        let session_id = headers
+            .get("x-session-id")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Extract referer for context
+        let referer = headers
+            .get("referer")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Build actor information (ISO 27001 A.12.4.1: User identification required)
+        let actor_name = format!(
+            "{} {}",
+            user.first_name.as_deref().unwrap_or(""),
+            user.last_name.as_deref().unwrap_or("")
+        )
+        .trim()
+        .to_string();
+        let actor_name = if actor_name.is_empty() {
+            user.email.clone()
+        } else {
+            actor_name
+        };
+
+        // Determine user role (TODO: Query from database)
+        let user_role = "instance_admin"; // TODO: Determine actual role from user_roles table
+
+        // Build full audit log details matching compliance standards (ISO 27001, SOC 2, NIST)
+        // ISO 27001 A.12.4.1 requires: user identification, type of event, date/time, success/failure, source
+        // SOC 2 CC6.6 requires: who, what, when, where, why, result
+        // NIST/OWASP best practices: actor, action, target, context, outcome, timestamp
+        let timestamp = chrono::Utc::now();
+        let audit_details = serde_json::json!({
+            "action": "update",
+            "target_type": "Buyer",
+            "target_id": id.to_string(),
+            "target_name": buyer_after_full.as_ref().and_then(|b| b.get("name").and_then(|n| n.as_str())).unwrap_or(""),
+            "actor": {
+                "id": user.id.to_string(),
+                "name": actor_name,
+                "email": user.email,
+                "role": user_role,
+                "instance_id": instance_id.map(|id| id.to_string())
+            },
+            "changes": changed_fields,
+            "before": buyer_before_full,
+            "after": buyer_after_full,
+            "context": {
+                "reason": "User updated buyer via dashboard",
+                "request_id": request_id,
+                "session_id": session_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "referer": referer,
+                "method": "POST",
+                "endpoint": format!("/api/v1/dashboard/buyers/{}", id),
+                "source": "dashboard_web_ui"
+            },
+            "outcome": "success",
+            "timestamp": timestamp.to_rfc3339(),
+            "compliance": {
+                "standard": "ISO_27001_SOC2_NIST",
+                "version": "2024"
+            }
+        });
+
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            instance_id,
+            Some(user.id),
+            action_type,
+            Some("Buyer"),
+            Some(id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Buyer updated successfully"
+    })))
+}
+
+async fn delete_buyer(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get buyer info before deletion for audit log
+    let buyer_before = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
+        "SELECT * FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching buyer: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let buyer_before = match buyer_before {
+        Some(b) => b,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Get affected campaigns for audit log
+    let affected_campaigns: Vec<serde_json::Value> =
+        sqlx::query("SELECT id, name, campaign_token FROM campaigns WHERE buyer_id = $1")
+            .bind(id)
+            .fetch_all(state.db_pool.as_ref())
+            .await
+            .ok()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                use sqlx::Row;
+                let id: Option<Uuid> = row.try_get("id").ok();
+                let name: Option<String> = row.try_get("name").ok();
+                let token: Option<String> = row.try_get("campaign_token").ok();
+                id.map(|id| {
+                    serde_json::json!({
+                        "id": id.to_string(),
+                        "name": name.unwrap_or_default(),
+                        "campaign_token": token.unwrap_or_default()
+                    })
+                })
+            })
+            .collect();
+
+    // Soft delete the buyer (set deleted_at)
+    sqlx::query("UPDATE buyers SET deleted_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error soft deleting buyer: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Log audit for buyer deletion
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(buyer_before.instance_id),
+        None, // TODO: Extract user_id from request extensions
+        "buyer_deleted",
+        Some("Buyer"),
+        Some(id),
+        serde_json::json!({
+            "buyer_name": buyer_before.name,
+            "buyer_type": buyer_before.buyer_type,
+            "post_type": buyer_before.post_type
+        }),
+        serde_json::json!({
+            "campaigns": affected_campaigns
+        }),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Buyer deleted successfully"
+    })))
+}
+
+// Campaigns API
+async fn list_campaigns(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::{error, info};
+    let campaigns = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
+        "SELECT * FROM campaigns WHERE deleted_at IS NULL ORDER BY created_at DESC",
+    )
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing campaigns: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Found {} campaigns", campaigns.len());
+
+    let response: Vec<serde_json::Value> = campaigns
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id.to_string(),
+                "name": c.name,
+                "vertical": c.vertical,
+                "campaign_token": c.campaign_token,
+                "status": c.status,
+                "publisher_id": c.publisher_id.to_string(),
+                "buyer_id": c.buyer_id.to_string(),
+                "created_at": c.created_at.to_rfc3339()
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "campaigns": response
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateCampaignRequest {
+    pub name: Option<String>,
+    pub vertical: String,
+    pub publisher_id: Uuid,
+    pub buyer_id: Uuid,
+    pub instance_id: Option<Uuid>,
+    pub ping_tree_id: Option<Uuid>,
+}
+
+#[axum::debug_handler]
+async fn create_campaign(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateCampaignRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let instance_id = if let Some(id) = payload.instance_id {
+        id
+    } else {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::BAD_REQUEST)?
+    };
+
+    // Generate campaign token
+    let token_bytes: Vec<u8> = (0..20).map(|_| rand::random::<u8>()).collect();
+    let campaign_token = hex::encode(token_bytes);
+
+    let campaign_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO campaigns (
+            id, buyer_id, publisher_id, instance_id, name, vertical,
+            campaign_token, status, is_documentation_test, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, 'active', false, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(campaign_id)
+    .bind(payload.buyer_id)
+    .bind(payload.publisher_id)
+    .bind(instance_id)
+    .bind(payload.name.as_deref())
+    .bind(&payload.vertical)
+    .bind(&campaign_token)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // If ping_tree_id provided, add campaign to ping tree
+    if let Some(ping_tree_id) = payload.ping_tree_id {
+        sqlx::query(
+            r#"
+            INSERT INTO ping_tree_campaigns (
+                id, ping_tree_id, campaign_id, priority, enabled, created_at, updated_at
+            ) VALUES (
+                gen_random_uuid(), $1, $2, 1, true, NOW(), NOW()
+            )
+            ON CONFLICT (ping_tree_id, campaign_id) DO NOTHING
+            "#,
+        )
+        .bind(ping_tree_id)
+        .bind(campaign_id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "campaign": {
+            "id": campaign_id.to_string(),
+            "name": payload.name,
+            "vertical": payload.vertical,
+            "campaign_token": campaign_token,
+            "status": "active",
+            "publisher_id": payload.publisher_id.to_string(),
+            "buyer_id": payload.buyer_id.to_string()
+        },
+        "message": "Campaign created successfully"
+    })))
+}
+
+async fn get_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let campaign = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
+        "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "campaign": {
+            "id": campaign.id.to_string(),
+            "name": campaign.name,
+            "vertical": campaign.vertical,
+            "campaign_token": campaign.campaign_token,
+            "status": campaign.status,
+            "publisher_id": campaign.publisher_id.to_string(),
+            "buyer_id": campaign.buyer_id.to_string(),
+            "created_at": campaign.created_at.to_rfc3339()
+        }
+    })))
+}
+
+async fn update_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
+        sqlx::query("UPDATE campaigns SET name = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL")
+            .bind(name)
+            .bind(id)
+            .execute(state.db_pool.as_ref())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Campaign updated successfully"
+    })))
+}
+
+async fn delete_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sqlx::query("UPDATE campaigns SET deleted_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Campaign deleted successfully"
+    })))
+}
+
+// Ping Trees API
+async fn list_ping_trees(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::{error, info};
+    let ping_trees = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE deleted_at IS NULL ORDER BY created_at DESC",
+    )
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing ping trees: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Found {} ping trees", ping_trees.len());
+
+    let response: Vec<serde_json::Value> = ping_trees
+        .iter()
+        .map(|pt| {
+            serde_json::json!({
+                "id": pt.id.to_string(),
+                "name": pt.name,
+                "vertical": pt.vertical,
+                "strategy": pt.strategy,
+                "status": pt.status,
+                "publisher_id": pt.publisher_id.to_string(),
+                "priority": pt.priority,
+                "created_at": pt.created_at.to_rfc3339()
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "ping_trees": response
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CreatePingTreeRequest {
+    pub name: String,
+    pub vertical: String,
+    pub strategy: String,
+    pub publisher_id: Uuid,
+    pub instance_id: Option<Uuid>,
+    pub priority: Option<i32>,
+}
+
+async fn create_ping_tree(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePingTreeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Validate strategy
+    if payload.strategy != "ping_post" && payload.strategy != "fullpost" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let instance_id = if let Some(id) = payload.instance_id {
+        id
+    } else {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::BAD_REQUEST)?
+    };
+
+    let ping_tree_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        INSERT INTO ping_trees (
+            id, instance_id, publisher_id, name, vertical, strategy, status,
+            priority, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, 'active',
+            $7, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(ping_tree_id)
+    .bind(instance_id)
+    .bind(payload.publisher_id)
+    .bind(&payload.name)
+    .bind(&payload.vertical)
+    .bind(&payload.strategy)
+    .bind(payload.priority)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "ping_tree": {
+            "id": ping_tree_id.to_string(),
+            "name": payload.name,
+            "vertical": payload.vertical,
+            "strategy": payload.strategy,
+            "status": "active",
+            "publisher_id": payload.publisher_id.to_string(),
+            "priority": payload.priority
+        },
+        "message": "Ping tree created successfully"
+    })))
+}
+
+async fn get_ping_tree(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Get campaigns in this ping tree
+    let campaigns = sqlx::query_as::<_, leadsnebula_core::models::ping_tree_campaign::PingTreeCampaign>(
+        "SELECT * FROM ping_tree_campaigns WHERE ping_tree_id = $1 ORDER BY priority ASC NULLS LAST"
+    )
+    .bind(id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "ping_tree": {
+            "id": ping_tree.id.to_string(),
+            "name": ping_tree.name,
+            "vertical": ping_tree.vertical,
+            "strategy": ping_tree.strategy,
+            "status": ping_tree.status,
+            "publisher_id": ping_tree.publisher_id.to_string(),
+            "priority": ping_tree.priority,
+            "created_at": ping_tree.created_at.to_rfc3339()
+        },
+        "campaigns": campaigns.iter().map(|c| serde_json::json!({
+            "id": c.id.to_string(),
+            "campaign_id": c.campaign_id.to_string(),
+            "priority": c.priority,
+            "enabled": c.enabled
+        })).collect::<Vec<_>>()
+    })))
+}
+
+async fn update_ping_tree(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
+        sqlx::query("UPDATE ping_trees SET name = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL")
+            .bind(name)
+            .bind(id)
+            .execute(state.db_pool.as_ref())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Ping tree updated successfully"
+    })))
+}
+
+async fn delete_ping_tree(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sqlx::query("UPDATE ping_trees SET deleted_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Ping tree deleted successfully"
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct AddCampaignToPingTreeRequest {
+    pub campaign_id: Uuid,
+    pub priority: Option<i32>,
+}
+
+async fn add_campaign_to_ping_tree(
+    State(state): State<AppState>,
+    Path(ping_tree_id): Path<Uuid>,
+    Json(payload): Json<AddCampaignToPingTreeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sqlx::query(
+        r#"
+        INSERT INTO ping_tree_campaigns (
+            id, ping_tree_id, campaign_id, priority, enabled, created_at, updated_at
+        ) VALUES (
+            gen_random_uuid(), $1, $2, $3, true, NOW(), NOW()
+        )
+        ON CONFLICT (ping_tree_id, campaign_id) DO UPDATE
+        SET priority = EXCLUDED.priority, enabled = true, updated_at = NOW()
+        "#,
+    )
+    .bind(ping_tree_id)
+    .bind(payload.campaign_id)
+    .bind(payload.priority)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Campaign added to ping tree successfully"
+    })))
+}
+
+async fn remove_campaign_from_ping_tree(
+    State(state): State<AppState>,
+    Path((ping_tree_id, campaign_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sqlx::query("DELETE FROM ping_tree_campaigns WHERE ping_tree_id = $1 AND campaign_id = $2")
+        .bind(ping_tree_id)
+        .bind(campaign_id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Campaign removed from ping tree successfully"
+    })))
+}
+
+// Verticals API
+async fn list_verticals(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::{error, info};
+    let verticals = sqlx::query_as::<_, leadsnebula_core::models::vertical::Vertical>(
+        "SELECT * FROM verticals WHERE is_active = true ORDER BY name",
+    )
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing verticals: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Found {} verticals", verticals.len());
+
+    let response: Vec<serde_json::Value> = verticals
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id.to_string(),
+                "name": v.name,
+                "slug": v.slug,
+                "is_active": v.is_active
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "verticals": response
+    })))
+}
+
+// Buyer Integrations API
+async fn list_buyer_integrations(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::{error, info};
+
+    let vertical_id_param = params.get("vertical_id");
+
+    let integrations = if let Some(vertical_id_str) = vertical_id_param {
+        if let Ok(vertical_id) = Uuid::parse_str(vertical_id_str) {
+            sqlx::query(
+                "SELECT id, name, slug, vertical_id, description, is_internal, status, default_timeout FROM buyer_integrations WHERE status = 'available' AND vertical_id = $1 ORDER BY name"
+            )
+            .bind(vertical_id)
+            .fetch_all(state.db_pool.as_ref())
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, name, slug, vertical_id, description, is_internal, status, default_timeout FROM buyer_integrations WHERE status = 'available' ORDER BY name"
+            )
+            .fetch_all(state.db_pool.as_ref())
+            .await
+        }
+    } else {
+        sqlx::query(
+            "SELECT id, name, slug, vertical_id, description, is_internal, status, default_timeout FROM buyer_integrations WHERE status = 'available' ORDER BY name"
+        )
+        .fetch_all(state.db_pool.as_ref())
+        .await
+    }
+    .map_err(|e| {
+        error!("Database error listing buyer integrations: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Found {} buyer integrations", integrations.len());
+
+    use sqlx::Row;
+    let response: Vec<serde_json::Value> = integrations
+        .iter()
+        .map(|row| {
+            let id: Uuid = row.try_get("id").unwrap_or_else(|_| Uuid::nil());
+            let name: String = row.try_get("name").unwrap_or_else(|_| String::new());
+            let slug: String = row.try_get("slug").unwrap_or_else(|_| String::new());
+            let vertical_id: Uuid = row.try_get("vertical_id").unwrap_or_else(|_| Uuid::nil());
+            let description: Option<String> = row.try_get("description").ok();
+            let is_internal: bool = row.try_get("is_internal").unwrap_or(false);
+            let status: String = row.try_get("status").unwrap_or_else(|_| String::new());
+            let default_timeout: Option<f64> = row
+                .try_get::<Option<String>, _>("default_timeout")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| row.try_get::<f64, _>("default_timeout").ok());
+
+            serde_json::json!({
+                "id": id.to_string(),
+                "name": name,
+                "slug": slug,
+                "vertical_id": vertical_id.to_string(),
+                "description": description,
+                "is_internal": is_internal,
+                "status": status,
+                "default_timeout": default_timeout
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "integrations": response
+    })))
+}
+
+// Buyer Rule Sets API
+
+#[derive(Deserialize)]
+pub struct CreateRuleSetRequest {
+    pub rule_set_name: String,
+    pub timeout_seconds: Option<f64>,
+    pub enabled: Option<bool>,
+    pub is_active: Option<bool>,
+    pub config: Option<serde_json::Value>,
+    pub rules_order: Option<Vec<String>>,
+}
+
+async fn list_buyer_rule_sets(
+    State(state): State<AppState>,
+    Path(buyer_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::{error, info};
+
+    let rule_sets = sqlx::query(
+        r#"
+        SELECT 
+            id, buyer_id, vertical_id, buyer_integration_id, rule_set_name,
+            config, rules_order, enabled, is_active, timeout_seconds,
+            created_at, updated_at
+        FROM buyer_qualification_configs
+        WHERE buyer_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(buyer_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing buyer rule sets: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!("Found {} rule sets for buyer {}", rule_sets.len(), buyer_id);
+
+    // Load ZIP codes from tables once for all rule sets
+    let (blacklist_zips, whitelist_zips) =
+        load_zip_codes_from_tables(state.db_pool.as_ref(), buyer_id)
+            .await
+            .unwrap_or_else(|e| {
+                error!("Error loading ZIP codes from tables: {}", e);
+                (Vec::new(), Vec::new())
+            });
+
+    let response: Vec<serde_json::Value> = rule_sets
+        .iter()
+        .map(|row| {
+            let id: Uuid = row.try_get("id").unwrap_or_else(|_| Uuid::nil());
+            let buyer_id: Uuid = row.try_get("buyer_id").unwrap_or_else(|_| Uuid::nil());
+            let vertical_id: Uuid = row.try_get("vertical_id").unwrap_or_else(|_| Uuid::nil());
+            let buyer_integration_id: Option<Uuid> = row.try_get("buyer_integration_id").ok();
+            let rule_set_name: String = row.try_get("rule_set_name").unwrap_or_default();
+            let mut config: serde_json::Value = row
+                .try_get("config")
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let rules_order: Vec<String> = row.try_get("rules_order").unwrap_or_default();
+            let enabled: bool = row.try_get("enabled").unwrap_or(true);
+            let is_active: bool = row.try_get("is_active").unwrap_or(false);
+            // DECIMAL columns must be retrieved as rust_decimal::Decimal for PostgreSQL NUMERIC
+            use rust_decimal::Decimal;
+            let timeout_seconds: Option<f64> = row
+                .try_get::<Option<Decimal>, _>("timeout_seconds")
+                .ok()
+                .flatten()
+                .map(|d| d.to_string().parse::<f64>().unwrap_or(1.2))
+                .or_else(|| row.try_get::<f64, _>("timeout_seconds").ok())
+                .or_else(|| {
+                    row.try_get::<Option<String>, _>("timeout_seconds")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.parse::<f64>().ok())
+                });
+            let created_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("created_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let updated_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("updated_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            // Update config with ZIP codes from tables (tables are source of truth)
+            if let Some(config_obj) = config.as_object_mut() {
+                if !blacklist_zips.is_empty() {
+                    config_obj.insert(
+                        "zip_blacklist".to_string(),
+                        serde_json::json!(blacklist_zips.clone()),
+                    );
+                } else {
+                    config_obj.remove("zip_blacklist");
+                }
+                if !whitelist_zips.is_empty() {
+                    config_obj.insert(
+                        "zip_whitelist".to_string(),
+                        serde_json::json!(whitelist_zips.clone()),
+                    );
+                } else {
+                    config_obj.remove("zip_whitelist");
+                }
+            }
+
+            serde_json::json!({
+                "id": id.to_string(),
+                "buyer_id": buyer_id.to_string(),
+                "vertical_id": vertical_id.to_string(),
+                "buyer_integration_id": buyer_integration_id.map(|v| v.to_string()),
+                "rule_set_name": rule_set_name,
+                "config": config,
+                "rules_order": rules_order,
+                "enabled": enabled,
+                "is_active": is_active,
+                "timeout_seconds": timeout_seconds,
+                "created_at": created_at.to_rfc3339(),
+                "updated_at": updated_at.to_rfc3339()
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "rule_sets": response
+    })))
+}
+
+async fn create_buyer_rule_set(
+    State(state): State<AppState>,
+    Path(buyer_id): Path<Uuid>,
+    Json(payload): Json<CreateRuleSetRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    // Verify buyer exists
+    let buyer =
+        sqlx::query("SELECT id, vertical_id FROM buyers WHERE id = $1 AND deleted_at IS NULL")
+            .bind(buyer_id)
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .map_err(|e| {
+                error!("Database error checking buyer: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let buyer = buyer.ok_or(StatusCode::NOT_FOUND)?;
+    let vertical_id: Uuid = buyer
+        .try_get("vertical_id")
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let rule_set_id = Uuid::new_v4();
+    let timeout_seconds = payload.timeout_seconds.unwrap_or(1.2);
+    let enabled = payload.enabled.unwrap_or(true);
+    let is_active = payload.is_active.unwrap_or(false);
+    let config = payload.config.unwrap_or_else(|| serde_json::json!({}));
+    let rules_order = payload.rules_order.unwrap_or_else(|| {
+        vec![
+            "zip_blacklist".to_string(),
+            "zip_whitelist".to_string(),
+            "own_home".to_string(),
+            "roof_shade".to_string(),
+            "credit_rating".to_string(),
+            "monthly_bill".to_string(),
+            "property_type".to_string(),
+            "roof_type".to_string(),
+            "purchase_timeframe".to_string(),
+        ]
+    });
+
+    // If setting as active, deactivate all other rule sets for this buyer
+    if is_active {
+        sqlx::query("UPDATE buyer_qualification_configs SET is_active = false WHERE buyer_id = $1")
+            .bind(buyer_id)
+            .execute(state.db_pool.as_ref())
+            .await
+            .map_err(|e| {
+                error!("Database error deactivating rule sets: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // Extract ZIP codes from config before saving (store in separate tables, remove from JSONB)
+    let mut config_for_db = config.clone();
+    if let Err(e) =
+        extract_and_store_zip_codes(state.db_pool.as_ref(), buyer_id, &mut config_for_db).await
+    {
+        error!("Error extracting and storing ZIP codes: {}", e);
+        // Don't fail the request, just log the error - continue with original config
+    }
+
+    let insert_result = sqlx::query(
+        r#"
+        INSERT INTO buyer_qualification_configs (
+            id, buyer_id, vertical_id, rule_set_name, config, rules_order,
+            enabled, is_active, timeout_seconds, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW()
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(rule_set_id)
+    .bind(buyer_id)
+    .bind(vertical_id)
+    .bind(&payload.rule_set_name)
+    .bind(&config_for_db) // Use config without ZIP codes
+    .bind(&rules_order)
+    .bind(enabled)
+    .bind(is_active)
+    .bind(timeout_seconds)
+    .fetch_one(state.db_pool.as_ref())
+    .await;
+
+    match insert_result {
+        Ok(_) => {
+            // Log audit for rule set creation
+            use sqlx::Row;
+            let buyer = sqlx::query("SELECT instance_id FROM buyers WHERE id = $1")
+                .bind(buyer_id)
+                .fetch_optional(state.db_pool.as_ref())
+                .await
+                .ok()
+                .flatten();
+            let instance_id =
+                buyer.and_then(|row| row.try_get::<Option<Uuid>, _>("instance_id").ok().flatten());
+
+            let _ = create_audit_log(
+                state.db_pool.as_ref(),
+                instance_id,
+                None, // TODO: Extract user_id from request extensions
+                "buyer_rule_set_created",
+                Some("Buyer"),
+                Some(buyer_id),
+                serde_json::json!({
+                    "rule_set_id": rule_set_id.to_string(),
+                    "rule_set_name": payload.rule_set_name,
+                    "is_active": is_active,
+                    "enabled": enabled,
+                    "timeout_seconds": timeout_seconds
+                }),
+                serde_json::json!({}),
+                None, // TODO: Extract IP address from request
+                None, // TODO: Extract user agent from request
+            )
+            .await;
+
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "rule_set": {
+                    "id": rule_set_id.to_string(),
+                    "rule_set_name": payload.rule_set_name,
+                    "is_active": is_active
+                },
+                "message": "Rule set created successfully"
+            })))
+        }
+        Err(e) => {
+            error!("Database error creating rule set: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_buyer_rule_set(
+    State(state): State<AppState>,
+    Path((buyer_id, rule_set_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    let rule_set = sqlx::query(
+        r#"
+        SELECT 
+            id, buyer_id, vertical_id, buyer_integration_id, rule_set_name,
+            config, rules_order, enabled, is_active, timeout_seconds,
+            created_at, updated_at
+        FROM buyer_qualification_configs
+        WHERE id = $1 AND buyer_id = $2
+        "#,
+    )
+    .bind(rule_set_id)
+    .bind(buyer_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error getting rule set: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let rule_set = rule_set.ok_or(StatusCode::NOT_FOUND)?;
+
+    let id: Uuid = rule_set.try_get("id").unwrap_or_else(|_| Uuid::nil());
+    let buyer_id: Uuid = rule_set.try_get("buyer_id").unwrap_or_else(|_| Uuid::nil());
+    let vertical_id: Uuid = rule_set
+        .try_get("vertical_id")
+        .unwrap_or_else(|_| Uuid::nil());
+    let buyer_integration_id: Option<Uuid> = rule_set.try_get("buyer_integration_id").ok();
+    let rule_set_name: String = rule_set.try_get("rule_set_name").unwrap_or_default();
+    let mut config: serde_json::Value = rule_set
+        .try_get("config")
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let rules_order: Vec<String> = rule_set.try_get("rules_order").unwrap_or_default();
+    let enabled: bool = rule_set.try_get("enabled").unwrap_or(true);
+    let is_active: bool = rule_set.try_get("is_active").unwrap_or(false);
+    // DECIMAL columns must be retrieved as rust_decimal::Decimal for PostgreSQL NUMERIC
+    use rust_decimal::Decimal;
+    let timeout_seconds: Option<f64> = rule_set
+        .try_get::<Option<Decimal>, _>("timeout_seconds")
+        .ok()
+        .flatten()
+        .map(|d| d.to_string().parse::<f64>().unwrap_or(1.2))
+        .or_else(|| rule_set.try_get::<f64, _>("timeout_seconds").ok())
+        .or_else(|| {
+            rule_set
+                .try_get::<Option<String>, _>("timeout_seconds")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+    let created_at: chrono::DateTime<chrono::Utc> = rule_set
+        .try_get("created_at")
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let updated_at: chrono::DateTime<chrono::Utc> = rule_set
+        .try_get("updated_at")
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    // Load ZIP codes from separate tables and merge into config
+    match load_zip_codes_from_tables(state.db_pool.as_ref(), buyer_id).await {
+        Ok((blacklist_zips, whitelist_zips)) => {
+            // Update config with ZIP codes from tables (tables are source of truth)
+            if let Some(config_obj) = config.as_object_mut() {
+                if !blacklist_zips.is_empty() {
+                    config_obj.insert(
+                        "zip_blacklist".to_string(),
+                        serde_json::json!(blacklist_zips),
+                    );
+                } else {
+                    config_obj.remove("zip_blacklist");
+                }
+                if !whitelist_zips.is_empty() {
+                    config_obj.insert(
+                        "zip_whitelist".to_string(),
+                        serde_json::json!(whitelist_zips),
+                    );
+                } else {
+                    config_obj.remove("zip_whitelist");
+                }
+            }
+        }
+        Err(e) => {
+            error!("Error loading ZIP codes from tables: {}", e);
+            // Continue with config as-is if loading fails
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "rule_set": {
+            "id": id.to_string(),
+            "buyer_id": buyer_id.to_string(),
+            "vertical_id": vertical_id.to_string(),
+            "buyer_integration_id": buyer_integration_id.map(|v| v.to_string()),
+            "rule_set_name": rule_set_name,
+            "config": config,
+            "rules_order": rules_order,
+            "enabled": enabled,
+            "is_active": is_active,
+            "timeout_seconds": timeout_seconds,
+            "created_at": created_at.to_rfc3339(),
+            "updated_at": updated_at.to_rfc3339()
+        }
+    })))
+}
+
+async fn update_buyer_rule_set(
+    State(state): State<AppState>,
+    Path((buyer_id, rule_set_id)): Path<(Uuid, Uuid)>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Extension(user): axum::extract::Extension<leadsnebula_core::models::user::User>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::{QueryBuilder, Row};
+    use tracing::error;
+
+    // Get rule set before update for audit log - fetch full config JSONB
+    let rule_set_before = sqlx::query(
+        "SELECT rule_set_name, is_active, enabled, timeout_seconds, config FROM buyer_qualification_configs WHERE id = $1 AND buyer_id = $2"
+    )
+    .bind(rule_set_id)
+    .bind(buyer_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error checking rule set: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let rule_set_before_full = match rule_set_before {
+        Some(row) => {
+            let config_before: Option<serde_json::Value> = row.try_get("config").ok().flatten();
+            Some(serde_json::json!({
+                "rule_set_name": row.try_get::<Option<String>, _>("rule_set_name").ok().flatten().unwrap_or_default(),
+                "is_active": row.try_get::<Option<bool>, _>("is_active").ok().flatten().unwrap_or(false),
+                "enabled": row.try_get::<Option<bool>, _>("enabled").ok().flatten().unwrap_or(false),
+                "timeout_seconds": row.try_get::<Option<rust_decimal::Decimal>, _>("timeout_seconds").ok().and_then(|d| d.and_then(|v| v.to_string().parse::<f64>().ok())).unwrap_or(0.0),
+                "config": config_before.unwrap_or(serde_json::json!({}))
+            }))
+        }
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Build dynamic update query
+    let mut query_builder = QueryBuilder::new("UPDATE buyer_qualification_configs SET ");
+    let mut has_updates = false;
+
+    if let Some(rule_set_name) = payload.get("rule_set_name").and_then(|v| v.as_str()) {
+        query_builder.push("rule_set_name = ");
+        query_builder.push_bind(rule_set_name);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if let Some(config) = payload.get("config") {
+        // Extract ZIP codes before saving config (store in separate tables, remove from JSONB)
+        let mut config_json = config.clone();
+        if let Err(e) =
+            extract_and_store_zip_codes(state.db_pool.as_ref(), buyer_id, &mut config_json).await
+        {
+            error!("Error extracting and storing ZIP codes: {}", e);
+            // Don't fail the request, just log the error - continue with cleaned config
+        }
+        query_builder.push("config = ");
+        query_builder.push_bind(config_json); // Move ownership, not borrow
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if let Some(rules_order) = payload.get("rules_order").and_then(|v| v.as_array()) {
+        let order_vec: Vec<String> = rules_order
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        let order_vec_clone = order_vec.clone();
+        query_builder.push("rules_order = ");
+        query_builder.push_bind(order_vec_clone);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if let Some(enabled) = payload.get("enabled").and_then(|v| v.as_bool()) {
+        query_builder.push("enabled = ");
+        query_builder.push_bind(enabled);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if let Some(is_active) = payload.get("is_active").and_then(|v| v.as_bool()) {
+        // If setting as active, deactivate all other rule sets for this buyer
+        if is_active {
+            sqlx::query("UPDATE buyer_qualification_configs SET is_active = false WHERE buyer_id = $1 AND id != $2")
+                .bind(buyer_id)
+                .bind(rule_set_id)
+                .execute(state.db_pool.as_ref())
+                .await
+                .map_err(|e| {
+                    error!("Database error deactivating rule sets: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
+        query_builder.push("is_active = ");
+        query_builder.push_bind(is_active);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if let Some(timeout_seconds) = payload.get("timeout_seconds").and_then(|v| v.as_f64()) {
+        query_builder.push("timeout_seconds = ");
+        query_builder.push_bind(timeout_seconds);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if !has_updates {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "No updates provided"
+        })));
+    }
+
+    query_builder.push(" updated_at = NOW() WHERE id = ");
+    query_builder.push_bind(rule_set_id);
+    query_builder.push(" AND buyer_id = ");
+    query_builder.push_bind(buyer_id);
+
+    let query = query_builder.build();
+    let update_result = query.execute(state.db_pool.as_ref()).await;
+
+    match update_result {
+        Ok(_) => {
+            // ZIP codes were already extracted and stored before the update query
+
+            // Log audit for rule set update
+            use sqlx::Row;
+            let buyer = sqlx::query("SELECT instance_id FROM buyers WHERE id = $1")
+                .bind(buyer_id)
+                .fetch_optional(state.db_pool.as_ref())
+                .await
+                .ok()
+                .flatten();
+            let instance_id =
+                buyer.and_then(|row| row.try_get::<Option<Uuid>, _>("instance_id").ok().flatten());
+
+            // Get rule set after update to capture full config
+            let rule_set_after = sqlx::query(
+                "SELECT rule_set_name, is_active, enabled, timeout_seconds, config FROM buyer_qualification_configs WHERE id = $1 AND buyer_id = $2"
+            )
+            .bind(rule_set_id)
+            .bind(buyer_id)
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .ok()
+            .flatten();
+
+            let rule_set_after_full = if let Some(row) = rule_set_after {
+                let config_after: Option<serde_json::Value> = row.try_get("config").ok().flatten();
+                Some(serde_json::json!({
+                    "rule_set_name": row.try_get::<Option<String>, _>("rule_set_name").ok().flatten().unwrap_or_default(),
+                    "is_active": row.try_get::<Option<bool>, _>("is_active").ok().flatten().unwrap_or(false),
+                    "enabled": row.try_get::<Option<bool>, _>("enabled").ok().flatten().unwrap_or(false),
+                    "timeout_seconds": row.try_get::<Option<rust_decimal::Decimal>, _>("timeout_seconds").ok().and_then(|d| d.and_then(|v| v.to_string().parse::<f64>().ok())).unwrap_or(0.0),
+                    "config": config_after.unwrap_or(serde_json::json!({}))
+                }))
+            } else {
+                None
+            };
+
+            // Build before/after structure with full configs for audit log
+            let mut changed_fields = serde_json::Map::new();
+            if let Some(ref before) = rule_set_before_full {
+                if let Some(ref after) = rule_set_after_full {
+                    // Compare all fields and include full configs
+                    if let Some(new_name) = after.get("rule_set_name").and_then(|v| v.as_str()) {
+                        let before_name = before
+                            .get("rule_set_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if before_name != new_name {
+                            changed_fields.insert(
+                                "rule_set_name".to_string(),
+                                serde_json::json!({
+                                    "before": before_name,
+                                    "after": new_name
+                                }),
+                            );
+                        }
+                    }
+
+                    // Always include full configs in before/after
+                    let config_before = before
+                        .get("config")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    let config_after = after
+                        .get("config")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    changed_fields.insert(
+                        "config".to_string(),
+                        serde_json::json!({
+                            "before": config_before,
+                            "after": config_after
+                        }),
+                    );
+
+                    if let Some(new_is_active) = after.get("is_active").and_then(|v| v.as_bool()) {
+                        let before_is_active = before
+                            .get("is_active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if before_is_active != new_is_active {
+                            changed_fields.insert(
+                                "is_active".to_string(),
+                                serde_json::json!({
+                                    "before": before_is_active,
+                                    "after": new_is_active
+                                }),
+                            );
+                        }
+                    }
+                    if let Some(new_enabled) = after.get("enabled").and_then(|v| v.as_bool()) {
+                        let before_enabled = before
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if before_enabled != new_enabled {
+                            changed_fields.insert(
+                                "enabled".to_string(),
+                                serde_json::json!({
+                                    "before": before_enabled,
+                                    "after": new_enabled
+                                }),
+                            );
+                        }
+                    }
+                    if let Some(new_timeout) = after.get("timeout_seconds").and_then(|v| v.as_f64())
+                    {
+                        let before_timeout = before
+                            .get("timeout_seconds")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        if (before_timeout - new_timeout).abs() > 0.001 {
+                            changed_fields.insert(
+                                "timeout_seconds".to_string(),
+                                serde_json::json!({
+                                    "before": before_timeout,
+                                    "after": new_timeout
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+
+            let action_type = if changed_fields.contains_key("is_active") {
+                if changed_fields
+                    .get("is_active")
+                    .and_then(|v| v.get("after").and_then(|a| a.as_bool()))
+                    .unwrap_or(false)
+                {
+                    "buyer_rule_set_activated"
+                } else {
+                    "buyer_rule_set_deactivated"
+                }
+            } else {
+                "buyer_rule_set_updated"
+            };
+
+            // Extract compliance-required information from headers (ISO 27001, SOC 2, NIST)
+            let ip_address = headers
+                .get("x-forwarded-for")
+                .or_else(|| headers.get("x-real-ip"))
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+
+            let user_agent = headers
+                .get("user-agent")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Extract request ID from headers (X-Request-ID, X-Correlation-ID, or generate)
+            let request_id = headers
+                .get("x-request-id")
+                .or_else(|| headers.get("x-correlation-id"))
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            // Extract session ID if available
+            let session_id = headers
+                .get("x-session-id")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Extract referer for context
+            let referer = headers
+                .get("referer")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Build actor information (ISO 27001 A.12.4.1: User identification required)
+            let actor_name = format!(
+                "{} {}",
+                user.first_name.as_deref().unwrap_or(""),
+                user.last_name.as_deref().unwrap_or("")
+            )
+            .trim()
+            .to_string();
+            let actor_name = if actor_name.is_empty() {
+                user.email.clone()
+            } else {
+                actor_name
+            };
+
+            // Determine user role (TODO: Query from database)
+            let user_role = "instance_admin"; // TODO: Determine actual role from user_roles table
+
+            // Build full audit log details matching compliance standards (ISO 27001, SOC 2, NIST)
+            let timestamp = chrono::Utc::now();
+            let audit_details = serde_json::json!({
+                "action": "update",
+                "target_type": "BuyerRuleSet",
+                "target_id": rule_set_id.to_string(),
+                "target_name": rule_set_after_full.as_ref().and_then(|r| r.get("rule_set_name").and_then(|n| n.as_str())).unwrap_or(""),
+                "actor": {
+                    "id": user.id.to_string(),
+                    "name": actor_name,
+                    "email": user.email,
+                    "role": user_role,
+                    "instance_id": instance_id.map(|id| id.to_string())
+                },
+                "changes": changed_fields,
+                "before": rule_set_before_full,
+                "after": rule_set_after_full,
+                "context": {
+                    "reason": "User updated rule set via dashboard",
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "ip_address": ip_address,
+                    "user_agent": user_agent,
+                    "referer": referer,
+                    "method": "POST",
+                    "endpoint": format!("/api/v1/dashboard/buyers/{}/rule_sets/{}", buyer_id, rule_set_id),
+                    "source": "dashboard_web_ui"
+                },
+                "outcome": "success",
+                "timestamp": timestamp.to_rfc3339(),
+                "compliance": {
+                    "standard": "ISO_27001_SOC2_NIST",
+                    "version": "2024"
+                }
+            });
+
+            let _ = create_audit_log(
+                state.db_pool.as_ref(),
+                instance_id,
+                Some(user.id),
+                action_type,
+                Some("Buyer"),
+                Some(buyer_id),
+                audit_details,
+                serde_json::json!({}),
+                ip_address.as_deref(),
+                user_agent.as_deref(),
+            )
+            .await;
+
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "message": "Rule set updated successfully"
+            })))
+        }
+        Err(e) => {
+            error!("Database error updating rule set: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn delete_buyer_rule_set(
+    State(state): State<AppState>,
+    Path((buyer_id, rule_set_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    // Get rule set info before deletion for audit log
+    let rule_set_before = sqlx::query(
+        "SELECT rule_set_name, is_active, enabled FROM buyer_qualification_configs WHERE id = $1 AND buyer_id = $2"
+    )
+    .bind(rule_set_id)
+    .bind(buyer_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching rule set: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let rule_set_before = rule_set_before.map(|row| {
+        serde_json::json!({
+            "rule_set_name": row.try_get::<Option<String>, _>("rule_set_name").ok().flatten().unwrap_or_default(),
+            "is_active": row.try_get::<Option<bool>, _>("is_active").ok().flatten().unwrap_or(false),
+            "enabled": row.try_get::<Option<bool>, _>("enabled").ok().flatten().unwrap_or(false)
+        })
+    });
+
+    let delete_result =
+        sqlx::query("DELETE FROM buyer_qualification_configs WHERE id = $1 AND buyer_id = $2")
+            .bind(rule_set_id)
+            .bind(buyer_id)
+            .execute(state.db_pool.as_ref())
+            .await;
+
+    match delete_result {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                return Err(StatusCode::NOT_FOUND);
+            }
+
+            // Log audit for rule set deletion
+            let buyer = sqlx::query("SELECT instance_id FROM buyers WHERE id = $1")
+                .bind(buyer_id)
+                .fetch_optional(state.db_pool.as_ref())
+                .await
+                .ok()
+                .flatten();
+            let instance_id =
+                buyer.and_then(|row| row.try_get::<Option<Uuid>, _>("instance_id").ok().flatten());
+
+            let _ = create_audit_log(
+                state.db_pool.as_ref(),
+                instance_id,
+                None, // TODO: Extract user_id from request extensions
+                "buyer_rule_set_deleted",
+                Some("Buyer"),
+                Some(buyer_id),
+                serde_json::json!({
+                    "rule_set_id": rule_set_id.to_string(),
+                    "rule_set_name": rule_set_before.as_ref().and_then(|r| r.get("rule_set_name").and_then(|v| v.as_str())).unwrap_or("Unknown"),
+                    "was_active": rule_set_before.as_ref().and_then(|r| r.get("is_active").and_then(|v| v.as_bool())).unwrap_or(false)
+                }),
+                serde_json::json!({}),
+                None, // TODO: Extract IP address from request
+                None, // TODO: Extract user agent from request
+            ).await;
+
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "message": "Rule set deleted successfully"
+            })))
+        }
+        Err(e) => {
+            error!("Database error deleting rule set: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// Helper function to find or create a default ZIP list for a buyer
+async fn find_or_create_zip_list(
+    db_pool: &sqlx::PgPool,
+    buyer_id: Uuid,
+    list_type: &str, // "blacklist" or "whitelist"
+) -> Result<Uuid, sqlx::Error> {
+    use sqlx::Row;
+
+    // Try to find existing default list for this buyer and type
+    let existing = sqlx::query(
+        "SELECT id FROM public.buyer_zip_lists WHERE buyer_id = $1 AND list_type = $2 ORDER BY created_at ASC LIMIT 1"
+    )
+    .bind(buyer_id)
+    .bind(list_type)
+    .fetch_optional(db_pool)
+    .await?;
+
+    if let Some(row) = existing {
+        return row.try_get::<Uuid, _>("id");
+    }
+
+    // Create new default list
+    let list_id = Uuid::new_v4();
+    let list_name = format!(
+        "Default {}",
+        if list_type == "blacklist" {
+            "Blacklist"
+        } else {
+            "Whitelist"
+        }
+    );
+
+    sqlx::query(
+        "INSERT INTO public.buyer_zip_lists (id, buyer_id, name, list_type, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING id"
+    )
+    .bind(list_id)
+    .bind(buyer_id)
+    .bind(&list_name)
+    .bind(list_type)
+    .fetch_one(db_pool)
+    .await?;
+
+    Ok(list_id)
+}
+
+// Helper function to extract and store ZIP codes from config to separate tables
+// This removes ZIP codes from the config JSONB and stores them only in tables
+async fn extract_and_store_zip_codes(
+    db_pool: &sqlx::PgPool,
+    buyer_id: Uuid,
+    config: &mut serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    use sqlx::Row;
+    use tracing::warn;
+
+    // Extract and store blacklist ZIP codes, then remove from config
+    if let Some(blacklist) = config
+        .get("zip_blacklist")
+        .and_then(|v| v.as_array())
+        .cloned()
+    {
+        let list_id = find_or_create_zip_list(db_pool, buyer_id, "blacklist").await?;
+
+        // Get existing ZIPs in the list
+        let existing_zips: Vec<String> =
+            sqlx::query("SELECT zip FROM public.buyer_zip_codes WHERE buyer_zip_list_id = $1")
+                .bind(list_id)
+                .fetch_all(db_pool)
+                .await?
+                .iter()
+                .filter_map(|row| row.try_get::<String, _>("zip").ok())
+                .collect();
+
+        // Add new ZIPs that aren't already in the list
+        for zip_value in blacklist {
+            if let Some(zip) = zip_value.as_str() {
+                let zip = zip.trim();
+                if zip.len() == 5 && zip.chars().all(|c| c.is_ascii_digit()) {
+                    if !existing_zips.contains(&zip.to_string()) {
+                        // Insert with ON CONFLICT DO NOTHING to handle race conditions
+                        let _ = sqlx::query(
+                            "INSERT INTO public.buyer_zip_codes (id, buyer_zip_list_id, zip, created_at, updated_at) VALUES (gen_random_uuid(), $1, $2, NOW(), NOW()) ON CONFLICT (buyer_zip_list_id, zip) DO NOTHING"
+                        )
+                        .bind(list_id)
+                        .bind(zip)
+                        .execute(db_pool)
+                        .await;
+                    }
+                } else {
+                    warn!("Invalid ZIP code format in blacklist: {}", zip);
+                }
+            }
+        }
+
+        // Remove ZIP codes from config JSONB (tables are now source of truth)
+        if let Some(config_obj) = config.as_object_mut() {
+            config_obj.remove("zip_blacklist");
+        }
+    }
+
+    // Extract and store whitelist ZIP codes, then remove from config
+    if let Some(whitelist) = config
+        .get("zip_whitelist")
+        .and_then(|v| v.as_array())
+        .cloned()
+    {
+        let list_id = find_or_create_zip_list(db_pool, buyer_id, "whitelist").await?;
+
+        // Get existing ZIPs in the list
+        let existing_zips: Vec<String> =
+            sqlx::query("SELECT zip FROM public.buyer_zip_codes WHERE buyer_zip_list_id = $1")
+                .bind(list_id)
+                .fetch_all(db_pool)
+                .await?
+                .iter()
+                .filter_map(|row| row.try_get::<String, _>("zip").ok())
+                .collect();
+
+        // Add new ZIPs that aren't already in the list
+        for zip_value in whitelist {
+            if let Some(zip) = zip_value.as_str() {
+                let zip = zip.trim();
+                if zip.len() == 5 && zip.chars().all(|c| c.is_ascii_digit()) {
+                    if !existing_zips.contains(&zip.to_string()) {
+                        // Insert with ON CONFLICT DO NOTHING to handle race conditions
+                        let _ = sqlx::query(
+                            "INSERT INTO public.buyer_zip_codes (id, buyer_zip_list_id, zip, created_at, updated_at) VALUES (gen_random_uuid(), $1, $2, NOW(), NOW()) ON CONFLICT (buyer_zip_list_id, zip) DO NOTHING"
+                        )
+                        .bind(list_id)
+                        .bind(zip)
+                        .execute(db_pool)
+                        .await;
+                    }
+                } else {
+                    warn!("Invalid ZIP code format in whitelist: {}", zip);
+                }
+            }
+        }
+
+        // Remove ZIP codes from config JSONB (tables are now source of truth)
+        if let Some(config_obj) = config.as_object_mut() {
+            config_obj.remove("zip_whitelist");
+        }
+    }
+
+    Ok(())
+}
+
+// Helper function to load ZIP codes from tables and merge into config
+async fn load_zip_codes_from_tables(
+    db_pool: &sqlx::PgPool,
+    buyer_id: Uuid,
+) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
+    use sqlx::Row;
+
+    // Load blacklist ZIPs
+    let blacklist_zips: Vec<String> = sqlx::query(
+        r#"
+        SELECT DISTINCT bzc.zip
+        FROM public.buyer_zip_codes bzc
+        INNER JOIN public.buyer_zip_lists bzl ON bzc.buyer_zip_list_id = bzl.id
+        WHERE bzl.buyer_id = $1 AND bzl.list_type = 'blacklist'
+        ORDER BY bzc.zip
+        "#,
+    )
+    .bind(buyer_id)
+    .fetch_all(db_pool)
+    .await?
+    .iter()
+    .filter_map(|row| row.try_get::<String, _>("zip").ok())
+    .collect();
+
+    // Load whitelist ZIPs
+    let whitelist_zips: Vec<String> = sqlx::query(
+        r#"
+        SELECT DISTINCT bzc.zip
+        FROM public.buyer_zip_codes bzc
+        INNER JOIN public.buyer_zip_lists bzl ON bzc.buyer_zip_list_id = bzl.id
+        WHERE bzl.buyer_id = $1 AND bzl.list_type = 'whitelist'
+        ORDER BY bzc.zip
+        "#,
+    )
+    .bind(buyer_id)
+    .fetch_all(db_pool)
+    .await?
+    .iter()
+    .filter_map(|row| row.try_get::<String, _>("zip").ok())
+    .collect();
+
+    Ok((blacklist_zips, whitelist_zips))
+}
+
+// Audit Log API
+async fn list_buyer_audit_logs(
+    State(state): State<AppState>,
+    Path(buyer_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    let logs = sqlx::query(
+        r#"
+        SELECT 
+            al.id,
+            al.instance_id,
+            al.instance_user_id,
+            al.action_type,
+            al.resource_type,
+            al.resource_id,
+            al.details,
+            al.affected_resources,
+            al.ip_address,
+            al.user_agent,
+            al.created_at,
+            al.updated_at,
+            u.email as user_email,
+            u.first_name as user_first_name,
+            u.last_name as user_last_name
+        FROM audit_logs al
+        LEFT JOIN instance_users u ON al.instance_user_id = u.id
+        WHERE al.resource_type = 'Buyer' AND al.resource_id = $1
+        ORDER BY al.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(buyer_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing audit logs: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let audit_logs: Vec<serde_json::Value> = logs
+        .iter()
+        .map(|row| {
+            let user_name = match (
+                row.try_get::<Option<String>, _>("user_first_name").ok().flatten(),
+                row.try_get::<Option<String>, _>("user_last_name").ok().flatten(),
+            ) {
+                (Some(first), Some(last)) if !first.is_empty() || !last.is_empty() => {
+                    format!("{} {}", first, last).trim().to_string()
+                }
+                _ => row.try_get::<Option<String>, _>("user_email").ok().flatten().unwrap_or_else(|| "Unknown".to_string()),
+            };
+
+            let details_value = row.try_get::<serde_json::Value, _>("details").ok().unwrap_or_else(|| serde_json::json!({}));
+
+            serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").ok(),
+                "action_type": row.try_get::<String, _>("action_type").ok(),
+                "user": user_name,
+                "details": details_value,
+                "affected_resources": row.try_get::<serde_json::Value, _>("affected_resources").ok().unwrap_or_else(|| serde_json::json!({})),
+                "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok().map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "audit_logs": audit_logs
+    })))
+}
+
+// Helper function to create audit log entries
+#[allow(clippy::too_many_arguments)]
+async fn create_audit_log(
+    db_pool: &sqlx::PgPool,
+    instance_id: Option<Uuid>,
+    instance_user_id: Option<Uuid>,
+    action_type: &str,
+    resource_type: Option<&str>,
+    resource_id: Option<Uuid>,
+    details: serde_json::Value,
+    affected_resources: serde_json::Value,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (
+            instance_id, instance_user_id, action_type, resource_type, resource_id,
+            details, affected_resources, ip_address, user_agent, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        "#,
+    )
+    .bind(instance_id)
+    .bind(instance_user_id)
+    .bind(action_type)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(details)
+    .bind(affected_resources)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db_pool)
+    .await?;
+
+    Ok(())
+}

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use leadsnebula_core::auth::hash_password;
 use leadsnebula_core::services::database::create_pool;
+use sqlx::Row;
 use std::io::{self, Write};
 use tracing::info;
 
@@ -37,6 +38,28 @@ async fn main() -> Result<()> {
     };
 
     let encrypted_password = hash_password(&password)?;
+
+    // First, check which user(s) exist
+    let users: Vec<(uuid::Uuid, String)> =
+        sqlx::query("SELECT id, email FROM instance_users WHERE LOWER(email) = LOWER($1)")
+            .bind(&args.email)
+            .map(|row: sqlx::postgres::PgRow| (row.get(0), row.get(1)))
+            .fetch_all(&pool)
+            .await?;
+
+    if users.is_empty() {
+        return Err(anyhow::anyhow!("User not found: {}", args.email));
+    }
+
+    if users.len() > 1 {
+        info!(
+            "Warning: Multiple users found with email {}. Updating all of them:",
+            args.email
+        );
+        for (id, email) in &users {
+            info!("  - ID: {}, Email: {}", id, email);
+        }
+    }
 
     let rows_affected = sqlx::query(
         "UPDATE instance_users SET encrypted_password = $1, updated_at = $2 WHERE LOWER(email) = LOWER($3)",

@@ -25,6 +25,11 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 dotenv = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rust_decimal = { workspace = true }
 
 # Optional features
 sentry = { version = "0.32", optional = true }

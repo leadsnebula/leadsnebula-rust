@@ -3,7 +3,11 @@ mod middleware;
 mod routes;
 
 use config::AppState;
-use routes::{auth_routes, health_routes};
+use middleware::{
+    api_auth::api_key_auth_middleware, hmac::hmac_verification_middleware,
+    jwt_auth::jwt_auth_middleware,
+};
+use routes::{auth_routes, carina_routes, dashboard_routes, health_routes, pulsar_routes};
 use std::net::SocketAddr;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
@@ -15,17 +19,24 @@ async fn main() -> anyhow::Result<()> {
     // Load environment variables from .env.local if it exists (development only)
     // This allows local development without setting env vars manually
     // Production should use SSM Parameter Store or system environment variables
-    // Try .env.local first, then fall back to .env if it exists
-    if dotenv::from_filename(".env.local").is_err() {
+    // Priority: .env.local (highest) > .env > system environment variables
+    // This ensures local development doesn't interfere with production
+    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    if !env_loaded {
         // .env.local doesn't exist, try .env as fallback
         let _ = dotenv::dotenv();
+    }
+
+    // Log which env file was loaded (for debugging)
+    if env_loaded {
+        tracing::info!("Loaded environment from .env.local (local development mode)");
     }
 
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "leadsnebula_api=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "leadsnebula_api=debug,tower_http=info".into()),
         )
         .init();
 
@@ -59,11 +70,43 @@ async fn main() -> anyhow::Result<()> {
                 .route("/live", axum::routing::get(routes::health::liveness_check))
                 .merge(health_routes())
                 .merge(auth_routes())
+                .merge(
+                    carina_routes()
+                        .layer(axum::middleware::from_fn_with_state(
+                            state.clone(),
+                            api_key_auth_middleware,
+                        ))
+                        .layer(axum::middleware::from_fn_with_state(
+                            state.clone(),
+                            hmac_verification_middleware,
+                        )),
+                )
+                .merge(pulsar_routes().layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    api_key_auth_middleware,
+                )))
+                .merge(
+                    dashboard_routes().layer(axum::middleware::from_fn_with_state(
+                        state.clone(),
+                        jwt_auth_middleware,
+                    )),
+                )
                 .with_state(state)
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(
+                            CorsLayer::new()
+                                .allow_origin(tower_http::cors::Any)
+                                .allow_methods(tower_http::cors::Any)
+                                .allow_headers([
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::header::AUTHORIZATION,
+                                    axum::http::header::HeaderName::from_static("x-api-key"),
+                                    axum::http::header::HeaderName::from_static("x-hmac-signature"),
+                                ])
+                                .expose_headers(tower_http::cors::Any),
+                        ),
                 );
 
             info!("Server listening on 0.0.0.0:8080");

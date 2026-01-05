@@ -29,6 +29,38 @@ path = "src/bin/fetch-ssm-values.rs"
 name = "test-redis-connection"
 path = "src/bin/test-redis-connection.rs"
 
+[[bin]]
+name = "query-publisher"
+path = "src/bin/query-publisher.rs"
+
+[[bin]]
+name = "create-test-data"
+path = "src/bin/create-test-data.rs"
+
+[[bin]]
+name = "check-user"
+path = "src/bin/check-user.rs"
+
+[[bin]]
+name = "test-password"
+path = "src/bin/test-password.rs"
+
+[[bin]]
+name = "cleanup-deleted-buyers"
+path = "src/bin/cleanup-deleted-buyers.rs"
+
+[[bin]]
+name = "add-solar-vertical-to-buyers"
+path = "src/bin/add-solar-vertical-to-buyers.rs"
+
+[[bin]]
+name = "add-vertical-to-buyer"
+path = "src/bin/add-vertical-to-buyer.rs"
+
+[[bin]]
+name = "fix-solar2-buyer"
+path = "src/bin/fix-solar2-buyer.rs"
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
@@ -36,9 +68,12 @@ sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "
 redis = { workspace = true }
 leadsnebula_core = { path = "../core" }
 anyhow = { workspace = true }
+dotenv = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 

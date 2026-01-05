@@ -11,6 +11,17 @@ use tracing::info;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Load .env.local first for local development (highest priority)
+    // This ensures local development doesn't interfere with production
+    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    if !env_loaded {
+        let _ = dotenv::dotenv();
+    }
+
+    if env_loaded {
+        tracing::info!("Loaded environment from .env.local (local development mode)");
+    }
+
     // Load DATABASE_URL from SSM (like main app) or fall back to env var
     let environment = std::env::var("ENVIRONMENT")
         .or_else(|_| std::env::var("ENV"))

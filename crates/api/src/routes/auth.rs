@@ -35,6 +35,10 @@ async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
+    use tracing::{error, info, warn};
+
+    info!("Login attempt for email: {}", payload.email);
+
     // Find user by email (case-insensitive)
     let user = sqlx::query_as::<_, User>(
         "SELECT * FROM instance_users WHERE LOWER(email) = LOWER($1) LIMIT 1",
@@ -42,11 +46,24 @@ async fn login(
     .bind(&payload.email)
     .fetch_optional(state.db_pool.as_ref())
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        error!("Database error during login lookup: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let user = match user {
-        Some(u) => u,
+        Some(u) => {
+            info!(
+                "User found: {} (ID: {}, Status: {}, Confirmed: {})",
+                u.email,
+                u.id,
+                u.status,
+                u.is_confirmed()
+            );
+            u
+        }
         None => {
+            warn!("Login failed: User not found for email: {}", payload.email);
             return Ok(Json(LoginResponse {
                 success: false,
                 token: None,
@@ -58,6 +75,7 @@ async fn login(
 
     // Check if user is confirmed
     if !user.is_confirmed() {
+        warn!("Login failed: User {} not confirmed", user.email);
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -68,6 +86,10 @@ async fn login(
 
     // Check if user is active
     if !user.is_active() {
+        warn!(
+            "Login failed: User {} is not active (status: {})",
+            user.email, user.status
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -77,10 +99,25 @@ async fn login(
     }
 
     // Verify password
-    let password_valid =
-        verify_password(&payload.password, &user.encrypted_password).unwrap_or(false);
+    info!("Verifying password for user: {}", user.email);
+    info!(
+        "Password hash prefix: {}...",
+        &user.encrypted_password.chars().take(20).collect::<String>()
+    );
+
+    let password_valid = match verify_password(&payload.password, &user.encrypted_password) {
+        Ok(valid) => {
+            info!("Password verification result: {}", valid);
+            valid
+        }
+        Err(e) => {
+            error!("Password verification error: {}", e);
+            false
+        }
+    };
 
     if !password_valid {
+        warn!("Login failed: Invalid password for user: {}", user.email);
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -88,6 +125,8 @@ async fn login(
             error: Some("Invalid email or password".to_string()),
         }));
     }
+
+    info!("Login successful for user: {}", user.email);
 
     // Generate JWT token
     let jwt_service = JwtService::new(state.config.jwt_secret.clone());

@@ -31,6 +31,16 @@ pub struct AppState {
 
 impl AppConfig {
     pub async fn load() -> anyhow::Result<Self> {
+        // Check if .env.local exists to detect local development
+        // This ensures we only use .env.local REDIS_URL in local dev, not in Fly.io deployments
+        let is_local_dev = std::path::Path::new(".env.local").exists();
+
+        // Load .env.local first for local development (highest priority)
+        // This ensures local development doesn't interfere with production
+        if is_local_dev {
+            let _ = dotenv::from_filename(".env.local");
+        }
+
         let environment = std::env::var("ENVIRONMENT")
             .or_else(|_| std::env::var("ENV"))
             .unwrap_or_else(|_| "development".to_string());
@@ -65,9 +75,29 @@ impl AppConfig {
             })?;
 
         // Redis URL: Always use prod path for both environments (shared Redis instance)
-        let redis_url = params
-            .get("/leadsnebula/prod/rust/redis/connection_url")
-            .cloned();
+        // In local development (when .env.local exists), use REDIS_URL from .env.local
+        // In deployed environments (Fly.io), always use SSM (no REDIS_URL secrets in Fly.io)
+        let redis_url = if std::env::var("SKIP_REDIS").is_ok() {
+            info!("SKIP_REDIS environment variable set - skipping Redis connection");
+            None
+        } else if is_local_dev {
+            // Local development: prioritize REDIS_URL from .env.local
+            if let Ok(redis_url) = std::env::var("REDIS_URL") {
+                info!("Using REDIS_URL from .env.local for local development: redis://...");
+                Some(redis_url)
+            } else {
+                info!("REDIS_URL not found in .env.local, falling back to SSM");
+                params
+                    .get("/leadsnebula/prod/rust/redis/connection_url")
+                    .cloned()
+            }
+        } else {
+            // Deployed environments (Fly.io): always use SSM (sole source of truth)
+            // No REDIS_URL secrets in Fly.io - SSM is the only source
+            params
+                .get("/leadsnebula/prod/rust/redis/connection_url")
+                .cloned()
+        };
 
         // Try multiple possible SSM paths for JWT_SECRET (supporting different path structures)
         // Also try prod path as fallback for dev environment
@@ -250,6 +280,14 @@ async fn init_redis(
     pool_size: u32,
     min_idle: u32,
 ) -> anyhow::Result<Option<Arc<RedisClient>>> {
+    // Check if we should skip Redis in local development
+    let is_local_dev = environment == "development"
+        || environment == "dev"
+        || std::env::var("ENVIRONMENT").unwrap_or_default() == "development";
+
+    // Use shorter timeout for local development to fail fast
+    let timeout_seconds = if is_local_dev { 3 } else { 30 };
+
     // Extract host/port for logging (hide credentials)
     let display_url = redis_url
         .split_once("://")
@@ -278,14 +316,18 @@ async fn init_redis(
         }
     );
 
-    // First connection attempt with 30 second timeout
-    info!("🔵 Starting Redis connection attempt (30s timeout)...");
+    // First connection attempt with configurable timeout (shorter for local dev)
+    info!(
+        "🔵 Starting Redis connection attempt ({}s timeout)...",
+        timeout_seconds
+    );
     let start_time = std::time::Instant::now();
-    let connect_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        info!("🔵 Inside timeout wrapper - calling RedisClient::new()...");
-        RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle).await
-    })
-    .await;
+    let connect_result =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), async {
+            info!("🔵 Inside timeout wrapper - calling RedisClient::new()...");
+            RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle).await
+        })
+        .await;
     let elapsed = start_time.elapsed();
     info!("🔵 Redis connection attempt completed in {:?}", elapsed);
 
@@ -317,11 +359,17 @@ async fn init_redis(
                 e,
                 error_source
             );
-            // Retry once after 2 seconds
+            // In local development, don't retry - fail fast
+            if is_local_dev {
+                tracing::warn!("❌ Redis connection failed. Skipping Redis in local development.");
+                return Ok(None);
+            }
+
+            // Retry once after 2 seconds (only in non-local environments)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             info!("Retrying Redis connection...");
             match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(timeout_seconds),
                 RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle),
             )
             .await
@@ -351,21 +399,32 @@ async fn init_redis(
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache."
+                        "❌ Redis connection timed out after retry ({} seconds). Continuing without Redis cache.",
+                        timeout_seconds
                     );
                     Ok(None)
                 }
             }
         }
         Err(_) => {
+            // In local development, don't retry - fail fast
+            if is_local_dev {
+                tracing::warn!(
+                    "❌ Redis connection timed out after {} seconds. Skipping Redis in local development.",
+                    timeout_seconds
+                );
+                return Ok(None);
+            }
+
             tracing::warn!(
-                "❌ Redis connection timed out after 30 seconds. Retrying in 2 seconds..."
+                "❌ Redis connection timed out after {} seconds. Retrying in 2 seconds...",
+                timeout_seconds
             );
-            // Retry once after 2 seconds
+            // Retry once after 2 seconds (only in non-local environments)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             info!("Retrying Redis connection after timeout...");
             match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(timeout_seconds),
                 RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle),
             )
             .await
@@ -395,7 +454,8 @@ async fn init_redis(
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "❌ Redis connection timed out after retry (30 seconds). Continuing without Redis cache."
+                        "❌ Redis connection timed out after retry ({} seconds). Continuing without Redis cache.",
+                        timeout_seconds
                     );
                     Ok(None)
                 }

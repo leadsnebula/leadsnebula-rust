@@ -15,7 +15,7 @@ aws-config = { workspace = true }
 aws-smithy-async = { workspace = true }
 bb8 = { workspace = true }
 redis = { workspace = true }
-bcrypt = { workspace = true }
+argon2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -29,6 +29,8 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+rust_decimal = { workspace = true }
+reqwest = { workspace = true }
 
 # Optional features
 sentry = { version = "0.32", optional = true }
