@@ -14,28 +14,12 @@ primary_region = "iad"
   min_machines_running = 1
   processes = ["app"]
 
-[[services]]
-  protocol = "tcp"
-  internal_port = 8080
-  processes = ["app"]
-
-  [[services.ports]]
-    port = 80
-    handlers = ["http"]
-    force_https = true
-
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
-
-[[services.http_checks]]
-  interval = "15s"
-  timeout = "5s"
-  grace_period = "60s"
-  method = "GET"
-  path = "/live"
-  protocol = "http"
-  tls_skip_verify = false
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "60s"
+    method = "GET"
+    path = "/live"
 
 [deploy]
   # Release command disabled - using --no-release-command in workflow
