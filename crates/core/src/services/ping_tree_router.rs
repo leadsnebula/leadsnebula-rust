@@ -513,6 +513,22 @@ impl PingTreeRouter {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn select_winner_for_test(
+    responses: Vec<(&BuyerResponse, Uuid, Option<i32>)>,
+) -> (BuyerResponse, Uuid, Option<i32>) {
+    // Convert to owned values and create references for select_winner
+    // We need to store owned values to create valid references
+    let owned: Vec<(BuyerResponse, Uuid, Option<i32>)> = responses
+        .into_iter()
+        .map(|(r, id, p)| (r.clone(), id, p))
+        .collect();
+    // Create references from the owned vector
+    // Create references from owned vector - need to reference the tuple itself
+    let refs: Vec<&(BuyerResponse, Uuid, Option<i32>)> = owned.iter().collect();
+    select_winner(refs)
+}
+
 fn select_winner(
     responses: Vec<&(BuyerResponse, Uuid, Option<i32>)>,
 ) -> (BuyerResponse, Uuid, Option<i32>) {
@@ -589,5 +605,163 @@ impl Campaign {
         .bind(id)
         .fetch_optional(pool)
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn create_buyer_response(success: bool, price: Option<f64>, status: &str) -> BuyerResponse {
+        BuyerResponse {
+            success,
+            status: status.to_string(),
+            error: None,
+            message: None,
+            promise_id: None,
+            ping_id: None,
+            post_id: None,
+            price,
+        }
+    }
+
+    #[test]
+    fn test_select_winner_highest_price() {
+        let campaign1 = Uuid::new_v4();
+        let campaign2 = Uuid::new_v4();
+        let campaign3 = Uuid::new_v4();
+
+        let resp1 = create_buyer_response(true, Some(100.0), "accepted");
+        let resp2 = create_buyer_response(true, Some(150.0), "accepted");
+        let resp3 = create_buyer_response(true, Some(120.0), "accepted");
+
+        let responses = vec![
+            (&resp1, campaign1, None),
+            (&resp2, campaign2, None),
+            (&resp3, campaign3, None),
+        ];
+
+        let (winner, winner_id, _) = select_winner_for_test(responses);
+        assert_eq!(winner_id, campaign2);
+        assert_eq!(winner.price, Some(150.0));
+    }
+
+    #[test]
+    fn test_select_winner_priority_breaks_tie() {
+        let campaign1 = Uuid::new_v4();
+        let campaign2 = Uuid::new_v4();
+        let campaign3 = Uuid::new_v4();
+
+        let resp1 = create_buyer_response(true, Some(100.0), "accepted");
+        let resp2 = create_buyer_response(true, Some(100.0), "accepted");
+        let resp3 = create_buyer_response(true, Some(100.0), "accepted");
+
+        let responses = vec![
+            (&resp1, campaign1, Some(3)),
+            (&resp2, campaign2, Some(1)), // Lower priority number = higher priority
+            (&resp3, campaign3, Some(2)),
+        ];
+
+        let (_winner, winner_id, _) = select_winner_for_test(responses);
+        assert_eq!(winner_id, campaign2); // Should win due to priority 1
+    }
+
+    #[test]
+    fn test_select_winner_filters_invalid_responses() {
+        let campaign1 = Uuid::new_v4();
+        let campaign2 = Uuid::new_v4();
+        let campaign3 = Uuid::new_v4();
+
+        let resp1 = create_buyer_response(true, Some(100.0), "accepted");
+        let resp2 = create_buyer_response(false, Some(0.0), "rejected");
+        let resp3 = create_buyer_response(true, None, "accepted");
+
+        let responses = vec![
+            (&resp1, campaign1, None),
+            (&resp2, campaign2, None),
+            (&resp3, campaign3, None),
+        ];
+
+        let (_winner, winner_id, _) = select_winner_for_test(responses);
+        assert_eq!(winner_id, campaign1); // Only resp1 is valid
+    }
+
+    #[test]
+    fn test_select_winner_no_valid_responses() {
+        let campaign1 = Uuid::new_v4();
+        let campaign2 = Uuid::new_v4();
+
+        let resp1 = create_buyer_response(false, Some(0.0), "rejected");
+        let resp2 = create_buyer_response(false, None, "error");
+
+        let responses = vec![(&resp1, campaign1, None), (&resp2, campaign2, None)];
+
+        let (_winner, winner_id, _) = select_winner_for_test(responses);
+        // Should return first error response
+        assert_eq!(winner_id, campaign1);
+    }
+
+    #[test]
+    fn test_select_winner_price_then_priority() {
+        let campaign1 = Uuid::new_v4();
+        let campaign2 = Uuid::new_v4();
+        let campaign3 = Uuid::new_v4();
+
+        // campaign2 has highest price
+        let resp1 = create_buyer_response(true, Some(100.0), "accepted");
+        let resp2 = create_buyer_response(true, Some(150.0), "accepted");
+        let resp3 = create_buyer_response(true, Some(100.0), "accepted");
+
+        let responses = vec![
+            (&resp1, campaign1, Some(1)), // Lower priority but lower price
+            (&resp2, campaign2, Some(3)), // Higher price wins regardless of priority
+            (&resp3, campaign3, Some(2)),
+        ];
+
+        let (_winner, winner_id, _) = select_winner_for_test(responses);
+        assert_eq!(winner_id, campaign2); // Highest price wins
+    }
+
+    // Property-based test: winner should always have highest price or best priority
+    proptest! {
+        #[test]
+        fn test_select_winner_property(
+            prices in prop::collection::vec(1.0f64..1000.0, 2..10),
+            priorities in prop::collection::vec(1i32..10, 2..10)
+        ) {
+            // Store owned responses to avoid lifetime issues
+            let mut owned_responses = Vec::new();
+            let mut campaign_ids = Vec::new();
+
+            for price in prices.iter() {
+                let campaign_id = Uuid::new_v4();
+                campaign_ids.push(campaign_id);
+                let resp = create_buyer_response(true, Some(*price), "accepted");
+                owned_responses.push(resp);
+            }
+
+            // Create references from owned responses
+            let mut responses = Vec::new();
+            for (i, resp) in owned_responses.iter().enumerate() {
+                let campaign_id = campaign_ids[i];
+                let priority = priorities.get(i).copied();
+                responses.push((resp, campaign_id, priority));
+            }
+
+            if !responses.is_empty() {
+                let (winner, _, _) = select_winner_for_test(responses.clone());
+                if let Some(winner_price) = winner.price {
+                    // Winner price should be >= all other valid prices
+                    for (resp, _, _) in &responses {
+                        if let Some(price) = resp.price {
+                            if price > 0.0 {
+                                prop_assert!(winner_price >= price || (winner_price - price).abs() < 0.01);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

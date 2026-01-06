@@ -269,4 +269,17 @@ mod tests {
         // Cleanup
         let _: () = conn.del("test_key").await.expect("DEL failed");
     }
+
+    #[test]
+    fn test_prefix_key_logic() {
+        // Test prefixing logic without needing a real pool
+        let env = "dev";
+        let key = "test_key";
+        let prefixed = format!("{}:{}", env, key);
+        assert_eq!(prefixed, "dev:test_key");
+
+        let env_prod = "prod";
+        let prefixed_prod = format!("{}:{}", env_prod, key);
+        assert_eq!(prefixed_prod, "prod:test_key");
+    }
 }

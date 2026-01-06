@@ -48,3 +48,52 @@ impl CacheService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_ttl_dev() {
+        let service = CacheService::new(None, "dev".to_string());
+        let ttl = service.get_ttl(true);
+        assert_eq!(ttl, 300); // 5 minutes
+    }
+
+    #[test]
+    fn test_get_ttl_prod() {
+        let service = CacheService::new(None, "prod".to_string());
+        let ttl = service.get_ttl(false);
+        assert_eq!(ttl, 3600); // 1 hour
+    }
+
+    #[test]
+    fn test_get_ttl_development() {
+        let service = CacheService::new(None, "development".to_string());
+        let ttl = service.get_ttl(true);
+        assert_eq!(ttl, 300); // 5 minutes
+    }
+
+    #[tokio::test]
+    async fn test_get_without_redis() {
+        let service = CacheService::new(None, "dev".to_string());
+        let result = service.get("test_key").await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_set_without_redis() {
+        let service = CacheService::new(None, "dev".to_string());
+        // Should not panic when Redis is None
+        let result = service.set("test_key", "test_value").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_without_redis() {
+        let service = CacheService::new(None, "dev".to_string());
+        // Should not panic when Redis is None
+        let result = service.delete("test_key").await;
+        assert!(result.is_ok());
+    }
+}

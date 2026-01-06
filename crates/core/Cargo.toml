@@ -44,3 +44,9 @@ sentry = ["dep:sentry"]
 webauthn = ["dep:webauthn-rs", "dep:url"]
 otp = ["dep:totp-rs"]
 
+[dev-dependencies]
+proptest = { workspace = true }
+mockall = { workspace = true }
+loom = { workspace = true }
+tokio-test = { workspace = true }
+

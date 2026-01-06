@@ -89,3 +89,101 @@ pub fn verify_password(password: &str, hash: &str) -> anyhow::Result<bool> {
         Err(e) => Err(anyhow::anyhow!("Argon2 verification error: {}", e)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn test_jwt_encode_decode_roundtrip() {
+        let secret = "test_secret_key_for_jwt_encoding".to_string();
+        let service = JwtService::new(secret);
+        let user_id = "123e4567-e89b-12d3-a456-426614174000".to_string();
+        let email = "test@example.com".to_string();
+
+        let token = service.encode(user_id.clone(), email.clone()).unwrap();
+        assert!(!token.is_empty());
+
+        let claims = service.decode(&token).unwrap();
+        assert_eq!(claims.user_id, user_id);
+        assert_eq!(claims.email, email);
+        assert!(claims.iat > 0);
+        assert!(claims.exp > claims.iat);
+    }
+
+    #[test]
+    fn test_jwt_decode_invalid_token() {
+        let secret = "test_secret_key".to_string();
+        let service = JwtService::new(secret);
+
+        // Invalid token format
+        assert!(service.decode("invalid.token.here").is_err());
+        assert!(service.decode("not_a_jwt").is_err());
+    }
+
+    #[test]
+    fn test_jwt_decode_wrong_secret() {
+        let secret1 = "secret1".to_string();
+        let secret2 = "secret2".to_string();
+
+        let service1 = JwtService::new(secret1);
+        let service2 = JwtService::new(secret2);
+
+        let token = service1
+            .encode("user123".to_string(), "test@example.com".to_string())
+            .unwrap();
+
+        // Decoding with wrong secret should fail
+        assert!(service2.decode(&token).is_err());
+    }
+
+    #[test]
+    fn test_hash_password_produces_different_hashes() {
+        let password = "TestPassword123!";
+        let hash1 = hash_password(password).unwrap();
+        let hash2 = hash_password(password).unwrap();
+
+        // Different salts should produce different hashes
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_verify_password_correct() {
+        let password = "TestPassword123!";
+        let hash = hash_password(password).unwrap();
+
+        let result = verify_password(password, &hash).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_verify_password_incorrect() {
+        let password = "TestPassword123!";
+        let wrong_password = "WrongPassword123!";
+        let hash = hash_password(password).unwrap();
+
+        let result = verify_password(wrong_password, &hash).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_verify_password_invalid_hash() {
+        let password = "TestPassword123!";
+        let invalid_hash = "invalid_hash_format";
+
+        assert!(verify_password(password, invalid_hash).is_err());
+    }
+
+    // Property-based test: hash/verify roundtrip for any password
+    proptest! {
+        #[test]
+        fn test_hash_verify_password_roundtrip(
+            password in "[a-zA-Z0-9!@#$%^&*()_+\\-=\\[\\]{};':\"\\\\|,.<>\\/?]{8,128}"
+        ) {
+            let hash = hash_password(&password).map_err(|e| proptest::test_runner::TestCaseError::fail(e.to_string()))?;
+            let result = verify_password(&password, &hash).map_err(|e| proptest::test_runner::TestCaseError::fail(e.to_string()))?;
+            prop_assert!(result);
+        }
+    }
+}
