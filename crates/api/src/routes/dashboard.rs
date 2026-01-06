@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     response::Json,
     routing::{delete, get, post, put},
@@ -9,6 +9,45 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
+
+// Helper function to check if user is admin
+// For now, checks if user owns the instance (instance_user_id matches)
+// TODO: Implement proper role-based access control when instance_user_roles table exists
+async fn is_user_admin(
+    db_pool: &sqlx::PgPool,
+    user_id: Uuid,
+    instance_id: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    if let Some(inst_id) = instance_id {
+        // Check if user owns the instance (instance_user_id matches)
+        // This is a temporary solution until proper role-based access control is implemented
+        let result = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM instances WHERE id = $1 AND instance_user_id = $2 AND deleted_at IS NULL)",
+        )
+        .bind(inst_id)
+        .bind(user_id)
+        .fetch_one(db_pool)
+        .await?;
+        Ok(result)
+    } else {
+        // Check if user owns any instance
+        let result = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL)",
+        )
+        .bind(user_id)
+        .fetch_one(db_pool)
+        .await?;
+        Ok(result)
+    }
+}
+
+// Helper to get user from request extensions
+fn get_user_from_request(request: &Request) -> Option<leadsnebula_core::models::user::User> {
+    request
+        .extensions()
+        .get::<leadsnebula_core::models::user::User>()
+        .cloned()
+}
 
 // Publishers API
 #[derive(Serialize)]
@@ -20,6 +59,15 @@ pub struct PublisherResponse {
     pub api_key_prefix: String,
     pub hmac_required: bool,
     pub created_at: String,
+    pub deleted_at: Option<String>,
+    pub verticals: Vec<VerticalInfo>,
+}
+
+#[derive(Serialize)]
+pub struct VerticalInfo {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +75,15 @@ pub struct CreatePublisherRequest {
     pub name: String,
     pub email: String,
     pub instance_id: Option<Uuid>,
+    pub representative_first_name: Option<String>,
+    pub representative_last_name: Option<String>,
+    pub address_street: Option<String>,
+    pub address_city: Option<String>,
+    pub address_state: Option<String>,
+    pub address_zip: Option<String>,
+    pub timezone: Option<String>,
+    pub ein_tin: Option<String>,
+    pub vertical_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +112,10 @@ pub fn dashboard_routes() -> Router<AppState> {
         .route(
             "/api/v1/dashboard/publishers/:id/regenerate-api-key",
             post(regenerate_publisher_api_key),
+        )
+        .route(
+            "/api/v1/dashboard/publishers/:id/api-key",
+            get(get_publisher_api_key),
         )
         .route(
             "/api/v1/dashboard/publishers/:id/generate-hmac-secret",
@@ -139,7 +200,7 @@ async fn list_publishers(
     // TODO: Get instance_ids from user's JWT token
     // For now, get all publishers
     let publishers = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
-        "SELECT * FROM publishers WHERE deleted_at IS NULL ORDER BY created_at DESC",
+        "SELECT * FROM publishers ORDER BY created_at DESC",
     )
     .fetch_all(state.db_pool.as_ref())
     .await
@@ -150,9 +211,33 @@ async fn list_publishers(
 
     info!("Found {} publishers", publishers.len());
 
-    let response: Vec<PublisherResponse> = publishers
-        .iter()
-        .map(|p| PublisherResponse {
+    let mut response: Vec<PublisherResponse> = Vec::new();
+
+    for p in &publishers {
+        // Get verticals for this publisher
+        let verticals = sqlx::query_as::<_, leadsnebula_core::models::vertical::Vertical>(
+            r#"
+            SELECT v.* FROM verticals v
+            INNER JOIN publisher_verticals pv ON v.id = pv.vertical_id
+            WHERE pv.publisher_id = $1
+            ORDER BY v.name
+            "#,
+        )
+        .bind(p.id)
+        .fetch_all(state.db_pool.as_ref())
+        .await
+        .unwrap_or_default();
+
+        let vertical_info: Vec<VerticalInfo> = verticals
+            .iter()
+            .map(|v| VerticalInfo {
+                id: v.id.to_string(),
+                name: v.name.clone(),
+                slug: v.slug.clone(),
+            })
+            .collect();
+
+        response.push(PublisherResponse {
             id: p.id.to_string(),
             name: p.name.clone(),
             email: p.email.clone(),
@@ -160,8 +245,10 @@ async fn list_publishers(
             api_key_prefix: p.api_key_prefix.clone(),
             hmac_required: p.hmac_required,
             created_at: p.created_at.to_rfc3339(),
-        })
-        .collect();
+            deleted_at: p.deleted_at.map(|dt| dt.to_rfc3339()),
+            verticals: vertical_info,
+        });
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -173,6 +260,7 @@ async fn create_publisher(
     State(state): State<AppState>,
     Json(payload): Json<CreatePublisherRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::encryption::EncryptionService;
     use rand::Rng;
     use sha2::{Digest, Sha256};
 
@@ -198,16 +286,51 @@ async fn create_publisher(
     hasher.update(api_key.as_bytes());
     let api_key_hash = hex::encode(hasher.finalize());
 
+    // Encrypt API key for storage (api_key_encrypted column is NOT NULL)
+    let encryption_service = EncryptionService::new(&state.config.encryption_key).map_err(|e| {
+        tracing::error!("Failed to initialize encryption service: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let api_key_encrypted = encryption_service.encrypt(&api_key).map_err(|e| {
+        tracing::error!("Failed to encrypt API key: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Check if a non-deleted publisher with this email already exists
+    // Allow emails from deleted publishers to be reused
+    let existing_publisher = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM publishers WHERE email = $1 AND deleted_at IS NULL)",
+    )
+    .bind(&payload.email)
+    .fetch_one(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error checking existing publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if existing_publisher {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": format!("A publisher with the email '{}' already exists. Please use a different email address.", payload.email)
+        })));
+    }
+
     let publisher_id = Uuid::new_v4();
 
-    sqlx::query(
+    let insert_result = sqlx::query(
         r#"
         INSERT INTO publishers (
-            id, name, email, api_key_hash, api_key_prefix, status,
-            instance_id, is_documentation_test, created_at, updated_at
+            id, name, email, api_key_hash, api_key_prefix, api_key_encrypted, status,
+            instance_id, is_documentation_test, created_at, updated_at,
+            representative_first_name, representative_last_name,
+            address_street, address_city, address_state, address_zip,
+            timezone, ein_tin
         ) VALUES (
-            $1, $2, $3, $4, 'pk_live_', 'active',
-            $5, false, NOW(), NOW()
+            $1, $2, $3, $4, 'pk_live_', $5, 'active',
+            $6, false, NOW(), NOW(),
+            $7, $8, $9, $10, $11, $12, $13, $14
         )
         "#,
     )
@@ -215,10 +338,64 @@ async fn create_publisher(
     .bind(&payload.name)
     .bind(&payload.email)
     .bind(&api_key_hash)
+    .bind(&api_key_encrypted)
     .bind(instance_id)
+    .bind(&payload.representative_first_name)
+    .bind(&payload.representative_last_name)
+    .bind(&payload.address_street)
+    .bind(&payload.address_city)
+    .bind(&payload.address_state)
+    .bind(&payload.address_zip)
+    .bind(&payload.timezone)
+    .bind(&payload.ein_tin)
     .execute(state.db_pool.as_ref())
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .await;
+
+    match insert_result {
+        Ok(_result) => {
+            // Insert verticals if provided
+            if let Some(vertical_ids) = &payload.vertical_ids {
+                for vertical_id in vertical_ids {
+                    let _ = sqlx::query(
+                        "INSERT INTO publisher_verticals (publisher_id, vertical_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+                    )
+                    .bind(publisher_id)
+                    .bind(vertical_id)
+                    .execute(state.db_pool.as_ref())
+                    .await;
+                }
+            }
+        }
+        Err(e) => {
+            // Check for unique constraint violations (fallback in case migration hasn't been run)
+            let error_str = e.to_string();
+            if error_str.contains("duplicate key") {
+                if error_str.contains("publishers_email_key")
+                    || error_str.contains("publishers_email_unique_not_deleted")
+                {
+                    // Return a user-friendly error response instead of 500
+                    return Ok(Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("A publisher with the email '{}' already exists. Please use a different email address.", payload.email)
+                    })));
+                } else if error_str.contains("publishers_api_key_hash") {
+                    // Extremely unlikely but handle api_key_hash collision
+                    tracing::warn!(
+                        "API key hash collision detected for publisher creation. Retrying..."
+                    );
+                    // For now, return error - in production, you might want to retry with a new key
+                    return Ok(Json(serde_json::json!({
+                        "success": false,
+                        "error": "An internal error occurred while generating the API key. Please try again."
+                    })));
+                }
+            }
+
+            // Log other database errors for debugging
+            tracing::error!("Database error creating publisher: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -239,13 +416,38 @@ async fn get_publisher(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
-        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT * FROM publishers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(state.db_pool.as_ref())
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Get verticals for this publisher
+    let verticals = sqlx::query_as::<_, leadsnebula_core::models::vertical::Vertical>(
+        r#"
+        SELECT v.* FROM verticals v
+        INNER JOIN publisher_verticals pv ON v.id = pv.vertical_id
+        WHERE pv.publisher_id = $1
+        ORDER BY v.name
+        "#,
+    )
+    .bind(id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .unwrap_or_default();
+
+    let vertical_info: Vec<serde_json::Value> = verticals
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id.to_string(),
+                "name": v.name,
+                "slug": v.slug,
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -268,7 +470,9 @@ async fn get_publisher(
             "address_zip": publisher.address_zip,
             "timezone": publisher.timezone,
             "ein_tin": publisher.ein_tin,
-            "created_at": publisher.created_at.to_rfc3339()
+            "created_at": publisher.created_at.to_rfc3339(),
+            "deleted_at": publisher.deleted_at.map(|dt| dt.to_rfc3339()),
+            "verticals": vertical_info
         }
     })))
 }
@@ -398,6 +602,7 @@ async fn regenerate_publisher_api_key(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::encryption::EncryptionService;
     use rand::Rng;
     use sha2::{Digest, Sha256};
     use tracing::error;
@@ -426,11 +631,23 @@ async fn regenerate_publisher_api_key(
     hasher.update(api_key.as_bytes());
     let api_key_hash = hex::encode(hasher.finalize());
 
-    // Update publisher with new API key
+    // Encrypt API key for storage (api_key_encrypted column is NOT NULL)
+    let encryption_service = EncryptionService::new(&state.config.encryption_key).map_err(|e| {
+        error!("Failed to initialize encryption service: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let api_key_encrypted = encryption_service.encrypt(&api_key).map_err(|e| {
+        error!("Failed to encrypt API key: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Update publisher with new API key (both hash and encrypted)
     sqlx::query(
-        "UPDATE publishers SET api_key_hash = $1, api_key_prefix = 'pk_live_', updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL"
+        "UPDATE publishers SET api_key_hash = $1, api_key_prefix = 'pk_live_', api_key_encrypted = $2, updated_at = NOW() WHERE id = $3 AND deleted_at IS NULL"
     )
     .bind(&api_key_hash)
+    .bind(&api_key_encrypted)
     .bind(id)
     .execute(state.db_pool.as_ref())
     .await
@@ -443,6 +660,76 @@ async fn regenerate_publisher_api_key(
         "success": true,
         "api_key": api_key,
         "message": "API key regenerated successfully"
+    })))
+}
+
+async fn get_publisher_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::encryption::EncryptionService;
+    use tracing::error;
+
+    // Get user from request extensions (set by jwt_auth_middleware)
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Get publisher to check instance_id
+    let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Check if user is admin (for the publisher's instance)
+    let is_admin = is_user_admin(state.db_pool.as_ref(), user.id, Some(publisher.instance_id))
+        .await
+        .map_err(|e| {
+            error!("Database error checking admin status: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if !is_admin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Decrypt API key
+
+    // After migration, api_key_encrypted is NOT NULL, but may be empty string for old records
+    let api_key_encrypted = match &publisher.api_key_encrypted {
+        Some(encrypted) if !encrypted.is_empty() => encrypted.clone(),
+        _ => {
+            // API key was not encrypted (created before encryption was enabled or encryption key wasn't configured)
+            // Return a helpful error message indicating the key needs to be regenerated
+            return Ok(Json(serde_json::json!({
+                "success": false,
+                "error": "API key was not encrypted when created. Please regenerate the API key to enable encryption and retrieval.",
+                "requires_regeneration": true
+            })));
+        }
+    };
+
+    // Decrypt the API key
+    let encryption_service = EncryptionService::new(&state.config.encryption_key).map_err(|e| {
+        error!("Failed to initialize encryption service: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let api_key = encryption_service
+        .decrypt(&api_key_encrypted)
+        .map_err(|e| {
+            error!("Failed to decrypt API key: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "api_key": api_key
     })))
 }
 

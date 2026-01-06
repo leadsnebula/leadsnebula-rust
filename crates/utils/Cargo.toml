@@ -61,6 +61,22 @@ path = "src/bin/add-vertical-to-buyer.rs"
 name = "fix-solar2-buyer"
 path = "src/bin/fix-solar2-buyer.rs"
 
+[[bin]]
+name = "generate-encryption-key"
+path = "src/bin/generate-encryption-key.rs"
+
+[[bin]]
+name = "test-encryption"
+path = "src/bin/test-encryption.rs"
+
+[[bin]]
+name = "apply-single-migration"
+path = "src/bin/apply-single-migration.rs"
+
+[[bin]]
+name = "verify-email-index"
+path = "src/bin/verify-email-index.rs"
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
@@ -76,4 +92,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
 

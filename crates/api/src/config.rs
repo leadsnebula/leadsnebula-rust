@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose, Engine as _};
 use leadsnebula_core::redis::RedisClient;
 use leadsnebula_core::services::database::create_pool;
 use leadsnebula_core::ssm::SsmService;
@@ -12,6 +13,7 @@ pub struct AppConfig {
     pub redis_pool_size: u32,
     pub redis_min_idle: u32,
     pub jwt_secret: String,
+    pub encryption_key: Vec<u8>,
     #[allow(dead_code)] // Used by Sentry initialization in main.rs
     pub sentry_dsn: Option<String>,
     pub environment: String,
@@ -37,8 +39,22 @@ impl AppConfig {
 
         // Load .env.local first for local development (highest priority)
         // This ensures local development doesn't interfere with production
+        // Note: main.rs also loads .env.local, but we verify it's available here
+        // We don't reload it here since main.rs already loaded it with tolerant parsing
         if is_local_dev {
-            let _ = dotenv::from_filename(".env.local");
+            // Verify REDIS_URL was loaded (main.rs already loaded .env.local)
+            if let Ok(redis_url) = std::env::var("REDIS_URL") {
+                tracing::info!(
+                    "REDIS_URL found in environment: {}...",
+                    if redis_url.len() > 30 {
+                        format!("{}...", &redis_url[..30])
+                    } else {
+                        redis_url
+                    }
+                );
+            } else {
+                tracing::warn!("REDIS_URL not found in environment after .env.local was loaded");
+            }
         }
 
         let environment = std::env::var("ENVIRONMENT")
@@ -82,14 +98,27 @@ impl AppConfig {
             None
         } else if is_local_dev {
             // Local development: prioritize REDIS_URL from .env.local
-            if let Ok(redis_url) = std::env::var("REDIS_URL") {
-                info!("Using REDIS_URL from .env.local for local development: redis://...");
-                Some(redis_url)
-            } else {
-                info!("REDIS_URL not found in .env.local, falling back to SSM");
-                params
-                    .get("/leadsnebula/prod/rust/redis/connection_url")
-                    .cloned()
+            match std::env::var("REDIS_URL") {
+                Ok(redis_url) => {
+                    info!(
+                        "Using REDIS_URL from .env.local for local development: {}",
+                        if redis_url.len() > 20 {
+                            format!("{}...", &redis_url[..20])
+                        } else {
+                            redis_url.clone()
+                        }
+                    );
+                    Some(redis_url)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "REDIS_URL not found in environment (error: {}), falling back to SSM",
+                        e
+                    );
+                    params
+                        .get("/leadsnebula/prod/rust/redis/connection_url")
+                        .cloned()
+                }
             }
         } else {
             // Deployed environments (Fly.io): always use SSM (sole source of truth)
@@ -124,6 +153,37 @@ impl AppConfig {
                     if env_normalized == "dev" { ", /leadsnebula/prod/rust/jwt/secret_key, /leadsnebula/prod/rust/auth/jwt_secret" } else { "" }
                 )
             })?;
+
+        // Load encryption key for API key encryption from SSM (REQUIRED)
+        // This is a separate key from Rails encryption keys - it's specifically for encrypting publisher API keys
+        // Path: /leadsnebula/{env}/rust/encryption/api_key_key
+        // IMPORTANT: Dev environment uses dev key only (no prod fallback) for local development
+        // Production uses prod key only
+        let encryption_key_path = format!(
+            "/leadsnebula/{}/rust/encryption/api_key_key",
+            env_normalized
+        );
+
+        let encryption_key_str = params
+            .get(&encryption_key_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Encryption key not found in SSM at {}. This key is required for encrypting publisher API keys. Please create it in SSM Parameter Store.",
+                    encryption_key_path
+                )
+            })?;
+
+        // Decode base64 encryption key (SSM stores it as base64)
+        let encryption_key = general_purpose::STANDARD
+            .decode(encryption_key_str)
+            .map_err(|e| anyhow::anyhow!("Failed to decode encryption key from base64: {}", e))?;
+
+        if encryption_key.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "Encryption key must be 32 bytes (256 bits) for AES-256-GCM, got {} bytes",
+                encryption_key.len()
+            ));
+        }
 
         let sentry_dsn = params
             .get(&format!(
@@ -181,6 +241,7 @@ impl AppConfig {
             redis_pool_size,
             redis_min_idle,
             jwt_secret,
+            encryption_key,
             sentry_dsn,
             environment,
             from_email,
@@ -305,16 +366,6 @@ async fn init_redis(
         .unwrap_or_else(|| "(hidden)".to_string());
 
     info!("Connecting to Redis at {}...", display_url);
-    tracing::debug!(
-        "Redis connection URL scheme: {}",
-        if redis_url.starts_with("rediss://") {
-            "TLS (rediss://)"
-        } else if redis_url.starts_with("redis://") {
-            "Plain (redis://)"
-        } else {
-            "Unknown"
-        }
-    );
 
     // First connection attempt with configurable timeout (shorter for local dev)
     info!(

@@ -9,6 +9,7 @@ pub struct Publisher {
     pub email: String,
     pub api_key_hash: String,
     pub api_key_prefix: String,
+    pub api_key_encrypted: Option<String>,
     pub status: String,
     pub total_requests: i32,
     pub last_request_at: Option<chrono::DateTime<chrono::Utc>>,
