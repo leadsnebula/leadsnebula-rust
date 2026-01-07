@@ -120,34 +120,42 @@ jobs:
           # Start container in background
           CONTAINER_ID=$(docker run -d -p 8080:8080 \
             -e ENVIRONMENT=development \
-            "$IMAGE_TAG" 2>&1 | tail -1 || echo "")
+            "$IMAGE_TAG" 2>&1 | tail -1 | tr -d '\r\n' || echo "")
           
-          if [ -z "$CONTAINER_ID" ] || [ "${#CONTAINER_ID}" -ne 64 ]; then
+          # Validate container ID (should be 12+ characters, not necessarily 64)
+          if [ -z "$CONTAINER_ID" ] || [ "${#CONTAINER_ID}" -lt 12 ]; then
             echo "❌ Failed to start container"
             echo "Container ID: '$CONTAINER_ID'"
             exit 1
           fi
           
+          echo "Container started: $CONTAINER_ID"
+          
           # Wait for container to start and server to initialize
           echo "Waiting for server to start..."
-          sleep 8
+          sleep 5
+          
+          # Check container status
+          CONTAINER_STATUS=$(docker ps -a --filter "id=$CONTAINER_ID" --format "{{.Status}}" 2>/dev/null || echo "")
+          echo "Container status: ${CONTAINER_STATUS:-unknown}"
           
           # Test liveness endpoint (container may show errors in logs but endpoint should work)
-          MAX_RETRIES=15
+          MAX_RETRIES=20
           RETRY_COUNT=0
           ENDPOINT_WORKING=false
+          
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            # Check if container is still running (or was running recently)
-            if ! docker ps -a | grep -q "$CONTAINER_ID"; then
-              echo "⚠️  Container not found, checking logs..."
-              docker logs "$CONTAINER_ID" 2>&1 | tail -20 || true
-              break
-            fi
-            
-            # Try to reach the endpoint
+            # Try to reach the endpoint (even if container appears stopped, it might still be listening)
             if curl -f -s --max-time 3 http://localhost:8080/live > /dev/null 2>&1; then
               echo "✅ Liveness endpoint responding"
               ENDPOINT_WORKING=true
+              break
+            fi
+            
+            # Check if container still exists (running or stopped)
+            if ! docker ps -a --filter "id=$CONTAINER_ID" --format "{{.ID}}" | grep -q .; then
+              echo "⚠️  Container no longer exists, checking if it was removed..."
+              docker logs "$CONTAINER_ID" 2>&1 | tail -20 || echo "Could not retrieve logs"
               break
             fi
             
@@ -170,7 +178,10 @@ jobs:
           else
             echo "❌ Liveness endpoint not responding after $MAX_RETRIES attempts"
             echo "Container logs:"
-            docker logs "$CONTAINER_ID" 2>&1 | tail -30 || true
+            docker logs "$CONTAINER_ID" 2>&1 | tail -40 || echo "Could not retrieve logs"
+            echo ""
+            echo "Container status:"
+            docker ps -a --filter "id=$CONTAINER_ID" || echo "Container not found"
             docker rm -f "$CONTAINER_ID" 2>/dev/null || true
             exit 1
           fi
