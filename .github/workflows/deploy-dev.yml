@@ -1,18 +1,12 @@
 name: Deploy to Dev
 
 on:
-  push:
-    branches: [dev]
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-      - '.cursorrules'
-  workflow_dispatch:
   workflow_run:
     workflows: ["Rust CI"]
     types:
       - completed
     branches: [dev]
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -28,18 +22,24 @@ jobs:
       - name: Wait for Rust CI tests
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event.workflow_run.head_branch || 'dev' }}
           check-name: 'Test Suite'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
           allowed-conclusions: success
           timeout-seconds: 1800
-        if: github.event_name == 'push'
+        if: github.event_name == 'workflow_run'
 
       - name: Verify environment and config
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/dev" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo "ERROR: This workflow only deploys from dev branch or manual trigger"
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+              echo "ERROR: Rust CI workflow did not complete successfully"
+              exit 1
+            fi
+          fi
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "${{ github.event_name }}" != "workflow_run" ]; then
+            echo "ERROR: This workflow only deploys after Rust CI succeeds or manual trigger"
             exit 1
           fi
           if [ ! -f "fly.dev.toml" ]; then
@@ -60,7 +60,15 @@ jobs:
             exit 1
           fi
           echo "APP_NAME=${APP_NAME}" >> $GITHUB_ENV
-          echo "Deploying to: ${APP_NAME}"
+          
+          # Get the commit SHA from the workflow_run event or current commit
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            COMMIT_SHA="${{ github.sha }}"
+          fi
+          echo "COMMIT_SHA=${COMMIT_SHA}" >> $GITHUB_ENV
+          echo "Deploying to: ${APP_NAME} (commit: ${COMMIT_SHA})"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -85,7 +93,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-dev
+          tags: ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ env.COMMIT_SHA }}-dev
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
@@ -97,7 +105,7 @@ jobs:
       - name: Pre-deployment validation
         run: |
           echo "🔍 Running pre-deployment validation..."
-          IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-dev"
+          IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ env.COMMIT_SHA }}-dev"
           
           # Pull the image we just built
           docker pull "$IMAGE_TAG" || {
@@ -231,7 +239,7 @@ jobs:
           # Retry deploy up to 3 times in case of transient Fly.io API issues
           for attempt in {1..3}; do
             if flyctl deploy \
-              --image ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-dev \
+              --image ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ env.COMMIT_SHA }}-dev \
               --config fly.dev.toml \
               --app ${{ env.APP_NAME }} \
               --remote-only=false \

@@ -1,3 +1,7 @@
+// Note: health_routes() and health_check() are currently unused because we only serve minimal app
+// They will be used when we implement full app serving after AppState initialization
+#![allow(dead_code)]
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

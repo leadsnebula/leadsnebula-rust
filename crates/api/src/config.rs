@@ -12,7 +12,9 @@ pub struct AppConfig {
     pub redis_url: Option<String>,
     pub redis_pool_size: u32,
     pub redis_min_idle: u32,
+    #[allow(dead_code)] // Used by routes that require authentication
     pub jwt_secret: String,
+    #[allow(dead_code)] // Used by routes that encrypt/decrypt API keys
     pub encryption_key: Vec<u8>,
     #[allow(dead_code)] // Used by Sentry initialization in main.rs
     pub sentry_dsn: Option<String>,
@@ -23,7 +25,9 @@ pub struct AppConfig {
 
 #[derive(Clone)]
 pub struct AppState {
+    #[allow(dead_code)] // Used by routes that need config
     pub config: AppConfig,
+    #[allow(dead_code)] // Used by routes that need database access
     pub db_pool: Arc<PgPool>,
     #[allow(dead_code)] // Used by services that need Redis
     pub redis: Option<Arc<RedisClient>>,

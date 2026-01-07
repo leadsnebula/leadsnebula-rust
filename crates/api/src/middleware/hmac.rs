@@ -1,3 +1,7 @@
+// Note: This middleware is currently unused because we only serve minimal app with /live endpoint
+// It will be used when we implement full app serving after AppState initialization
+#![allow(dead_code)]
+
 use crate::AppState;
 use axum::{
     body::Body,

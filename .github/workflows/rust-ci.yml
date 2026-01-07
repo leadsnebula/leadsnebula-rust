@@ -55,19 +55,20 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Run unit tests with nextest
+      - name: Run unit and health tests with nextest
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
         run: |
-          # Run unit tests (fast)
-          cargo nextest run --lib --locked --all-features || cargo test --lib --locked --all-features
+          # Run unit tests and health integration tests (fast, no DB required for health tests)
+          cargo nextest run --lib --test integration_health --locked --all-features || cargo test --lib --test integration_health --locked --all-features
 
       - name: Run integration tests
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
         run: |
           # Run integration tests (slower, require DB)
-          cargo test --test integration_publisher_crud --locked --all-features || true
+          # Note: integration_publisher_crud is in workspace tests/, integration_health is in crates/api/tests/
+          cargo test --test integration_health --locked --all-features -p leadsnebula-api || true
 
       - name: Build release
         run: cargo build --release --locked

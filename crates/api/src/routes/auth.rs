@@ -1,3 +1,7 @@
+// Note: This module is currently unused because we only serve minimal app with /live endpoint
+// It will be used when we implement full app serving after AppState initialization
+#![allow(dead_code)]
+
 use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
 use leadsnebula_core::auth::{verify_password, JwtService};
 use leadsnebula_core::models::user::User;
