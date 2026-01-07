@@ -61,46 +61,56 @@ jobs:
         run: |
           # Get list of changed files
           if [ "${{ github.event_name }}" == "pull_request" ]; then
-            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || echo "")
           else
             # For push events, compare with previous commit
-            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
           fi
           
           # Extract unique crate names from changed files
-          CHANGED_CRATES=$(echo "$CHANGED_FILES" | grep -o '^crates/[^/]*' | sort -u | tr '\n' ' ' || echo "")
+          CHANGED_CRATES=$(echo "$CHANGED_FILES" | grep -o '^crates/[^/]*' | sort -u | tr '\n' ' ' | xargs || echo "")
           
           if [ -z "$CHANGED_CRATES" ]; then
             # No crate-specific changes, run all tests
             echo "packages=" >> $GITHUB_OUTPUT
             echo "run_all=true" >> $GITHUB_OUTPUT
+            echo "Changed crates: none (running all tests)"
           else
-            # Convert to package filter format
-            PACKAGES=$(echo "$CHANGED_CRATES" | sed 's|crates/||g' | sed 's| | -p |g' | sed 's|^|-p |')
-            echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
-            echo "run_all=false" >> $GITHUB_OUTPUT
+            # Convert to package filter format (remove crates/ prefix, add -p prefix)
+            PACKAGE_NAMES=$(echo "$CHANGED_CRATES" | sed 's|crates/||g' | xargs)
+            if [ -z "$PACKAGE_NAMES" ]; then
+              # Empty after processing, run all tests
+              echo "packages=" >> $GITHUB_OUTPUT
+              echo "run_all=true" >> $GITHUB_OUTPUT
+              echo "Changed crates: $CHANGED_CRATES (but no valid package names, running all tests)"
+            else
+              # Build package filter arguments
+              PACKAGES=""
+              for pkg in $PACKAGE_NAMES; do
+                PACKAGES="$PACKAGES -p $pkg"
+              done
+              echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+              echo "run_all=false" >> $GITHUB_OUTPUT
+              echo "Changed crates: $CHANGED_CRATES"
+              echo "Package filter: $PACKAGES"
+            fi
           fi
-          
-          echo "Changed crates: $CHANGED_CRATES"
-          echo "Package filter: $PACKAGES"
 
       - name: Run unit tests with nextest
         run: |
           # Run unit tests (lib tests) in parallel with nextest
           # Use all available CPU cores for maximum parallelization
-          if [ "${{ steps.changed-crates.outputs.run_all }}" == "true" ]; then
+          if [ "${{ steps.changed-crates.outputs.run_all }}" == "true" ] || [ -z "${{ steps.changed-crates.outputs.packages }}" ]; then
             echo "Running all unit tests (no crate-specific changes detected)"
             cargo nextest run --lib --locked --all-features \
-              --test-threads 0 \
               --retries 2
           else
             echo "Running tests for changed crates: ${{ steps.changed-crates.outputs.packages }}"
             cargo nextest run --lib ${{ steps.changed-crates.outputs.packages }} --locked --all-features \
-              --test-threads 0 \
               --retries 2 || \
             # Fallback: if filtered tests fail, run all tests to ensure nothing broke
             (echo "⚠️ Filtered tests had issues, running full test suite..." && \
-             cargo nextest run --lib --locked --all-features --test-threads 0 --retries 2)
+             cargo nextest run --lib --locked --all-features --retries 2)
           fi
 
   test-integration:
@@ -147,7 +157,6 @@ jobs:
         run: |
           # Run integration tests with nextest for faster execution
           cargo nextest run --test integration_health --locked --all-features \
-            --test-threads 0 \
             --retries 2 || \
           cargo test --test integration_health --locked --all-features
 
