@@ -192,16 +192,19 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Failed to initialize application state: {}", e);
             tracing::warn!("Application running in minimal mode - only /live endpoint available");
             tracing::warn!("Full functionality will be unavailable until configuration is fixed");
+            // Continue serving even if AppState initialization failed
             serve_handle.await??;
         }
         Ok(Err(e)) => {
             tracing::error!("AppState initialization task error: {}", e);
             tracing::warn!("Application running in minimal mode - only /live endpoint available");
+            // Continue serving even if AppState initialization task failed
             serve_handle.await??;
         }
         Err(_) => {
             tracing::error!("AppState initialization timed out after 30 seconds");
             tracing::warn!("Application running in minimal mode - only /live endpoint available");
+            // Continue serving even if AppState initialization timed out
             serve_handle.await??;
         }
     }
