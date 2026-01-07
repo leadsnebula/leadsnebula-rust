@@ -83,14 +83,20 @@ impl AppConfig {
         }
 
         // Extract values from batched parameters
+        let expected_path = format!("/leadsnebula/{}/rust/db/connection_url", env_normalized);
         let database_url = params
-            .get(&format!("/leadsnebula/{}/rust/db/connection_url", env_normalized))
+            .get(&expected_path)
             .cloned()
             .or_else(|| std::env::var("DATABASE_URL").ok())
             .ok_or_else(|| {
+                // Provide detailed error message with both original and normalized environment
+                let available_paths: Vec<String> = params.keys().cloned().collect();
                 anyhow::anyhow!(
-                    "DATABASE_URL not found in SSM at /leadsnebula/{}/rust/db/connection_url. Production environments must use SSM Parameter Store.",
-                    env_normalized
+                    "DATABASE_URL not found in SSM at {}. Environment: '{}' (normalized: '{}'). Production environments must use SSM Parameter Store. Available SSM paths: {:?}",
+                    expected_path,
+                    environment,
+                    env_normalized,
+                    available_paths
                 )
             })?;
 

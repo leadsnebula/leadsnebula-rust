@@ -84,6 +84,100 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
+      - name: Pre-deployment validation
+        run: |
+          echo "🔍 Running pre-deployment validation..."
+          IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-production"
+          
+          # Pull the image we just built
+          docker pull "$IMAGE_TAG" || {
+            echo "❌ Failed to pull Docker image"
+            exit 1
+          }
+          
+          # Test 1: Verify image has required binaries
+          echo "📦 Checking required binaries..."
+          docker run --rm "$IMAGE_TAG" ls -la /app/leadsnebula-api /app/run-migrations || {
+            echo "❌ Required binaries missing"
+            exit 1
+          }
+          
+          # Test 2: Verify liveness endpoint works (without dependencies)
+          echo "🏥 Testing liveness endpoint..."
+          # Start container in background
+          CONTAINER_ID=$(docker run -d -p 8080:8080 \
+            -e ENVIRONMENT=production \
+            "$IMAGE_TAG" 2>&1 | tail -1 | tr -d '\r\n' || echo "")
+          
+          # Validate container ID (should be 12+ characters, not necessarily 64)
+          if [ -z "$CONTAINER_ID" ] || [ "${#CONTAINER_ID}" -lt 12 ]; then
+            echo "❌ Failed to start container"
+            echo "Container ID: '$CONTAINER_ID'"
+            exit 1
+          fi
+          
+          echo "Container started: $CONTAINER_ID"
+          
+          # Wait for container to start and server to initialize
+          echo "Waiting for server to start..."
+          sleep 5
+          
+          # Check container status
+          CONTAINER_STATUS=$(docker ps -a --filter "id=$CONTAINER_ID" --format "{{.Status}}" 2>/dev/null || echo "")
+          echo "Container status: ${CONTAINER_STATUS:-unknown}"
+          
+          # Test liveness endpoint (container may show errors in logs but endpoint should work)
+          MAX_RETRIES=20
+          RETRY_COUNT=0
+          ENDPOINT_WORKING=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            # Try to reach the endpoint (even if container appears stopped, it might still be listening)
+            if curl -f -s --max-time 3 http://localhost:8080/live > /dev/null 2>&1; then
+              echo "✅ Liveness endpoint responding"
+              ENDPOINT_WORKING=true
+              break
+            fi
+            
+            # Check if container still exists (running or stopped)
+            if ! docker ps -a --filter "id=$CONTAINER_ID" --format "{{.ID}}" | grep -q .; then
+              echo "⚠️  Container no longer exists, checking if it was removed..."
+              docker logs "$CONTAINER_ID" 2>&1 | tail -20 || echo "Could not retrieve logs"
+              break
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Waiting for endpoint... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+              sleep 2
+            fi
+          done
+          
+          # Verify response format if endpoint is working
+          if [ "$ENDPOINT_WORKING" = "true" ]; then
+            RESPONSE=$(curl -s --max-time 3 http://localhost:8080/live 2>/dev/null || echo "")
+            if echo "$RESPONSE" | grep -q '"status".*"alive"'; then
+              echo "✅ Liveness endpoint response format is correct"
+            else
+              echo "⚠️  Liveness endpoint responded but format unexpected"
+              echo "Response: $RESPONSE"
+            fi
+          else
+            echo "❌ Liveness endpoint not responding after $MAX_RETRIES attempts"
+            echo "Container logs:"
+            docker logs "$CONTAINER_ID" 2>&1 | tail -40 || echo "Could not retrieve logs"
+            echo ""
+            echo "Container status:"
+            docker ps -a --filter "id=$CONTAINER_ID" || echo "Container not found"
+            docker rm -f "$CONTAINER_ID" 2>/dev/null || true
+            exit 1
+          fi
+          
+          # Cleanup
+          docker rm -f "$CONTAINER_ID" 2>/dev/null || true
+          
+          echo "✅ Pre-deployment validation passed"
+
       - name: Install Fly CLI
         uses: superfly/flyctl-actions/setup-flyctl@master
 
@@ -113,6 +207,31 @@ jobs:
           echo "List secrets with: flyctl secrets list --app ${{ env.APP_NAME }}"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Validate SSM configuration (documentation)
+        run: |
+          echo "📋 SSM Configuration Requirements for Production"
+          echo ""
+          echo "AWS credentials are set as environment variables in Fly.io machines."
+          echo "SSM validation happens at runtime when the application starts."
+          echo ""
+          echo "⚠️  Required SSM parameters (must use 'prod' path, not 'production'):"
+          echo "   - /leadsnebula/prod/rust/db/connection_url"
+          echo "   - /leadsnebula/prod/rust/auth/jwt_secret"
+          echo "   - /leadsnebula/prod/rust/encryption/api_key_key"
+          echo "   - /leadsnebula/prod/rust/redis/connection_url"
+          echo ""
+          echo "⚠️  Optional SSM parameters:"
+          echo "   - /leadsnebula/prod/rust/monitoring/sentry_dsn"
+          echo "   - /leadsnebula/prod/rust/email/from_address"
+          echo ""
+          echo "NOTE: The ENVIRONMENT variable is 'production', but SSM paths use '/leadsnebula/prod/rust/...'"
+          echo "      (environment names are normalized: production → prod, development → dev)"
+          echo ""
+          echo "If deployment fails with 'DATABASE_URL not found in SSM', check that:"
+          echo "  1. AWS credentials are set in Fly.io: flyctl secrets list --app ${{ env.APP_NAME }}"
+          echo "  2. SSM parameters exist with 'prod' path (not 'production')"
+          echo "  3. Fly.io machine has IAM permissions to access SSM"
 
       - name: Deploy to Fly.io Production
         run: |
