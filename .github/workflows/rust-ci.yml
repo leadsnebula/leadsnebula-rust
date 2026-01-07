@@ -100,7 +100,7 @@ jobs:
           cargo llvm-cov --locked --all-features --lcov --output-path lcov.info || true
 
       - name: Upload coverage to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-report

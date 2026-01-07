@@ -161,12 +161,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), app_state_handle).await;
 
     match state_result {
-        Ok(Ok(Ok(state))) => {
+        Ok(Ok(Ok(_state))) => {
             info!("Application state initialized successfully");
 
             // Initialize Sentry if DSN is provided
             #[cfg(feature = "sentry")]
-            if let Some(dsn) = &state.config.sentry_dsn {
+            if let Some(dsn) = &_state.config.sentry_dsn {
                 let _guard = sentry::init((
                     dsn.clone(),
                     sentry::ClientOptions {
