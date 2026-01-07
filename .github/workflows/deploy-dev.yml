@@ -19,16 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Wait for Rust CI tests
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.event.workflow_run.head_branch || 'dev' }}
-          check-name: 'Test Suite'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
-          allowed-conclusions: success
-        if: github.event_name == 'workflow_run'
-
       - name: Verify environment and config
         run: |
           if [ "${{ github.event_name }}" == "workflow_run" ]; then
