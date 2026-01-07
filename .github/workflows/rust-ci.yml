@@ -41,7 +41,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: "."
 
       - name: Install cargo-nextest (if not cached)
         run: |
@@ -50,15 +50,12 @@ jobs:
           fi
 
       - name: Run cargo fmt check
-        working-directory: rust
         run: cargo fmt --all -- --check
 
       - name: Run cargo clippy
-        working-directory: rust
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run unit tests with nextest
-        working-directory: rust
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
         run: |
@@ -66,7 +63,6 @@ jobs:
           cargo nextest run --lib --locked --all-features || cargo test --lib --locked --all-features
 
       - name: Run integration tests
-        working-directory: rust
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
         run: |
@@ -74,7 +70,6 @@ jobs:
           cargo test --test integration_publisher_crud --locked --all-features || true
 
       - name: Build release
-        working-directory: rust
         run: cargo build --release --locked
 
   coverage:
@@ -95,10 +90,9 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: "."
 
       - name: Generate coverage report
-        working-directory: rust
         run: |
           # Install cargo-llvm-cov if needed
           cargo install cargo-llvm-cov --locked || true
@@ -109,4 +103,4 @@ jobs:
         if: always()
         with:
           name: coverage-report
-          path: rust/lcov.info
+          path: lcov.info

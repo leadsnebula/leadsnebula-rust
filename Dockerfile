@@ -37,10 +37,16 @@ COPY migrations/ ./migrations/
 
 # Build with cache mounts for faster rebuilds
 # Note: Cache mounts are ephemeral, so we copy binaries to persistent location after build
+# Optimizations:
+# - Use all available CPU cores (detected automatically, but limit to 4 for consistency)
+# - Enable incremental compilation for faster rebuilds
+# - Build only required binaries to reduce build time
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/usr/local/cargo/git \
     CARGO_BUILD_JOBS=4 \
     CARGO_INCREMENTAL=1 \
+    RUSTFLAGS="-C target-cpu=native" \
     cargo build --release --locked --bin leadsnebula-api --bin run-migrations --bin create-user --bin update-password --bin test-redis-connection && \
     mkdir -p /app/binaries && \
     cp /app/target/release/leadsnebula-api /app/binaries/ && \

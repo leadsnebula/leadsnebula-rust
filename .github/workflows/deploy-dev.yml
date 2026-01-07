@@ -8,6 +8,11 @@ on:
       - '.gitignore'
       - '.cursorrules'
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Rust CI"]
+    types:
+      - completed
+    branches: [dev]
 
 jobs:
   deploy:
@@ -16,8 +21,20 @@ jobs:
     permissions:
       contents: read
       packages: write
+      checks: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for Rust CI tests
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.ref }}
+          check-name: 'Test Suite'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 10
+          allowed-conclusions: success
+          timeout-seconds: 1800
+        if: github.event_name == 'push'
 
       - name: Verify environment and config
         run: |
@@ -72,6 +89,84 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+          # Build args for optimization
+          build-args: |
+            CARGO_BUILD_JOBS=4
+            CARGO_INCREMENTAL=1
+
+      - name: Pre-deployment validation
+        run: |
+          echo "🔍 Running pre-deployment validation..."
+          IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/leadsnebula-rust:${{ github.sha }}-dev"
+          
+          # Pull the image we just built
+          docker pull "$IMAGE_TAG" || {
+            echo "❌ Failed to pull Docker image"
+            exit 1
+          }
+          
+          # Test 1: Verify image has required binaries
+          echo "📦 Checking required binaries..."
+          docker run --rm "$IMAGE_TAG" ls -la /app/leadsnebula-api /app/run-migrations || {
+            echo "❌ Required binaries missing"
+            exit 1
+          }
+          
+          # Test 2: Verify liveness endpoint works (without dependencies)
+          echo "🏥 Testing liveness endpoint..."
+          # Start container in background
+          CONTAINER_ID=$(docker run -d -p 8080:8080 \
+            -e ENVIRONMENT=development \
+            "$IMAGE_TAG" || echo "")
+          
+          if [ -z "$CONTAINER_ID" ]; then
+            echo "❌ Failed to start container"
+            exit 1
+          fi
+          
+          # Wait for container to start
+          sleep 5
+          
+          # Check if container is still running
+          if ! docker ps | grep -q "$CONTAINER_ID"; then
+            echo "❌ Container exited unexpectedly"
+            docker logs "$CONTAINER_ID" || true
+            docker rm -f "$CONTAINER_ID" || true
+            exit 1
+          fi
+          
+          # Test liveness endpoint
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -f -s --max-time 5 http://localhost:8080/live > /dev/null 2>&1; then
+              echo "✅ Liveness endpoint responding"
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "❌ Liveness endpoint not responding after $MAX_RETRIES attempts"
+              docker logs "$CONTAINER_ID" || true
+              docker rm -f "$CONTAINER_ID" || true
+              exit 1
+            fi
+            sleep 2
+          done
+          
+          # Verify response format
+          RESPONSE=$(curl -s --max-time 5 http://localhost:8080/live || echo "")
+          if ! echo "$RESPONSE" | grep -q '"status".*"alive"'; then
+            echo "❌ Invalid liveness response format"
+            echo "Response: $RESPONSE"
+            docker logs "$CONTAINER_ID" || true
+            docker rm -f "$CONTAINER_ID" || true
+            exit 1
+          fi
+          
+          # Cleanup
+          docker rm -f "$CONTAINER_ID" || true
+          
+          echo "✅ Pre-deployment validation passed"
 
       - name: Install Fly CLI
         uses: superfly/flyctl-actions/setup-flyctl@master

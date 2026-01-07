@@ -32,3 +32,15 @@ async fn test_jwt_token_expiration() {
     assert!(claims.exp > claims.iat);
     assert!(claims.exp - claims.iat >= 24 * 3600 - 1); // Should be ~24 hours
 }
+
+// Note: Health endpoint integration tests are covered by:
+// 1. Pre-deployment validation in CI (tests Docker container startup and /live endpoint)
+// 2. Manual testing via Postman collection
+// 3. Fly.io health checks in production
+//
+// For unit-level testing of health endpoints, we would need to either:
+// - Create a lib.rs that exports routes (but this conflicts with binary-only structure)
+// - Use tower-test to test HTTP endpoints (more complex setup)
+//
+// The current approach (pre-deployment validation) is more practical and tests the
+// actual deployment scenario.
