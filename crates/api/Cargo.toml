@@ -40,3 +40,8 @@ sentry-tower = { version = "0.32", optional = true }
 default = []
 sentry = ["dep:sentry", "dep:sentry-tower", "leadsnebula_core/sentry"]
 
+[dev-dependencies]
+tower-test = { workspace = true }
+tokio-test = { workspace = true }
+mockall = { workspace = true }
+proptest = { workspace = true }
