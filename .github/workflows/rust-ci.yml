@@ -156,9 +156,13 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
         run: |
           # Run integration tests with nextest for faster execution
+          # Run health endpoint tests
           cargo nextest run --test integration_health --locked --all-features \
             --retries 2 || \
           cargo test --test integration_health --locked --all-features
+          # Run authentication integration tests sequentially to avoid database conflicts
+          # sqlx::test creates/drops test databases which can conflict when run in parallel
+          cargo test --test integration_auth --locked --all-features -- --test-threads=1
 
   build:
     name: Build Release

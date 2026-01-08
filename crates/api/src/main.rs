@@ -86,10 +86,13 @@ fn load_env_local_tolerant(path: &str) -> io::Result<usize> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Determine if we're in local development
-    // Only check for .env.local in development environment to avoid unnecessary checks in production
+    // Check for .env.local existence OR ENVIRONMENT being development/dev
+    // This allows local dev to work even if ENVIRONMENT isn't explicitly set
+    let env_local_exists = std::path::Path::new(".env.local").exists();
     let is_local_dev = std::env::var("ENVIRONMENT")
         .map(|e| e == "development" || e == "dev")
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || env_local_exists;
 
     // Load environment variables from .env.local if it exists (development only)
     // This allows local development without setting env vars manually
@@ -97,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     // Priority: .env.local (highest) > .env > system environment variables
     // This ensures local development doesn't interfere with production
     // Use a tolerant parser that skips invalid lines instead of failing completely
-    if is_local_dev && std::path::Path::new(".env.local").exists() {
+    if is_local_dev && env_local_exists {
         match load_env_local_tolerant(".env.local") {
             Ok(_loaded_count) => {
                 // Variables loaded successfully
@@ -176,7 +179,17 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(
+                            CorsLayer::new()
+                                .allow_origin(tower_http::cors::Any)
+                                .allow_methods(tower_http::cors::Any)
+                                .allow_headers([
+                                    axum::http::header::AUTHORIZATION,
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderName::from_static("x-api-key"),
+                                ])
+                                .expose_headers(tower_http::cors::Any),
+                        ),
                 );
 
             info!("All routes are now available, including /api/auth/login");
@@ -194,7 +207,17 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(
+                            CorsLayer::new()
+                                .allow_origin(tower_http::cors::Any)
+                                .allow_methods(tower_http::cors::Any)
+                                .allow_headers([
+                                    axum::http::header::AUTHORIZATION,
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderName::from_static("x-api-key"),
+                                ])
+                                .expose_headers(tower_http::cors::Any),
+                        ),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;
@@ -209,7 +232,17 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(
+                            CorsLayer::new()
+                                .allow_origin(tower_http::cors::Any)
+                                .allow_methods(tower_http::cors::Any)
+                                .allow_headers([
+                                    axum::http::header::AUTHORIZATION,
+                                    axum::http::header::CONTENT_TYPE,
+                                    axum::http::HeaderName::from_static("x-api-key"),
+                                ])
+                                .expose_headers(tower_http::cors::Any),
+                        ),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;

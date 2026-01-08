@@ -67,38 +67,94 @@ impl AppConfig {
 
         let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
 
-        // Create SSM service (without Redis initially for bootstrapping)
-        let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
+        // In local development, try to load all config from environment variables first
+        // Only use SSM as fallback if environment variables aren't available
+        let mut params = std::collections::HashMap::new();
+        if is_local_dev {
+            // Try to load all required config from environment variables
+            let has_all_env_vars = std::env::var("DATABASE_URL").is_ok()
+                && std::env::var("JWT_SECRET").is_ok()
+                && std::env::var("ENCRYPTION_KEY").is_ok();
 
-        // Fetch all configs in one batched call
-        let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
-        let mut params = ssm.get_parameters_by_path(&config_path).await?;
+            if !has_all_env_vars {
+                // Some env vars missing, try SSM as fallback
+                tracing::info!("Local development: some environment variables missing, attempting SSM fallback");
+                if let Ok(ssm_service) = SsmService::new(environment.clone(), None).await {
+                    let ssm_arc = Arc::new(ssm_service);
+                    let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
+                    if let Ok(mut ssm_params) = ssm_arc.get_parameters_by_path(&config_path).await {
+                        // For dev environment, also fetch from prod path as fallback
+                        if env_normalized == "dev" {
+                            if let Ok(prod_params) = ssm_arc
+                                .get_parameters_by_path("/leadsnebula/prod/rust/")
+                                .await
+                            {
+                                ssm_params.extend(prod_params);
+                            }
+                        }
+                        params = ssm_params;
+                    } else {
+                        tracing::warn!(
+                            "Failed to fetch SSM parameters. Will use environment variables only."
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Failed to create SSM service. Will use environment variables only."
+                    );
+                }
+            } else {
+                tracing::info!(
+                    "Local development detected: using environment variables instead of SSM"
+                );
+            }
+        } else {
+            // Production/deployed: always use SSM
+            let ssm_service = Arc::new(SsmService::new(environment.clone(), None).await?);
+            let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
+            let mut ssm_params = ssm_service.get_parameters_by_path(&config_path).await?;
 
-        // For dev environment, also fetch from prod path as fallback
-        if env_normalized == "dev" {
-            let prod_params = ssm
-                .get_parameters_by_path("/leadsnebula/prod/rust/")
-                .await?;
-            params.extend(prod_params);
+            // For dev environment, also fetch from prod path as fallback
+            if env_normalized == "dev" {
+                let prod_params = ssm_service
+                    .get_parameters_by_path("/leadsnebula/prod/rust/")
+                    .await?;
+                ssm_params.extend(prod_params);
+            }
+            params = ssm_params;
         }
 
         // Extract values from batched parameters
+        // In local dev, prioritize environment variables; in production, prioritize SSM
         let expected_path = format!("/leadsnebula/{}/rust/db/connection_url", env_normalized);
-        let database_url = params
-            .get(&expected_path)
-            .cloned()
-            .or_else(|| std::env::var("DATABASE_URL").ok())
-            .ok_or_else(|| {
-                // Provide detailed error message with both original and normalized environment
-                let available_paths: Vec<String> = params.keys().cloned().collect();
-                anyhow::anyhow!(
-                    "DATABASE_URL not found in SSM at {}. Environment: '{}' (normalized: '{}'). Production environments must use SSM Parameter Store. Available SSM paths: {:?}",
-                    expected_path,
-                    environment,
-                    env_normalized,
-                    available_paths
-                )
-            })?;
+        let database_url = if is_local_dev {
+            // Local dev: try environment variable first, then SSM
+            std::env::var("DATABASE_URL")
+                .ok()
+                .or_else(|| params.get(&expected_path).cloned())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DATABASE_URL not found in environment or SSM. For local development, set DATABASE_URL in .env.local"
+                    )
+                })?
+        } else {
+            // Production: try SSM first, then environment variable as fallback
+            params
+                .get(&expected_path)
+                .cloned()
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| {
+                    // Provide detailed error message with both original and normalized environment
+                    let available_paths: Vec<String> = params.keys().cloned().collect();
+                    anyhow::anyhow!(
+                        "DATABASE_URL not found in SSM at {}. Environment: '{}' (normalized: '{}'). Production environments must use SSM Parameter Store. Available SSM paths: {:?}",
+                        expected_path,
+                        environment,
+                        env_normalized,
+                        available_paths
+                    )
+                })?
+        };
 
         // Redis URL: Always use prod path for both environments (shared Redis instance)
         // In local development (when .env.local exists), use REDIS_URL from .env.local
@@ -140,29 +196,58 @@ impl AppConfig {
 
         // Try multiple possible SSM paths for JWT_SECRET (supporting different path structures)
         // Also try prod path as fallback for dev environment
-        let jwt_secret = params
-            .get(&format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized))
-            .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt/secret_key", env_normalized)))
-            .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt_secret", env_normalized)))
-            .or_else(|| {
-                // Fallback to prod path if dev environment
-                if env_normalized == "dev" {
-                    params.get("/leadsnebula/prod/rust/jwt/secret_key")
-                        .or_else(|| params.get("/leadsnebula/prod/rust/auth/jwt_secret"))
-                        .or_else(|| params.get("/leadsnebula/prod/rust/jwt_secret"))
-                } else {
-                    None
-                }
-            })
-            .cloned()
-            .or_else(|| std::env::var("JWT_SECRET").ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "JWT_SECRET not found in SSM. Tried paths: /leadsnebula/{}/rust/auth/jwt_secret, /leadsnebula/{}/rust/jwt/secret_key, /leadsnebula/{}/rust/jwt_secret{}",
-                    env_normalized, env_normalized, env_normalized,
-                    if env_normalized == "dev" { ", /leadsnebula/prod/rust/jwt/secret_key, /leadsnebula/prod/rust/auth/jwt_secret" } else { "" }
-                )
-            })?;
+        let jwt_secret = if is_local_dev {
+            // Local dev: try environment variable first, then SSM
+            std::env::var("JWT_SECRET")
+                .ok()
+                .or_else(|| {
+                    params
+                        .get(&format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized))
+                        .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt/secret_key", env_normalized)))
+                        .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt_secret", env_normalized)))
+                        .or_else(|| {
+                            // Fallback to prod path if dev environment
+                            if env_normalized == "dev" {
+                                params.get("/leadsnebula/prod/rust/jwt/secret_key")
+                                    .or_else(|| params.get("/leadsnebula/prod/rust/auth/jwt_secret"))
+                                    .or_else(|| params.get("/leadsnebula/prod/rust/jwt_secret"))
+                            } else {
+                                None
+                            }
+                        })
+                        .cloned()
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "JWT_SECRET not found in environment or SSM. For local development, set JWT_SECRET in .env.local"
+                    )
+                })?
+        } else {
+            // Production: try SSM first, then environment variable as fallback
+            params
+                .get(&format!("/leadsnebula/{}/rust/auth/jwt_secret", env_normalized))
+                .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt/secret_key", env_normalized)))
+                .or_else(|| params.get(&format!("/leadsnebula/{}/rust/jwt_secret", env_normalized)))
+                .or_else(|| {
+                    // Fallback to prod path if dev environment
+                    if env_normalized == "dev" {
+                        params.get("/leadsnebula/prod/rust/jwt/secret_key")
+                            .or_else(|| params.get("/leadsnebula/prod/rust/auth/jwt_secret"))
+                            .or_else(|| params.get("/leadsnebula/prod/rust/jwt_secret"))
+                    } else {
+                        None
+                    }
+                })
+                .cloned()
+                .or_else(|| std::env::var("JWT_SECRET").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "JWT_SECRET not found in SSM. Tried paths: /leadsnebula/{}/rust/auth/jwt_secret, /leadsnebula/{}/rust/jwt/secret_key, /leadsnebula/{}/rust/jwt_secret{}",
+                        env_normalized, env_normalized, env_normalized,
+                        if env_normalized == "dev" { ", /leadsnebula/prod/rust/jwt/secret_key, /leadsnebula/prod/rust/auth/jwt_secret" } else { "" }
+                    )
+                })?
+        };
 
         // Load encryption key for API key encryption from SSM (REQUIRED)
         // This is a separate key from Rails encryption keys - it's specifically for encrypting publisher API keys
@@ -174,18 +259,33 @@ impl AppConfig {
             env_normalized
         );
 
-        let encryption_key_str = params
-            .get(&encryption_key_path)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Encryption key not found in SSM at {}. This key is required for encrypting publisher API keys. Please create it in SSM Parameter Store.",
-                    encryption_key_path
-                )
-            })?;
+        let encryption_key_str = if is_local_dev {
+            // Local dev: try environment variable first, then SSM
+            std::env::var("ENCRYPTION_KEY")
+                .ok()
+                .or_else(|| params.get(&encryption_key_path).cloned())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Encryption key not found in environment or SSM at {}. For local development, set ENCRYPTION_KEY (base64 encoded, 32 bytes) in .env.local",
+                        encryption_key_path
+                    )
+                })?
+        } else {
+            // Production: try SSM first
+            params
+                .get(&encryption_key_path)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Encryption key not found in SSM at {}. This key is required for encrypting publisher API keys. Please create it in SSM Parameter Store.",
+                        encryption_key_path
+                    )
+                })?
+        };
 
         // Decode base64 encryption key (SSM stores it as base64)
         let encryption_key = general_purpose::STANDARD
-            .decode(encryption_key_str)
+            .decode(&encryption_key_str)
             .map_err(|e| anyhow::anyhow!("Failed to decode encryption key from base64: {}", e))?;
 
         if encryption_key.len() != 32 {
@@ -333,7 +433,37 @@ impl AppState {
         };
 
         // Create SSM service with Redis for caching (if available)
-        let ssm = Arc::new(SsmService::new(config.environment.clone(), redis.clone()).await?);
+        // In local dev, SSM might not be available (no AWS credentials)
+        // The AWS SDK should still create the service (it will just fail when used)
+        let is_local_dev = std::path::Path::new(".env.local").exists();
+        let ssm = match SsmService::new(config.environment.clone(), redis.clone()).await {
+            Ok(ssm_service) => Arc::new(ssm_service),
+            Err(e) => {
+                if is_local_dev {
+                    tracing::warn!(
+                        "Failed to create SSM service in local dev: {}. This is OK if using environment variables for all config.",
+                        e
+                    );
+                    // In local dev, if SSM creation fails, we can't create AppState with a working SSM
+                    // But since we're using env vars, SSM might not be needed at runtime
+                    // Try one more time - if it still fails, we'll return an error
+                    SsmService::new(config.environment.clone(), redis.clone()).await
+                        .map(Arc::new)
+                        .map_err(|e2| {
+                            anyhow::anyhow!(
+                                "Failed to create SSM service (required by AppState): {} and {}. For local dev with env vars, SSM service creation should still succeed (it will just fail when used). Check AWS SDK configuration.",
+                                e, e2
+                            )
+                        })?
+                } else {
+                    // Production: SSM is required, fail hard
+                    return Err(anyhow::anyhow!(
+                        "Failed to create SSM service: {}. SSM is required in production.",
+                        e
+                    ));
+                }
+            }
+        };
 
         Ok(Self {
             config,

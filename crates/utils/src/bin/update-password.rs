@@ -2,8 +2,10 @@ use anyhow::Result;
 use clap::Parser;
 use leadsnebula_core::auth::hash_password;
 use leadsnebula_core::services::database::create_pool;
+use leadsnebula_core::ssm::SsmService;
 use sqlx::Row;
 use std::io::{self, Write};
+use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser)]
@@ -20,10 +22,49 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Load .env.local first for local development (highest priority)
+    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    if !env_loaded {
+        let _ = dotenv::dotenv();
+    }
+
+    if env_loaded {
+        tracing::info!("Loaded environment from .env.local (local development mode)");
+    }
+
     let args = Args::parse();
 
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable must be set");
+    // Load DATABASE_URL from SSM (like main app) or fall back to env var
+    let environment = std::env::var("ENVIRONMENT")
+        .or_else(|_| std::env::var("ENV"))
+        .unwrap_or_else(|_| "development".to_string());
+
+    let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
+    let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
+    let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
+    let mut params = ssm.get_parameters_by_path(&config_path).await?;
+
+    // For dev environment, also fetch from prod path as fallback
+    if env_normalized == "dev" {
+        let prod_params = ssm
+            .get_parameters_by_path("/leadsnebula/prod/rust/")
+            .await?;
+        params.extend(prod_params);
+    }
+
+    let database_url = params
+        .get(&format!(
+            "/leadsnebula/{}/rust/db/connection_url",
+            env_normalized
+        ))
+        .cloned()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DATABASE_URL not found in SSM at /leadsnebula/{}/rust/db/connection_url and not in environment variables",
+                env_normalized
+            )
+        })?;
 
     let pool = create_pool(&database_url).await?;
 

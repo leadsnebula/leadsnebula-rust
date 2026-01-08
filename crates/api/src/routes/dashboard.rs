@@ -178,22 +178,1056 @@ pub fn dashboard_routes() -> Router<AppState> {
             get(list_buyer_audit_logs),
         )
         .route("/api/security", get(get_security_status))
+        .route("/api/security/otp/setup", post(setup_otp))
+        .route("/api/security/otp/verify", post(verify_otp))
+        .route("/api/security/otp/disable", post(disable_otp))
+        .route(
+            "/api/security/passkeys/registration_options",
+            post(passkey_registration_options),
+        )
+        .route("/api/security/passkeys/register", post(register_passkey))
 }
 
-// Security API (stub for now)
+// Security API
 async fn get_security_status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use tracing::info;
+    use leadsnebula_core::auth::JwtService;
+    use tracing::error;
+    use uuid::Uuid;
 
-    info!("Security status requested");
+    // Extract and decode JWT token
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // TODO: Implement actual security status check (OTP, passkeys, etc.)
-    // For now, return a basic response
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Load user from database
+    let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+        "SELECT * FROM instance_users WHERE id = $1 AND status = 'active'",
+    )
+    .bind(Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading user: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Check OTP status
+    let otp_enabled: Option<bool> = sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error checking OTP status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .flatten();
+
     Ok(Json(serde_json::json!({
         "success": true,
-        "otp_enabled": false,
+        "otp_enabled": otp_enabled.unwrap_or(false),
         "passkeys": []
+    })))
+}
+
+async fn setup_otp(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::auth::JwtService;
+    use tracing::error;
+    use uuid::Uuid;
+
+    // Extract and decode JWT token (middleware already validated it, but we decode to get user_id)
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Load user from database
+    let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+        "SELECT * FROM instance_users WHERE id = $1 AND status = 'active'",
+    )
+    .bind(Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading user: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Check if OTP is already enabled
+    let existing_otp = sqlx::query_scalar::<_, bool>(
+        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error checking OTP status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Some(true) = existing_otp {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "OTP is already enabled. Please disable it first to set up a new one."
+        })));
+    }
+
+    // Generate a new secret (base32 encoded)
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut rng = OsRng;
+    let mut secret_bytes = [0u8; 20];
+    rng.fill_bytes(&mut secret_bytes);
+    let secret = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &secret_bytes);
+
+    // Create or update OTP setting (but don't enable it yet - wait for verification)
+    sqlx::query(
+        r#"
+        INSERT INTO user_otp_settings (platform_user_id, secret, enabled, created_at, updated_at)
+        VALUES ($1, $2, false, NOW(), NOW())
+        ON CONFLICT (platform_user_id) 
+        DO UPDATE SET secret = $2, enabled = false, updated_at = NOW()
+        "#,
+    )
+    .bind(user.id)
+    .bind(&secret)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error saving OTP secret: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Generate provisioning URI
+    let provisioning_uri = format!(
+        "otpauth://totp/LeadsNebula:{}?secret={}&issuer=LeadsNebula",
+        urlencoding::encode(&user.email),
+        secret
+    );
+
+    // Return the secret and provisioning URI
+    // Frontend can generate QR code client-side
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "secret": secret,
+        "provisioning_uri": provisioning_uri
+    })))
+}
+
+#[derive(Deserialize)]
+struct VerifyOtpRequest {
+    code: String,
+    secret: Option<String>, // Optional for now, but we'll get it from DB
+}
+
+async fn verify_otp(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<VerifyOtpRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::auth::JwtService;
+    use leadsnebula_core::otp::OtpService;
+    use tracing::error;
+    use uuid::Uuid;
+
+    // Extract and decode JWT token
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Load user from database
+    let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+        "SELECT * FROM instance_users WHERE id = $1 AND status = 'active'",
+    )
+    .bind(Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading user: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Get OTP secret from database (prefer DB over request payload for security)
+    // fetch_optional on query_scalar returns Option<Option<String>> (row found? and value is Some?)
+    let db_secret: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT secret FROM user_otp_settings WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading OTP secret: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .flatten(); // Flatten Option<Option<String>> to Option<String>
+
+    // Use DB secret if available, otherwise fallback to payload secret (during setup flow)
+    let otp_secret = db_secret.or(payload.secret);
+
+    let secret = otp_secret.ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Verify OTP code
+    let otp_service = OtpService::new(&secret).map_err(|e| {
+        error!("Failed to create OtpService: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let is_valid = otp_service.verify(&payload.code);
+
+    if !is_valid {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid OTP code. Please try again."
+        })));
+    }
+
+    // Generate backup codes (8 codes, each 8 characters)
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut rng = OsRng;
+    let mut backup_codes = Vec::new();
+    let chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // Exclude ambiguous chars
+    for _ in 0..8 {
+        let code: String = (0..8)
+            .map(|_| {
+                let mut buf = [0u8; 1];
+                rng.fill_bytes(&mut buf);
+                chars.chars().nth((buf[0] as usize) % chars.len()).unwrap()
+            })
+            .collect();
+        backup_codes.push(code);
+    }
+    let backup_codes_json =
+        serde_json::to_string(&backup_codes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Enable OTP and save backup codes
+    sqlx::query(
+        r#"
+        UPDATE user_otp_settings
+        SET enabled = true, backup_codes = $1, last_verified_at = NOW(), updated_at = NOW()
+        WHERE platform_user_id = $2
+        "#,
+    )
+    .bind(&backup_codes_json)
+    .bind(user.id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error enabling OTP: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "backup_codes": backup_codes
+    })))
+}
+
+async fn disable_otp(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::auth::JwtService;
+    use tracing::error;
+    use uuid::Uuid;
+
+    // Extract and decode JWT token
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Load user from database
+    let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+        "SELECT * FROM instance_users WHERE id = $1 AND status = 'active'",
+    )
+    .bind(Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading user: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Check if OTP is enabled
+    let otp_enabled: Option<bool> = sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error checking OTP status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .flatten();
+
+    if !otp_enabled.unwrap_or(false) {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "OTP is not enabled."
+        })));
+    }
+
+    // Disable OTP (set enabled to false)
+    sqlx::query(
+        "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error disabling OTP: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "OTP disabled successfully."
+    })))
+}
+
+#[derive(Deserialize)]
+struct PasskeyRegistrationOptionsRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RegisterPasskeyRequest {
+    challenge_token: String,
+    name: String,
+    credential: serde_json::Value,
+}
+
+async fn passkey_registration_options(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(_payload): Json<PasskeyRegistrationOptionsRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::auth::JwtService;
+    #[cfg(feature = "webauthn")]
+    use rand::rngs::OsRng;
+    #[cfg(feature = "webauthn")]
+    use rand::RngCore;
+    use tracing::error;
+    use uuid::Uuid;
+    #[cfg(feature = "webauthn")]
+    use webauthn_rs::prelude::*;
+
+    // Extract and decode JWT token
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // Load user from database
+    let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+        "SELECT * FROM instance_users WHERE id = $1 AND status = 'active'",
+    )
+    .bind(Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading user: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Check if user can add passkey (max 3)
+    let passkey_count: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM webauthn_credentials WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_one(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error checking passkey count: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if passkey_count >= 3 {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "Maximum of 3 passkeys allowed. Please remove a passkey before adding a new one."
+        })));
+    }
+
+    #[cfg(feature = "webauthn")]
+    {
+        // #region agent log
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let log_path = "/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log";
+        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
+            writeln!(f, r#"{{"id":"log_reg_opts_env","timestamp":{},"location":"dashboard.rs:587","message":"WebAuthn registration options - environment check","data":{{"environment":"{}","env_var_read":{}}},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}}"#, 
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                state.config.environment,
+                std::env::var("WEBAUTHN_LOCAL_HTTPS").is_ok()
+            )
+        });
+        // #endregion agent log
+
+        // Determine RP ID and origin from environment
+        let rp_id: String = if state.config.environment == "development" {
+            "localhost".to_string()
+        } else {
+            std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
+        };
+
+        // For local development, check if HTTPS is configured via environment variable
+        // If not set, default to HTTP (passkeys won't work without HTTPS)
+        // For production, always use HTTPS (required for passkeys)
+        let origin: String = if state.config.environment == "development" {
+            std::env::var("WEBAUTHN_LOCAL_HTTPS")
+                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+        } else {
+            format!("https://{}", rp_id)
+        };
+
+        // #region agent log
+        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
+            writeln!(f, r#"{{"id":"log_reg_opts_values","timestamp":{},"location":"dashboard.rs:603","message":"WebAuthn registration options - origin and rp_id","data":{{"rp_id":"{}","origin":"{}","env_var_value":"{}"}},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}}"#, 
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                rp_id,
+                origin,
+                std::env::var("WEBAUTHN_LOCAL_HTTPS").unwrap_or_else(|_| "NOT_SET".to_string())
+            )
+        });
+        // #endregion agent log
+
+        // Create WebAuthn instance
+        let url = url::Url::parse(&origin).map_err(|e| {
+            error!("Failed to parse origin URL: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let webauthn = WebauthnBuilder::new(&rp_id, &url)
+            .map_err(|e| {
+                error!("Failed to create WebAuthn builder: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rp_name("LeadsNebula")
+            .build()
+            .map_err(|e| {
+                error!("Failed to build WebAuthn instance: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Create registration options
+        let user_id_bytes = user.id.as_bytes().to_vec();
+        let (ccr, _reg_session) = webauthn
+            .start_passkey_registration(
+                Uuid::from_bytes(user_id_bytes.try_into().map_err(|_| {
+                    error!("Invalid user ID format");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?),
+                &user.email,
+                &user.email,
+                None,
+            )
+            .map_err(|e| {
+                error!("Failed to create registration options: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Generate challenge token
+        let mut rng = OsRng;
+        let mut challenge_token_bytes = [0u8; 16];
+        rng.fill_bytes(&mut challenge_token_bytes);
+        let challenge_token = hex::encode(challenge_token_bytes);
+
+        // Store registration session in Redis (5 minute expiration)
+        // Serialize the PasskeyRegistration session for later verification
+        let cache_key = format!("webauthn_registration:{}:{}", user.id, challenge_token);
+        if let Some(redis) = &state.redis {
+            // Store the challenge and user_id for verification
+            // Store challenge from the CreationChallengeResponse
+            // The challenge is in the public_key field of the response
+            // Serialize CreationChallengeResponse to extract challenge
+            let ccr_json = serde_json::to_value(&ccr).map_err(|e| {
+                error!("Failed to serialize CreationChallengeResponse: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            let challenge_data = serde_json::json!({
+                "challenge": ccr_json.get("challenge").cloned().unwrap_or(serde_json::Value::Null),
+                "user_id": user.id.to_string()
+            });
+            redis
+                .set_with_ttl(&cache_key, &challenge_data.to_string(), 300)
+                .await
+                .map_err(|e| {
+                    error!("Failed to store challenge in Redis: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        } else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // Convert options to JSON
+        // webauthn-rs serializes CreationChallengeResponse with 'publicKey' (camelCase)
+        // but frontend expects 'public_key' (snake_case), so we need to transform it
+        let options_json = serde_json::to_value(&ccr).map_err(|e| {
+            error!("Failed to serialize options: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // Log the structure for debugging
+        use tracing::debug;
+        debug!(
+            "Serialized CreationChallengeResponse: {}",
+            serde_json::to_string_pretty(&options_json).unwrap_or_default()
+        );
+
+        // Transform publicKey to public_key for frontend compatibility
+        // Also ensure challenge is accessible at the expected location
+        let transformed_options = if let Some(public_key_value) = options_json.get("publicKey") {
+            let mut transformed = options_json.clone();
+            transformed.as_object_mut().unwrap().remove("publicKey");
+            transformed
+                .as_object_mut()
+                .unwrap()
+                .insert("public_key".to_string(), public_key_value.clone());
+            transformed
+        } else if options_json.get("public_key").is_some() {
+            // Already has public_key, use as-is
+            options_json
+        } else {
+            // No publicKey/public_key found, check if challenge is at top level
+            // This shouldn't happen with webauthn-rs, but handle it gracefully
+            error!("CreationChallengeResponse missing publicKey/public_key field");
+            options_json
+        };
+
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "options": transformed_options,
+            "challenge_token": challenge_token
+        })))
+    }
+
+    #[cfg(not(feature = "webauthn"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+async fn register_passkey(
+    State(_state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<RegisterPasskeyRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    #[cfg(feature = "webauthn")]
+    {
+        let state = _state;
+        use leadsnebula_core::auth::JwtService;
+        use tracing::error;
+        use uuid::Uuid;
+        use webauthn_rs::prelude::*;
+
+        // Extract and decode JWT token
+        let token = headers
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+
+        let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+        let claims = jwt_service
+            .decode(token)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+        // Load user from database
+        let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+            "SELECT * FROM instance_users WHERE id = $1 AND status = 'active'",
+        )
+        .bind(Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error loading user: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+        // Verify challenge from Redis
+        let cache_key = format!(
+            "webauthn_registration:{}:{}",
+            user.id, payload.challenge_token
+        );
+        let cached_data = if let Some(redis) = &state.redis {
+            redis.get(&cache_key).await.map_err(|e| {
+                error!("Failed to get challenge from Redis: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+        } else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+
+        let cached_data_str = cached_data.ok_or_else(|| {
+            error!("Invalid or expired registration challenge");
+            StatusCode::BAD_REQUEST
+        })?;
+
+        let cached_data: serde_json::Value =
+            serde_json::from_str(&cached_data_str).map_err(|_| {
+                error!("Failed to parse cached challenge data");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let stored_user_id = cached_data
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                error!("Invalid challenge data format");
+                StatusCode::BAD_REQUEST
+            })?;
+
+        if stored_user_id != user.id.to_string() {
+            return Ok(Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid or expired registration challenge. Please try again."
+            })));
+        }
+
+        // #region agent log
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let log_path = "/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log";
+        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
+            writeln!(f, r#"{{"id":"log_reg_verify_env","timestamp":{},"location":"dashboard.rs:787","message":"WebAuthn registration verify - environment check","data":{{"environment":"{}","env_var_read":{}}},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}}"#, 
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                state.config.environment,
+                std::env::var("WEBAUTHN_LOCAL_HTTPS").is_ok()
+            )
+        });
+        // #endregion agent log
+
+        // Determine RP ID and origin
+        let rp_id: String = if state.config.environment == "development" {
+            "localhost".to_string()
+        } else {
+            std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
+        };
+
+        // For local development, check if HTTPS is configured via environment variable
+        // If not set, default to HTTP (passkeys won't work without HTTPS)
+        // For production, always use HTTPS (required for passkeys)
+        let origin: String = if state.config.environment == "development" {
+            std::env::var("WEBAUTHN_LOCAL_HTTPS")
+                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+        } else {
+            format!("https://{}", rp_id)
+        };
+
+        // #region agent log
+        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
+            writeln!(f, r#"{{"id":"log_reg_verify_values","timestamp":{},"location":"dashboard.rs:803","message":"WebAuthn registration verify - origin and rp_id","data":{{"rp_id":"{}","origin":"{}","env_var_value":"{}"}},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}}"#, 
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                rp_id,
+                origin,
+                std::env::var("WEBAUTHN_LOCAL_HTTPS").unwrap_or_else(|_| "NOT_SET".to_string())
+            )
+        });
+        // #endregion agent log
+
+        // Create WebAuthn instance
+        let url = url::Url::parse(&origin).map_err(|e| {
+            error!("Failed to parse origin URL: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let webauthn = WebauthnBuilder::new(&rp_id, &url)
+            .map_err(|e| {
+                error!("Failed to create WebAuthn builder: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rp_name("LeadsNebula")
+            .build()
+            .map_err(|e| {
+                error!("Failed to build WebAuthn instance: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Parse credential from request
+        let reg_pkc =
+            serde_json::from_value::<RegisterPublicKeyCredential>(payload.credential.clone())
+                .map_err(|e| {
+                    error!("Failed to parse credential: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+        // Recreate the registration session to verify against
+        // Note: In a production system, we should store the full PasskeyRegistration session
+        // in Redis, but for now we'll recreate it and verify the challenge matches
+        let user_id_bytes = user.id.as_bytes().to_vec();
+        let user_uuid = Uuid::from_bytes(user_id_bytes.try_into().map_err(|_| {
+            error!("Invalid user ID format");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?);
+
+        let (_ccr, reg_session) = webauthn
+            .start_passkey_registration(user_uuid, &user.email, &user.email, None)
+            .map_err(|e| {
+                error!("Failed to create registration session: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Verify the credential
+        let passkey = webauthn
+            .finish_passkey_registration(&reg_pkc, &reg_session)
+            .map_err(|e| {
+                error!("Failed to verify credential: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+
+        // Determine passkey type from credential
+        // Check if it's a platform authenticator (soft) or cross-platform (physical)
+        let passkey_type = if let Some(_authenticator_data) = payload
+            .credential
+            .get("response")
+            .and_then(|r| r.get("authenticatorData"))
+            .and_then(|a| a.as_str())
+        {
+            // Could parse authenticator data to determine type
+            // For now, default to 'soft' (platform authenticator)
+            "soft"
+        } else {
+            "soft"
+        };
+
+        // Save to database
+        let passkey_id = Uuid::new_v4();
+
+        // Access credential data through public methods
+        let cred_id = passkey.cred_id().to_string();
+        // Serialize the passkey to get public key - webauthn-rs Passkey should be serializable
+        let public_key_str = serde_json::to_string(&passkey).map_err(|e| {
+            error!("Failed to serialize passkey: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        // Get counter/sign_count - will be updated on first use
+        let sign_count = 0i32;
+
+        sqlx::query(
+            r#"
+            INSERT INTO webauthn_credentials (
+                id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
+                name, passkey_type, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+            "#,
+        )
+        .bind(passkey_id)
+        .bind(user.id)
+        .bind(user.id)
+        .bind(cred_id)
+        .bind(public_key_str)
+        .bind(sign_count)
+        .bind(&payload.name)
+        .bind(passkey_type)
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error saving passkey: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // Clear cache entry
+        if let Some(redis) = &state.redis {
+            let _ = redis.delete(&cache_key).await;
+        }
+
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "passkey": {
+                "id": passkey_id.to_string(),
+                "name": payload.name,
+                "type": passkey_type,
+                "created_at": chrono::Utc::now().to_rfc3339()
+            }
+        })))
+    }
+
+    #[cfg(not(feature = "webauthn"))]
+    {
+        let _ = _state;
+        let _ = headers;
+        let _ = payload;
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
+// Temporary handler to test - will be replaced
+async fn _setup_otp_with_user(
+    State(state): State<AppState>,
+    user: leadsnebula_core::models::user::User,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // #region agent log
+    let log_data = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "dashboard.rs:207",
+        "message": "setup_otp handler entry",
+        "data": {"user_id": user.id.to_string(), "email": user.email.clone()},
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&log_data).unwrap_or_default()
+            )
+        });
+    // #endregion
+
+    // #region agent log
+    let log_data = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "dashboard.rs:240",
+        "message": "User loaded, checking OTP status",
+        "data": {"user_id": user.id.to_string(), "email": user.email.clone()},
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&log_data).unwrap_or_default()
+            )
+        });
+    // #endregion
+
+    // Check if OTP is already enabled
+    let existing_otp = sqlx::query_scalar::<_, bool>(
+        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        // #region agent log
+        let log_data = serde_json::json!({
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "dashboard.rs:250",
+            "message": "Database error checking OTP status",
+            "data": {"error": e.to_string()},
+            "timestamp": chrono::Utc::now().timestamp_millis()
+        });
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::to_string(&log_data).unwrap_or_default()
+                )
+            });
+        // #endregion
+        error!("Database error checking OTP status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Some(true) = existing_otp {
+        // #region agent log
+        let log_data = serde_json::json!({
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "C",
+            "location": "dashboard.rs:268",
+            "message": "OTP already enabled",
+            "data": {"user_id": user.id.to_string()},
+            "timestamp": chrono::Utc::now().timestamp_millis()
+        });
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::to_string(&log_data).unwrap_or_default()
+                )
+            });
+        // #endregion
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "OTP is already enabled. Please disable it first to set up a new one."
+        })));
+    }
+
+    // Generate a new secret (base32 encoded)
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut rng = OsRng;
+    let mut secret_bytes = [0u8; 20];
+    rng.fill_bytes(&mut secret_bytes);
+    let secret = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &secret_bytes);
+
+    // #region agent log
+    let log_data = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "dashboard.rs:285",
+        "message": "Secret generated, saving to database",
+        "data": {"user_id": user.id.to_string(), "secret_length": secret.len()},
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&log_data).unwrap_or_default()
+            )
+        });
+    // #endregion
+
+    // Create or update OTP setting (but don't enable it yet - wait for verification)
+    sqlx::query(
+        r#"
+        INSERT INTO user_otp_settings (platform_user_id, secret, enabled, created_at, updated_at)
+        VALUES ($1, $2, false, NOW(), NOW())
+        ON CONFLICT (platform_user_id) 
+        DO UPDATE SET secret = $2, enabled = false, updated_at = NOW()
+        "#,
+    )
+    .bind(user.id)
+    .bind(&secret)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        // #region agent log
+        let log_data = serde_json::json!({
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "E",
+            "location": "dashboard.rs:305",
+            "message": "Database error saving OTP secret",
+            "data": {"error": e.to_string()},
+            "timestamp": chrono::Utc::now().timestamp_millis()
+        });
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(
+                    f,
+                    "{}",
+                    serde_json::to_string(&log_data).unwrap_or_default()
+                )
+            });
+        // #endregion
+        error!("Database error saving OTP secret: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Generate provisioning URI
+    let provisioning_uri = format!(
+        "otpauth://totp/LeadsNebula:{}?secret={}&issuer=LeadsNebula",
+        urlencoding::encode(&user.email),
+        secret
+    );
+
+    // #region agent log
+    let log_data = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "dashboard.rs:330",
+        "message": "OTP setup complete, returning response",
+        "data": {"user_id": user.id.to_string(), "has_provisioning_uri": true},
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&log_data).unwrap_or_default()
+            )
+        });
+    // #endregion
+
+    // Return the secret and provisioning URI
+    // Frontend can generate QR code client-side
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "secret": secret,
+        "provisioning_uri": provisioning_uri
     })))
 }
 

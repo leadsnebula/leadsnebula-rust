@@ -16,7 +16,7 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 sqlx = { workspace = true }
-leadsnebula_core = { path = "../core" }
+leadsnebula_core = { path = "../core", features = ["otp", "webauthn"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,11 +31,18 @@ hex = { workspace = true }
 rand = { workspace = true }
 rust_decimal = { workspace = true }
 base64 = { workspace = true }
+base32 = "0.4"
+urlencoding = "2.1"
+async-trait = "0.1"
+jsonwebtoken = { workspace = true }
+webauthn-rs = { version = "0.4", optional = true }
+url = { version = "2", optional = true }
 
 # Optional features
 sentry = { version = "0.32", optional = true }
 sentry-tower = { version = "0.32", optional = true }
 
 [features]
-default = []
+default = ["webauthn"]
 sentry = ["dep:sentry", "dep:sentry-tower", "leadsnebula_core/sentry"]
+webauthn = ["dep:webauthn-rs", "dep:url", "leadsnebula_core/webauthn"]
