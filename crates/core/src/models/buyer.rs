@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::models::enums::BuyerStatus;
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Buyer {
     pub id: Uuid,
@@ -10,7 +12,7 @@ pub struct Buyer {
     pub instance_user_id: Option<Uuid>,
     pub vertical_id: Option<Uuid>,
     pub buyer_integration_id: Option<Uuid>,
-    pub status: String,
+    pub status: BuyerStatus,
     pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -44,7 +46,7 @@ fn default_json_array() -> serde_json::Value {
 
 impl Buyer {
     pub fn active(&self) -> bool {
-        self.status == "active" && self.deleted_at.is_none()
+        matches!(self.status, BuyerStatus::Active) && self.deleted_at.is_none()
     }
 
     pub async fn find_by_id(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<Self>, sqlx::Error> {

@@ -2,6 +2,7 @@ pub mod audit_log;
 pub mod buyer;
 pub mod buyer_qualification_config;
 pub mod campaign;
+pub mod enums;
 pub mod lead;
 pub mod ping_tree;
 pub mod ping_tree_campaign;

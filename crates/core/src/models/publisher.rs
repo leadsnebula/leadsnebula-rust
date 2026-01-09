@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::models::enums::PublisherStatus;
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Publisher {
     pub id: Uuid,
@@ -10,7 +12,7 @@ pub struct Publisher {
     pub api_key_hash: String,
     pub api_key_prefix: String,
     pub api_key_encrypted: Option<String>,
-    pub status: String,
+    pub status: PublisherStatus,
     pub total_requests: i32,
     pub last_request_at: Option<chrono::DateTime<chrono::Utc>>,
     pub instance_id: Uuid,
@@ -35,7 +37,7 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn active(&self) -> bool {
-        self.status == "active" && self.deleted_at.is_none()
+        matches!(self.status, PublisherStatus::Active) && self.deleted_at.is_none()
     }
 
     pub fn require_hmac(&self) -> bool {

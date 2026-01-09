@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::models::enums::CampaignStatus;
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Campaign {
     pub id: Uuid,
@@ -11,7 +13,7 @@ pub struct Campaign {
     pub name: Option<String>,
     pub vertical: String,
     pub campaign_token: String,
-    pub status: String,
+    pub status: CampaignStatus,
     pub is_documentation_test: bool,
     pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -20,7 +22,7 @@ pub struct Campaign {
 
 impl Campaign {
     pub fn active(&self) -> bool {
-        self.status == "active" && self.deleted_at.is_none()
+        matches!(self.status, CampaignStatus::Active) && self.deleted_at.is_none()
     }
 
     pub fn is_documentation_test(&self) -> bool {

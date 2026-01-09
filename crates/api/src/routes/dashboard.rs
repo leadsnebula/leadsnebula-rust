@@ -1279,7 +1279,7 @@ async fn list_publishers(
             id: p.id.to_string(),
             name: p.name.clone(),
             email: p.email.clone(),
-            status: p.status.clone(),
+            status: p.status.as_str().to_string(),
             api_key_prefix: p.api_key_prefix.clone(),
             hmac_required: p.hmac_required,
             created_at: p.created_at.to_rfc3339(),
@@ -2233,7 +2233,7 @@ async fn create_buyer(
         "buyer": {
             "id": buyer_id.to_string(),
             "name": payload.name,
-            "status": created_buyer.as_ref().map(|b| &b.status).unwrap_or(&"incomplete".to_string()),
+            "status": created_buyer.as_ref().map(|b| b.status.as_str()).unwrap_or("incomplete"),
             "buyer_type": buyer_type,
             "post_type": post_type,
             "vertical_id": payload.vertical_id.map(|v| v.to_string()),
@@ -2562,11 +2562,11 @@ async fn update_buyer(
     }
     if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
         if let Some(ref buyer) = buyer_before {
-            if buyer.status != status {
+            if buyer.status.as_str() != status {
                 changed_fields.insert(
                     "status".to_string(),
                     serde_json::json!({
-                        "before": buyer.status,
+                        "before": buyer.status.as_str(),
                         "after": status
                     }),
                 );

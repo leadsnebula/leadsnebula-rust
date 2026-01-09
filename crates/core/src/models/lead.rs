@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::models::enums::LeadStatus;
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Lead {
     pub uuid: Uuid,
@@ -13,7 +15,7 @@ pub struct Lead {
     pub buyer_id: Option<Uuid>,
     pub request_type: String,
     pub strategy: String,
-    pub status: String,
+    pub status: LeadStatus,
     pub promise_id: Option<String>,
     pub ping_id: Option<String>,
     pub post_id: Option<String>,

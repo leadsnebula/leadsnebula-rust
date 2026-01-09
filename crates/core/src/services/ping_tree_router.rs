@@ -1,5 +1,6 @@
 use crate::models::{
-    campaign::Campaign, lead::Lead, ping_tree::PingTree, ping_tree_campaign::PingTreeCampaign,
+    campaign::Campaign, enums::LeadStatus, lead::Lead, ping_tree::PingTree,
+    ping_tree_campaign::PingTreeCampaign,
 };
 use crate::services::buyer_router::BuyerResponse;
 use anyhow::Result;
@@ -39,35 +40,36 @@ impl PingTreeRouter {
 
     pub async fn route(&self, pool: &PgPool) -> Result<RoutingResult> {
         // Find active ping tree for publisher and vertical
-        let ping_tree =
-            match PingTree::find_for_routing(pool, &self.publisher_id, &self.vertical).await? {
-                Some(pt) => pt,
-                None => {
-                    // Update lead status to error
-                    self.update_lead_status(pool, "error", Some("No active ping tree found"))
-                        .await?;
-                    return Ok(RoutingResult {
-                        success: false,
-                        status: "error".to_string(),
-                        error: Some(format!(
-                            "No active ping tree found for publisher {} and vertical {}",
-                            self.publisher_id, self.vertical
-                        )),
-                        promise_id: None,
-                        ping_id: None,
-                        post_id: None,
-                        price: None,
-                        campaign_id: None,
-                        buyer_id: None,
-                    });
-                }
-            };
+        let ping_tree = match PingTree::find_for_routing(pool, &self.publisher_id, &self.vertical)
+            .await?
+        {
+            Some(pt) => pt,
+            None => {
+                // Update lead status to error
+                self.update_lead_status(pool, LeadStatus::Error, Some("No active ping tree found"))
+                    .await?;
+                return Ok(RoutingResult {
+                    success: false,
+                    status: "error".to_string(),
+                    error: Some(format!(
+                        "No active ping tree found for publisher {} and vertical {}",
+                        self.publisher_id, self.vertical
+                    )),
+                    promise_id: None,
+                    ping_id: None,
+                    post_id: None,
+                    price: None,
+                    campaign_id: None,
+                    buyer_id: None,
+                });
+            }
+        };
 
         // Check ping tree status
         if !ping_tree.is_active() {
             self.update_lead_status(
                 pool,
-                "error",
+                LeadStatus::Error,
                 Some(&format!("Ping tree is {}", ping_tree.status)),
             )
             .await?;
@@ -94,7 +96,7 @@ impl PingTreeRouter {
         if ping_tree_campaigns.is_empty() {
             self.update_lead_status(
                 pool,
-                "error",
+                LeadStatus::Error,
                 Some("No active campaigns found in ping tree"),
             )
             .await?;
@@ -125,7 +127,7 @@ impl PingTreeRouter {
         }
 
         if campaigns.is_empty() {
-            self.update_lead_status(pool, "error", Some("No valid campaigns found"))
+            self.update_lead_status(pool, LeadStatus::Error, Some("No valid campaigns found"))
                 .await?;
             return Ok(RoutingResult {
                 success: false,
@@ -154,7 +156,7 @@ impl PingTreeRouter {
             _ => {
                 self.update_lead_status(
                     pool,
-                    "error",
+                    LeadStatus::Error,
                     Some(&format!("Unknown request_type: {}", self.request_type)),
                 )
                 .await?;
@@ -279,19 +281,20 @@ impl PingTreeRouter {
                 .count();
 
             let final_status = if timeout_count == responses.len() {
-                "timeout"
+                LeadStatus::Timeout
             } else if rejected_count > 0 {
-                "rejected"
+                LeadStatus::Rejected
             } else {
-                "error"
+                LeadStatus::Error
             };
 
+            let status_str = final_status.as_str().to_string();
             self.update_lead_status(pool, final_status, Some("No valid buyer responses"))
                 .await?;
 
             return Ok(RoutingResult {
                 success: false,
-                status: final_status.to_string(),
+                status: status_str,
                 error: Some(format!(
                     "No valid buyer responses ({} timeouts, {} rejected)",
                     timeout_count, rejected_count
@@ -388,7 +391,7 @@ impl PingTreeRouter {
                 buyer_id: Some(campaign.buyer_id),
             })
         } else {
-            self.update_lead_status(pool, "error", Some("No campaign found for post"))
+            self.update_lead_status(pool, LeadStatus::Error, Some("No campaign found for post"))
                 .await?;
             Ok(RoutingResult {
                 success: false,
@@ -422,8 +425,12 @@ impl PingTreeRouter {
             // Now send post
             self.route_post(pool, campaigns).await
         } else {
-            self.update_lead_status(pool, "error", Some("Fullpost strategy not yet implemented"))
-                .await?;
+            self.update_lead_status(
+                pool,
+                LeadStatus::Error,
+                Some("Fullpost strategy not yet implemented"),
+            )
+            .await?;
             Ok(RoutingResult {
                 success: false,
                 status: "error".to_string(),
@@ -441,10 +448,10 @@ impl PingTreeRouter {
     async fn update_lead_status(
         &self,
         pool: &PgPool,
-        status: &str,
+        status: LeadStatus,
         error: Option<&str>,
     ) -> Result<()> {
-        if self.lead.status == "processing" {
+        if self.lead.status == LeadStatus::Processing {
             let mut vertical_data = self.lead.vertical_data.clone();
             if let Some(err) = error {
                 if let Some(obj) = vertical_data.as_object_mut() {
@@ -462,7 +469,7 @@ impl PingTreeRouter {
             sqlx::query(
                 "UPDATE leads SET status = $1, vertical_data = $2, updated_at = NOW() WHERE uuid = $3"
             )
-            .bind(status)
+            .bind(&status)
             .bind(&vertical_data)
             .bind(self.lead.uuid)
             .execute(pool)
@@ -482,15 +489,16 @@ impl PingTreeRouter {
         sqlx::query(
             r#"
             UPDATE leads 
-            SET status = 'ping_accepted',
-                campaign_id = $1,
-                buyer_id = $2,
-                promise_id = $3,
-                ping_id = $4,
+            SET status = $1,
+                campaign_id = $2,
+                buyer_id = $3,
+                promise_id = $4,
+                ping_id = $5,
                 updated_at = NOW()
-            WHERE uuid = $5
+            WHERE uuid = $6
             "#,
         )
+        .bind(&LeadStatus::PingAccepted)
         .bind(campaign.id)
         .bind(campaign.buyer_id)
         .bind(promise_id)
@@ -502,9 +510,11 @@ impl PingTreeRouter {
     }
 
     async fn update_lead_with_post(&self, pool: &PgPool, post_id: &str) -> Result<()> {
+        // Note: 'post_accepted' is not in the enum, using 'sold' as post acceptance typically means the lead was sold
         sqlx::query(
-            "UPDATE leads SET status = 'post_accepted', post_id = $1, updated_at = NOW() WHERE uuid = $2"
+            "UPDATE leads SET status = $1, post_id = $2, updated_at = NOW() WHERE uuid = $3",
         )
+        .bind(&LeadStatus::Sold)
         .bind(post_id)
         .bind(self.lead.uuid)
         .execute(pool)
