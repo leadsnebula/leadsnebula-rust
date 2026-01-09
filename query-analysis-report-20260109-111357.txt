@@ -1,0 +1,574 @@
+==========================================
+Query Pattern Analysis Report
+Environment: prod
+Generated: Fri Jan  9 11:13:59 AM PST 2026
+==========================================
+
+==========================================
+Query: Dashboard: Sold leads (paginated)
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.status = 'sold' ORDER BY l.created_at DESC LIMIT 50
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.15..8.15 rows=1 width=7036) (actual time=0.037..0.037 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   Buffers: shared hit=4
+   ->  Sort  (cost=8.15..8.15 rows=1 width=7036) (actual time=0.036..0.036 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Sort Key: l.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=4
+         ->  Index Scan using idx_leads_buyer_sold_at on public.leads l  (cost=0.12..8.14 rows=1 width=7036) (actual time=0.002..0.002 rows=0 loops=1)
+               Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+               Buffers: shared hit=1
+ Query Identifier: -1811657695939175088
+ Planning:
+   Buffers: shared hit=576 read=46 dirtied=4
+ Planning Time: 42.826 ms
+ Execution Time: 0.090 ms
+(16 rows)
+
+
+
+==========================================
+Query: Dashboard: Count sold leads
+----------------------------------------
+SQL:
+SELECT COUNT(*) FROM leads WHERE status = 'sold'
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=8.14..8.15 rows=1 width=8) (actual time=0.006..0.007 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=1
+   ->  Index Only Scan using idx_leads_buyer_sold_at on public.leads  (cost=0.12..8.14 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=1)
+         Output: buyer_id, sold_at
+         Heap Fetches: 0
+         Buffers: shared hit=1
+ Query Identifier: -7825619727191834978
+ Planning:
+   Buffers: shared hit=604 read=2
+ Planning Time: 2.415 ms
+ Execution Time: 0.074 ms
+(12 rows)
+
+
+
+==========================================
+Query: Dashboard: Sum revenue from sold leads
+----------------------------------------
+SQL:
+SELECT SUM(la.price) FROM lead_accounting la INNER JOIN leads l ON la.lead_id = l.uuid WHERE l.status = 'sold'
+
+EXPLAIN ANALYZE:
+----------------------------------------
+ERROR:  relation "lead_accounting" does not exist
+LINE 1: ...LYZE, BUFFERS, VERBOSE) SELECT SUM(la.price) FROM lead_accou...
+                                                             ^
+
+
+==========================================
+Query: Leads Dashboard: Filter by publisher
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.publisher_id IS NOT NULL ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10.27..10.29 rows=10 width=7036) (actual time=0.033..0.034 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   Buffers: shared hit=3
+   ->  Sort  (cost=10.27..10.29 rows=10 width=7036) (actual time=0.033..0.033 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Sort Key: l.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3
+         ->  Seq Scan on public.leads l  (cost=0.00..10.10 rows=10 width=7036) (actual time=0.005..0.005 rows=0 loops=1)
+               Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+               Filter: (l.publisher_id IS NOT NULL)
+ Query Identifier: 975680409211385514
+ Planning:
+   Buffers: shared hit=648
+ Planning Time: 0.985 ms
+ Execution Time: 0.077 ms
+(16 rows)
+
+
+
+==========================================
+Query: Leads Dashboard: Filter by buyer
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.buyer_id IS NOT NULL ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10.27..10.29 rows=10 width=7036) (actual time=0.037..0.037 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   Buffers: shared hit=3
+   ->  Sort  (cost=10.27..10.29 rows=10 width=7036) (actual time=0.036..0.036 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Sort Key: l.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3
+         ->  Seq Scan on public.leads l  (cost=0.00..10.10 rows=10 width=7036) (actual time=0.005..0.005 rows=0 loops=1)
+               Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+               Filter: (l.buyer_id IS NOT NULL)
+ Query Identifier: 4261727947783829058
+ Planning:
+   Buffers: shared hit=648
+ Planning Time: 1.169 ms
+ Execution Time: 0.086 ms
+(16 rows)
+
+
+
+==========================================
+Query: Leads Dashboard: Filter by status
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.status = 'processing' ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.16..8.17 rows=1 width=7036) (actual time=0.026..0.026 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   Buffers: shared hit=5
+   ->  Sort  (cost=8.16..8.17 rows=1 width=7036) (actual time=0.025..0.025 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Sort Key: l.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=5
+         ->  Index Scan using idx_leads_status on public.leads l  (cost=0.14..8.15 rows=1 width=7036) (actual time=0.003..0.003 rows=0 loops=1)
+               Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+               Index Cond: ((l.status)::text = 'processing'::text)
+               Buffers: shared hit=2
+ Query Identifier: -1811657695939175088
+ Planning:
+   Buffers: shared hit=632
+ Planning Time: 1.298 ms
+ Execution Time: 0.071 ms
+(17 rows)
+
+
+
+==========================================
+Query: Leads Dashboard: Search by encrypted email
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.email_encrypted = 'test@example.com' LIMIT 10
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                 QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.14..8.15 rows=1 width=7036) (actual time=0.006..0.006 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   Buffers: shared hit=2
+   ->  Index Scan using idx_leads_email_encrypted on public.leads l  (cost=0.14..8.15 rows=1 width=7036) (actual time=0.005..0.005 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Index Cond: (l.email_encrypted = 'test@example.com'::text)
+         Buffers: shared hit=2
+ Query Identifier: -2531872108847649887
+ Planning:
+   Buffers: shared hit=618
+ Planning Time: 1.038 ms
+ Execution Time: 0.111 ms
+(12 rows)
+
+
+
+==========================================
+Query: Leads Dashboard: Search by email domain
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE LOWER(l.email_domain) LIKE '%example%' LIMIT 10
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                 QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..10.15 rows=1 width=7036) (actual time=0.006..0.006 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   ->  Seq Scan on public.leads l  (cost=0.00..10.15 rows=1 width=7036) (actual time=0.005..0.005 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Filter: (lower((l.email_domain)::text) ~~ '%example%'::text)
+ Query Identifier: 580749261360241860
+ Planning:
+   Buffers: shared hit=609
+ Planning Time: 1.008 ms
+ Execution Time: 0.045 ms
+(10 rows)
+
+
+
+==========================================
+Query: Leads Dashboard: Filter valid campaign_ids
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE (l.campaign_id IS NULL OR l.campaign_id::text != '') ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10.32..10.34 rows=9 width=7036) (actual time=0.083..0.083 rows=0 loops=1)
+   Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+   Buffers: shared hit=3
+   ->  Sort  (cost=10.32..10.34 rows=9 width=7036) (actual time=0.081..0.082 rows=0 loops=1)
+         Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+         Sort Key: l.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3
+         ->  Seq Scan on public.leads l  (cost=0.00..10.18 rows=9 width=7036) (actual time=0.007..0.007 rows=0 loops=1)
+               Output: uuid, event_id, fbp_cookie, fbc_cookie, email_sha256, phone_sha256, tcpa_consent, tcpa_language, status, submitted_at, sold_at, buyer_id, retry_count, next_retry_at, ip_address_hash, user_agent, utm_params, referrer, is_test, promise_id, website_url, publisher_id, click_id, url_consent, best_call_time, date_of_birth, home_phone, jornaya_lead_id, trusted_form_url, campaign_id, strategy, request_stage, ping_id, post_id, lead_id, session_id, vertical_data, request_type, vertical_id, first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted, street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted, email_domain, created_at, updated_at
+               Filter: ((l.campaign_id IS NULL) OR ((l.campaign_id)::text <> ''::text))
+ Query Identifier: 3816084226600836945
+ Planning:
+   Buffers: shared hit=648 read=2
+ Planning Time: 2.730 ms
+ Execution Time: 0.135 ms
+(16 rows)
+
+
+
+==========================================
+Query: Pings: Most recent ping for lead
+----------------------------------------
+SQL:
+SELECT p.* FROM pings p WHERE p.lead_id IS NOT NULL ORDER BY p.created_at DESC LIMIT 1
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.15..0.31 rows=1 width=244) (actual time=0.007..0.007 rows=0 loops=1)
+   Output: id, ping_id, promise_id, state, result, buyer_response, error_message, response_time_ms, sent_at, lead_id, created_at, updated_at
+   Buffers: shared hit=1
+   ->  Index Scan using idx_pings_created_at on public.pings p  (cost=0.15..48.65 rows=298 width=244) (actual time=0.006..0.006 rows=0 loops=1)
+         Output: id, ping_id, promise_id, state, result, buyer_response, error_message, response_time_ms, sent_at, lead_id, created_at, updated_at
+         Filter: (p.lead_id IS NOT NULL)
+         Buffers: shared hit=1
+ Query Identifier: 5225219581884201486
+ Planning:
+   Buffers: shared hit=222 read=10 dirtied=2
+ Planning Time: 22.552 ms
+ Execution Time: 0.031 ms
+(12 rows)
+
+
+
+==========================================
+Query: Pings Dashboard: Filter by lead publisher
+----------------------------------------
+SQL:
+SELECT p.* FROM pings p INNER JOIN leads l ON p.lead_id = l.uuid WHERE l.publisher_id IS NOT NULL ORDER BY p.updated_at DESC LIMIT 50
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=34.00..34.13 rows=50 width=244) (actual time=0.030..0.031 rows=0 loops=1)
+   Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+   Buffers: shared hit=3
+   ->  Sort  (cost=34.00..34.75 rows=300 width=244) (actual time=0.029..0.030 rows=0 loops=1)
+         Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+         Sort Key: p.updated_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3
+         ->  Hash Join  (cost=10.22..24.03 rows=300 width=244) (actual time=0.006..0.006 rows=0 loops=1)
+               Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+               Inner Unique: true
+               Hash Cond: (p.lead_id = l.uuid)
+               ->  Seq Scan on public.pings p  (cost=0.00..13.00 rows=300 width=244) (actual time=0.005..0.005 rows=0 loops=1)
+                     Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+               ->  Hash  (cost=10.10..10.10 rows=10 width=16) (never executed)
+                     Output: l.uuid
+                     ->  Seq Scan on public.leads l  (cost=0.00..10.10 rows=10 width=16) (never executed)
+                           Output: l.uuid
+                           Filter: (l.publisher_id IS NOT NULL)
+ Query Identifier: 2906103520994822632
+ Planning:
+   Buffers: shared hit=899
+ Planning Time: 1.544 ms
+ Execution Time: 0.066 ms
+(24 rows)
+
+
+
+==========================================
+Query: Pings Dashboard: Filter by lead buyer
+----------------------------------------
+SQL:
+SELECT p.* FROM pings p INNER JOIN leads l ON p.lead_id = l.uuid WHERE l.buyer_id IS NOT NULL ORDER BY p.updated_at DESC LIMIT 50
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=34.00..34.13 rows=50 width=244) (actual time=0.031..0.032 rows=0 loops=1)
+   Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+   Buffers: shared hit=3
+   ->  Sort  (cost=34.00..34.75 rows=300 width=244) (actual time=0.030..0.031 rows=0 loops=1)
+         Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+         Sort Key: p.updated_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3
+         ->  Hash Join  (cost=10.22..24.03 rows=300 width=244) (actual time=0.003..0.004 rows=0 loops=1)
+               Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+               Inner Unique: true
+               Hash Cond: (p.lead_id = l.uuid)
+               ->  Seq Scan on public.pings p  (cost=0.00..13.00 rows=300 width=244) (actual time=0.003..0.003 rows=0 loops=1)
+                     Output: p.id, p.ping_id, p.promise_id, p.state, p.result, p.buyer_response, p.error_message, p.response_time_ms, p.sent_at, p.lead_id, p.created_at, p.updated_at
+               ->  Hash  (cost=10.10..10.10 rows=10 width=16) (never executed)
+                     Output: l.uuid
+                     ->  Seq Scan on public.leads l  (cost=0.00..10.10 rows=10 width=16) (never executed)
+                           Output: l.uuid
+                           Filter: (l.buyer_id IS NOT NULL)
+ Query Identifier: 4286905185519534453
+ Planning:
+   Buffers: shared hit=899
+ Planning Time: 1.344 ms
+ Execution Time: 0.063 ms
+(24 rows)
+
+
+
+==========================================
+Query: Posts: Most recent post for lead
+----------------------------------------
+SQL:
+SELECT p.* FROM posts p WHERE p.lead_id IS NOT NULL ORDER BY p.created_at DESC LIMIT 1
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                             QUERY PLAN                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.15..0.33 rows=1 width=286) (actual time=0.024..0.025 rows=0 loops=1)
+   Output: id, post_id, promise_id, result, buyer_response, error_message, response_time_ms, sent_at, lead_id, request_type, buyer_id, created_at, updated_at
+   Buffers: shared hit=1
+   ->  Index Scan using idx_posts_created_at on public.posts p  (cost=0.15..48.05 rows=259 width=286) (actual time=0.023..0.023 rows=0 loops=1)
+         Output: id, post_id, promise_id, result, buyer_response, error_message, response_time_ms, sent_at, lead_id, request_type, buyer_id, created_at, updated_at
+         Filter: (p.lead_id IS NOT NULL)
+         Buffers: shared hit=1
+ Query Identifier: -3436118268646870688
+ Planning:
+   Buffers: shared hit=280 read=13 dirtied=2
+ Planning Time: 18.479 ms
+ Execution Time: 0.048 ms
+(12 rows)
+
+
+
+==========================================
+Query: Ping Trees: Find active ping tree for routing
+----------------------------------------
+SQL:
+SELECT pt.* FROM ping_trees pt WHERE pt.publisher_id IS NOT NULL AND pt.vertical = 'solar' AND pt.status = 'active' AND pt.deleted_at IS NULL ORDER BY pt.priority ASC NULLS LAST, pt.created_at ASC LIMIT 1
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.18..8.18 rows=1 width=1046) (actual time=2.015..2.016 rows=1 loops=1)
+   Output: id, instance_id, publisher_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at
+   Buffers: shared hit=6 read=2 dirtied=1
+   ->  Sort  (cost=8.18..8.18 rows=1 width=1046) (actual time=2.013..2.014 rows=1 loops=1)
+         Output: id, instance_id, publisher_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at
+         Sort Key: pt.priority, pt.created_at
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=6 read=2 dirtied=1
+         ->  Index Scan using idx_ping_trees_deleted_at on public.ping_trees pt  (cost=0.14..8.17 rows=1 width=1046) (actual time=1.966..1.968 rows=1 loops=1)
+               Output: id, instance_id, publisher_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at
+               Index Cond: (pt.deleted_at IS NULL)
+               Filter: (((pt.vertical)::text = 'solar'::text) AND ((pt.status)::text = 'active'::text))
+               Buffers: shared read=2 dirtied=1
+ Query Identifier: -4799887111384136845
+ Planning:
+   Buffers: shared hit=206 read=7 dirtied=1
+ Planning Time: 9.186 ms
+ Execution Time: 2.047 ms
+(18 rows)
+
+
+
+==========================================
+Query: Campaigns: Active campaigns
+----------------------------------------
+SQL:
+SELECT c.* FROM campaigns c WHERE c.status = 'active' AND c.deleted_at IS NULL ORDER BY c.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                 QUERY PLAN                                                                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.16..8.17 rows=1 width=1711) (actual time=1.530..1.532 rows=1 loops=1)
+   Output: id, buyer_id, name, vertical, campaign_token, publisher_id, status, is_documentation_test, request_type_constraint, revshare_percentage, fraud_check_enabled, tracking_enabled, tie_breaker_strategy, deleted_at, instance_id, created_at, updated_at
+   Buffers: shared hit=3 read=2 dirtied=1
+   ->  Sort  (cost=8.16..8.17 rows=1 width=1711) (actual time=1.529..1.530 rows=1 loops=1)
+         Output: id, buyer_id, name, vertical, campaign_token, publisher_id, status, is_documentation_test, request_type_constraint, revshare_percentage, fraud_check_enabled, tracking_enabled, tie_breaker_strategy, deleted_at, instance_id, created_at, updated_at
+         Sort Key: c.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3 read=2 dirtied=1
+         ->  Index Scan using idx_campaigns_vertical_status on public.campaigns c  (cost=0.14..8.15 rows=1 width=1711) (actual time=1.506..1.507 rows=1 loops=1)
+               Output: id, buyer_id, name, vertical, campaign_token, publisher_id, status, is_documentation_test, request_type_constraint, revshare_percentage, fraud_check_enabled, tracking_enabled, tie_breaker_strategy, deleted_at, instance_id, created_at, updated_at
+               Index Cond: ((c.status)::text = 'active'::text)
+               Buffers: shared read=2 dirtied=1
+ Query Identifier: -2402304943560944360
+ Planning:
+   Buffers: shared hit=311 read=13
+ Planning Time: 14.697 ms
+ Execution Time: 1.563 ms
+(17 rows)
+
+
+
+==========================================
+Query: Buyers: Active buyers
+----------------------------------------
+SQL:
+SELECT b.* FROM buyers b WHERE b.deleted_at IS NULL ORDER BY b.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                             QUERY PLAN                                                                                                                                                              
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.16..8.17 rows=1 width=3428) (actual time=1.617..1.618 rows=1 loops=1)
+   Output: id, name, instance_user_id, instance_id, contact_info, deleted_at, ein_tin, address_street, address_city, address_state, address_zip, email_address, representative_first_name, representative_last_name, documents, post_type, buyer_type, status, vertical_id, buyer_integration_id, created_at, updated_at
+   Buffers: shared hit=3 read=2 dirtied=1
+   ->  Sort  (cost=8.16..8.17 rows=1 width=3428) (actual time=1.615..1.616 rows=1 loops=1)
+         Output: id, name, instance_user_id, instance_id, contact_info, deleted_at, ein_tin, address_street, address_city, address_state, address_zip, email_address, representative_first_name, representative_last_name, documents, post_type, buyer_type, status, vertical_id, buyer_integration_id, created_at, updated_at
+         Sort Key: b.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3 read=2 dirtied=1
+         ->  Index Scan using idx_buyers_deleted_at on public.buyers b  (cost=0.14..8.15 rows=1 width=3428) (actual time=1.588..1.589 rows=1 loops=1)
+               Output: id, name, instance_user_id, instance_id, contact_info, deleted_at, ein_tin, address_street, address_city, address_state, address_zip, email_address, representative_first_name, representative_last_name, documents, post_type, buyer_type, status, vertical_id, buyer_integration_id, created_at, updated_at
+               Index Cond: (b.deleted_at IS NULL)
+               Buffers: shared read=2 dirtied=1
+ Query Identifier: -652758775686066327
+ Planning:
+   Buffers: shared hit=265 read=11 dirtied=1
+ Planning Time: 12.383 ms
+ Execution Time: 1.662 ms
+(17 rows)
+
+
+
+==========================================
+Query: Publishers: Active publishers
+----------------------------------------
+SQL:
+SELECT p.* FROM publishers p WHERE p.status = 'active' AND p.deleted_at IS NULL ORDER BY p.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                               QUERY PLAN                                                                                                                                                                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=1.03..1.04 rows=1 width=4660) (actual time=0.759..0.760 rows=0 loops=1)
+   Output: id, name, email, api_key_hash, api_key_prefix, status, total_requests, last_request_at, instance_user_id, is_documentation_test, instance_id, hmac_secret_hash, hmac_secret_prefix, hmac_required, deleted_at, hmac_secret_encrypted, api_key_encrypted, ein_tin, address_street, address_city, address_state, address_zip, representative_first_name, representative_last_name, timezone, created_at, updated_at
+   Buffers: shared hit=3 read=1 dirtied=1
+   ->  Sort  (cost=1.03..1.04 rows=1 width=4660) (actual time=0.758..0.758 rows=0 loops=1)
+         Output: id, name, email, api_key_hash, api_key_prefix, status, total_requests, last_request_at, instance_user_id, is_documentation_test, instance_id, hmac_secret_hash, hmac_secret_prefix, hmac_required, deleted_at, hmac_secret_encrypted, api_key_encrypted, ein_tin, address_street, address_city, address_state, address_zip, representative_first_name, representative_last_name, timezone, created_at, updated_at
+         Sort Key: p.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=3 read=1 dirtied=1
+         ->  Seq Scan on public.publishers p  (cost=0.00..1.02 rows=1 width=4660) (actual time=0.732..0.733 rows=0 loops=1)
+               Output: id, name, email, api_key_hash, api_key_prefix, status, total_requests, last_request_at, instance_user_id, is_documentation_test, instance_id, hmac_secret_hash, hmac_secret_prefix, hmac_required, deleted_at, hmac_secret_encrypted, api_key_encrypted, ein_tin, address_street, address_city, address_state, address_zip, representative_first_name, representative_last_name, timezone, created_at, updated_at
+               Filter: ((p.deleted_at IS NULL) AND ((p.status)::text = 'active'::text))
+               Rows Removed by Filter: 2
+               Buffers: shared read=1 dirtied=1
+ Query Identifier: 4181357972723935982
+ Planning:
+   Buffers: shared hit=285 read=17 dirtied=3
+ Planning Time: 18.690 ms
+ Execution Time: 0.791 ms
+(18 rows)
+
+
+
+==========================================
+Query: Lead Sales: Sales for sold leads
+----------------------------------------
+SQL:
+SELECT ls.* FROM lead_sales ls INNER JOIN leads l ON ls.lead_id = l.uuid WHERE l.status = 'sold' LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                                                                       QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.27..16.31 rows=6 width=1280) (actual time=0.007..0.008 rows=0 loops=1)
+   Output: ls.id, ls.lead_id, ls.buyer_id, ls.campaign_id, ls.ping_id, ls.ping_bid_amount, ls.ping_response_time_ms, ls.ping_rank, ls.post_id, ls.post_status, ls.post_sale_price, ls.post_sold_at, ls.status, ls.sequence_order, ls.created_at, ls.updated_at
+   Buffers: shared hit=1
+   ->  Nested Loop  (cost=0.27..16.31 rows=6 width=1280) (actual time=0.006..0.006 rows=0 loops=1)
+         Output: ls.id, ls.lead_id, ls.buyer_id, ls.campaign_id, ls.ping_id, ls.ping_bid_amount, ls.ping_response_time_ms, ls.ping_rank, ls.post_id, ls.post_status, ls.post_sale_price, ls.post_sold_at, ls.status, ls.sequence_order, ls.created_at, ls.updated_at
+         Buffers: shared hit=1
+         ->  Index Scan using idx_leads_buyer_sold_at on public.leads l  (cost=0.12..8.14 rows=1 width=16) (actual time=0.006..0.006 rows=0 loops=1)
+               Output: l.uuid, l.event_id, l.fbp_cookie, l.fbc_cookie, l.email_sha256, l.phone_sha256, l.tcpa_consent, l.tcpa_language, l.status, l.submitted_at, l.sold_at, l.buyer_id, l.retry_count, l.next_retry_at, l.ip_address_hash, l.user_agent, l.utm_params, l.referrer, l.is_test, l.promise_id, l.website_url, l.publisher_id, l.click_id, l.url_consent, l.best_call_time, l.date_of_birth, l.home_phone, l.jornaya_lead_id, l.trusted_form_url, l.campaign_id, l.strategy, l.request_stage, l.ping_id, l.post_id, l.lead_id, l.session_id, l.vertical_data, l.request_type, l.vertical_id, l.first_name_encrypted, l.last_name_encrypted, l.email_encrypted, l.cell_phone_encrypted, l.street_address_encrypted, l.city_encrypted, l.state_encrypted, l.zip_encrypted, l.ip_address_encrypted, l.email_domain, l.created_at, l.updated_at
+               Buffers: shared hit=1
+         ->  Index Scan using idx_lead_sales_lead_sequence_order on public.lead_sales ls  (cost=0.14..8.16 rows=1 width=1280) (never executed)
+               Output: ls.id, ls.lead_id, ls.buyer_id, ls.campaign_id, ls.ping_id, ls.ping_bid_amount, ls.ping_response_time_ms, ls.ping_rank, ls.post_id, ls.post_status, ls.post_sale_price, ls.post_sold_at, ls.status, ls.sequence_order, ls.created_at, ls.updated_at
+               Index Cond: (ls.lead_id = l.uuid)
+ Query Identifier: 6239823094576865497
+ Planning:
+   Buffers: shared hit=853 read=7 dirtied=1
+ Planning Time: 9.826 ms
+ Execution Time: 0.055 ms
+(17 rows)
+
+
+
+==========================================
+Query: Lead Accounting: Accounting for sold leads
+----------------------------------------
+SQL:
+SELECT la.* FROM lead_accounting la INNER JOIN leads l ON la.lead_id = l.uuid WHERE l.status = 'sold' LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+ERROR:  relation "lead_accounting" does not exist
+LINE 1: ...LAIN (ANALYZE, BUFFERS, VERBOSE) SELECT la.* FROM lead_accou...
+                                                             ^
+
+
+==========================================
+Query: Audit Logs: Recent audit logs
+----------------------------------------
+SQL:
+SELECT al.* FROM audit_logs al ORDER BY al.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+                                                                                  QUERY PLAN                                                                                   
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=12.37..12.52 rows=60 width=1316) (actual time=0.760..0.761 rows=4 loops=1)
+   Output: id, instance_id, instance_user_id, action_type, resource_type, resource_id, details, affected_resources, ip_address, user_agent, created_at, updated_at
+   Buffers: shared hit=3 read=1 dirtied=1
+   ->  Sort  (cost=12.37..12.52 rows=60 width=1316) (actual time=0.759..0.760 rows=4 loops=1)
+         Output: id, instance_id, instance_user_id, action_type, resource_type, resource_id, details, affected_resources, ip_address, user_agent, created_at, updated_at
+         Sort Key: al.created_at DESC
+         Sort Method: quicksort  Memory: 28kB
+         Buffers: shared hit=3 read=1 dirtied=1
+         ->  Seq Scan on public.audit_logs al  (cost=0.00..10.60 rows=60 width=1316) (actual time=0.727..0.729 rows=4 loops=1)
+               Output: id, instance_id, instance_user_id, action_type, resource_type, resource_id, details, affected_resources, ip_address, user_agent, created_at, updated_at
+               Buffers: shared read=1 dirtied=1
+ Query Identifier: -7380948261335946143
+ Planning:
+   Buffers: shared hit=204 read=7 dirtied=1
+ Planning Time: 8.731 ms
+ Execution Time: 0.792 ms
+(16 rows)
+
+
+

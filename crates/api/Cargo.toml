@@ -46,3 +46,7 @@ sentry-tower = { version = "0.32", optional = true }
 default = ["webauthn"]
 sentry = ["dep:sentry", "dep:sentry-tower", "leadsnebula_core/sentry"]
 webauthn = ["dep:webauthn-rs", "dep:url", "leadsnebula_core/webauthn"]
+
+[dev-dependencies]
+ctor = { workspace = true }
+dotenv = { workspace = true }

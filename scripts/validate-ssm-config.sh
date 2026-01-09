@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # Validate SSM Parameter Store configuration before deployment
 # This script checks that all required SSM parameters exist for the given environment
@@ -28,6 +29,7 @@ echo ""
 # Required SSM paths
 REQUIRED_PATHS=(
     "/leadsnebula/${ENV_NORMALIZED}/rust/db/connection_url"
+    "/leadsnebula/${ENV_NORMALIZED}/rust/db/connection_url_direct"  # Direct connection for migrations
     "/leadsnebula/${ENV_NORMALIZED}/rust/auth/jwt_secret"
     "/leadsnebula/${ENV_NORMALIZED}/rust/encryption/api_key_key"
     "/leadsnebula/prod/rust/redis/connection_url"  # Redis is always from prod path

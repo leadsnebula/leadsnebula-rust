@@ -1,0 +1,226 @@
+==========================================
+Query Pattern Analysis Report
+Environment: prod
+Generated: Fri Jan  9 11:13:34 AM PST 2026
+==========================================
+
+==========================================
+Query: Dashboard: Sold leads (paginated)
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.status = 'sold' ORDER BY l.created_at DESC LIMIT 50
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Dashboard: Count sold leads
+----------------------------------------
+SQL:
+SELECT COUNT(*) FROM leads WHERE status = 'sold'
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Dashboard: Sum revenue from sold leads
+----------------------------------------
+SQL:
+SELECT SUM(la.price) FROM lead_accounting la INNER JOIN leads l ON la.lead_id = l.uuid WHERE l.status = 'sold'
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Leads Dashboard: Filter by publisher
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.publisher_id IS NOT NULL ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Leads Dashboard: Filter by buyer
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.buyer_id IS NOT NULL ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Leads Dashboard: Filter by status
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.status = 'processing' ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Leads Dashboard: Search by encrypted email
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE l.email_encrypted = 'test@example.com' LIMIT 10
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Leads Dashboard: Search by email domain
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE LOWER(l.email_domain) LIKE '%example%' LIMIT 10
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Leads Dashboard: Filter valid campaign_ids
+----------------------------------------
+SQL:
+SELECT l.* FROM leads l WHERE (l.campaign_id IS NULL OR l.campaign_id::text != '') ORDER BY l.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Pings: Most recent ping for lead
+----------------------------------------
+SQL:
+SELECT p.* FROM pings p WHERE p.lead_id IS NOT NULL ORDER BY p.created_at DESC LIMIT 1
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Pings Dashboard: Filter by lead publisher
+----------------------------------------
+SQL:
+SELECT p.* FROM pings p INNER JOIN leads l ON p.lead_id = l.uuid WHERE l.publisher_id IS NOT NULL ORDER BY p.updated_at DESC LIMIT 50
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Pings Dashboard: Filter by lead buyer
+----------------------------------------
+SQL:
+SELECT p.* FROM pings p INNER JOIN leads l ON p.lead_id = l.uuid WHERE l.buyer_id IS NOT NULL ORDER BY p.updated_at DESC LIMIT 50
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Posts: Most recent post for lead
+----------------------------------------
+SQL:
+SELECT p.* FROM posts p WHERE p.lead_id IS NOT NULL ORDER BY p.created_at DESC LIMIT 1
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Ping Trees: Find active ping tree for routing
+----------------------------------------
+SQL:
+SELECT pt.* FROM ping_trees pt WHERE pt.publisher_id IS NOT NULL AND pt.vertical = 'solar' AND pt.status = 'active' AND pt.deleted_at IS NULL ORDER BY pt.priority ASC NULLS LAST, pt.created_at ASC LIMIT 1
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Campaigns: Active campaigns
+----------------------------------------
+SQL:
+SELECT c.* FROM campaigns c WHERE c.status = 'active' AND c.deleted_at IS NULL ORDER BY c.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Buyers: Active buyers
+----------------------------------------
+SQL:
+SELECT b.* FROM buyers b WHERE b.deleted_at IS NULL ORDER BY b.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Publishers: Active publishers
+----------------------------------------
+SQL:
+SELECT p.* FROM publishers p WHERE p.status = 'active' AND p.deleted_at IS NULL ORDER BY p.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Lead Sales: Sales for sold leads
+----------------------------------------
+SQL:
+SELECT ls.* FROM lead_sales ls INNER JOIN leads l ON ls.lead_id = l.uuid WHERE l.status = 'sold' LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Lead Accounting: Accounting for sold leads
+----------------------------------------
+SQL:
+SELECT la.* FROM lead_accounting la INNER JOIN leads l ON la.lead_id = l.uuid WHERE l.status = 'sold' LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+
+==========================================
+Query: Audit Logs: Recent audit logs
+----------------------------------------
+SQL:
+SELECT al.* FROM audit_logs al ORDER BY al.created_at DESC LIMIT 100
+
+EXPLAIN ANALYZE:
+----------------------------------------
+psql: error: invalid connection option "AQICAHgyR4a48duHo/QmG0riF1lA1uvzebYW7zoEKUATylBMOgHfZBv4xatUbMQDsTV3HddfAAAA8TCB7gYJKoZIhvcNAQcGoIHgMIHdAgEAMIHXBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDPXpKfZKVutVnCBW1QIBEICBqXlyb5vDq/i3wbfRVetQLKWcEqjtXzn0W0cQLYeUjb1wQ9/JQwjC3ChS9UYYS/qdvBUW3cd9XllT0WAgp0qkGRWB+tlWklHghx6u6zWG+vOVmMCg6JYzDFzD5TGVyXsGqcj8K7MyLMFlrbHeHm0c0/Xz0Dl5qjm7ORlB7N1ANB0h3OFNdwB652kilGxQc9OVr9WId1Ocnx4C+ax110taHVzRpM6kQr7se/Q"
+
+

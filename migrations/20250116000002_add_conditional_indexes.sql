@@ -1,0 +1,168 @@
+-- Conditional Additional Indexes
+-- ============================================================================
+-- IMPORTANT: All indexes in this migration are COMMENTED OUT by default.
+-- Only uncomment indexes after verifying they are needed via query analysis.
+-- 
+-- Verification Steps:
+-- 1. Run EXPLAIN ANALYZE on production queries
+-- 2. Look for "Seq Scan" (sequential scan) in query plans
+-- 3. Only if sequential scan appears, uncomment the corresponding index
+-- 4. Use CONCURRENTLY to avoid locking production tables
+-- 5. Monitor index usage after creation with monitor-index-usage.sh
+-- ============================================================================
+
+-- ============================================================================
+-- Index 1: Posts Table - Lead ID + Created At
+-- ============================================================================
+-- Purpose: Optimize queries that fetch posts for a lead ordered by creation time
+-- Condition: Only uncomment if EXPLAIN ANALYZE shows sequential scan on:
+--   SELECT * FROM posts WHERE lead_id = $1 ORDER BY created_at DESC;
+--
+-- Verification Query:
+--   EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+--   SELECT * FROM posts WHERE lead_id = '<some-lead-id>' ORDER BY created_at DESC;
+--
+-- Expected: Should show "Index Scan" or "Index Only Scan"
+-- If shows "Seq Scan", uncomment the index below.
+-- ============================================================================
+
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_posts_lead_id_created_at 
+--     ON posts(lead_id, created_at DESC) 
+--     WHERE lead_id IS NOT NULL;
+
+-- ============================================================================
+-- Index 2: Audit Logs - Action Type + Created At (Composite)
+-- ============================================================================
+-- Purpose: Optimize queries that filter by action_type AND order by created_at
+-- Condition: Only uncomment if queries frequently filter by action_type + created_at together
+-- 
+-- Note: Separate indexes already exist:
+--   - idx_audit_logs_action_type (on action_type)
+--   - idx_audit_logs_created_at (on created_at)
+--   - idx_audit_logs_created_at_desc (on created_at DESC)
+--
+-- This composite index is only beneficial if queries use BOTH filters together:
+--   SELECT * FROM audit_logs 
+--   WHERE action_type = 'create' 
+--   ORDER BY created_at DESC;
+--
+-- Verification Query:
+--   EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+--   SELECT * FROM audit_logs 
+--   WHERE action_type = '<common-action-type>' 
+--   ORDER BY created_at DESC 
+--   LIMIT 100;
+--
+-- Expected: Should use existing indexes efficiently
+-- If shows sequential scan or inefficient index usage, uncomment below.
+-- ============================================================================
+
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_logs_action_created 
+--     ON audit_logs(action_type, created_at DESC) 
+--     WHERE action_type IS NOT NULL;
+
+-- ============================================================================
+-- Index 3: Audit Logs - Resource Type + Created At (Composite)
+-- ============================================================================
+-- Purpose: Optimize queries that filter by resource_type AND order by created_at
+-- Condition: Only uncomment if queries frequently filter by resource_type + created_at together
+-- 
+-- Note: Separate indexes already exist:
+--   - idx_audit_logs_resource_type_id (on resource_type, resource_id)
+--   - idx_audit_logs_created_at (on created_at)
+--   - idx_audit_logs_created_at_desc (on created_at DESC)
+--
+-- This composite index is only beneficial if queries use BOTH filters together:
+--   SELECT * FROM audit_logs 
+--   WHERE resource_type = 'lead' 
+--   ORDER BY created_at DESC;
+--
+-- Verification Query:
+--   EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+--   SELECT * FROM audit_logs 
+--   WHERE resource_type = '<common-resource-type>' 
+--   ORDER BY created_at DESC 
+--   LIMIT 100;
+--
+-- Expected: Should use existing indexes efficiently
+-- If shows sequential scan or inefficient index usage, uncomment below.
+-- ============================================================================
+
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_logs_resource_created 
+--     ON audit_logs(resource_type, created_at DESC) 
+--     WHERE resource_type IS NOT NULL;
+
+-- ============================================================================
+-- Index 4: Leads - Campaign ID (Valid Campaigns Only)
+-- ============================================================================
+-- Purpose: Optimize queries that filter leads by campaign_id where campaign_id IS NOT NULL
+-- Condition: Only uncomment if EXPLAIN ANALYZE shows sequential scan on campaign_id filtering
+-- 
+-- Note: Index idx_leads_campaign_id already exists on campaign_id
+-- This partial index is only beneficial if:
+--   1. Most queries filter WHERE campaign_id IS NOT NULL
+--   2. There are many NULL campaign_id values (sparse column)
+--   3. Sequential scans appear despite existing index
+--
+-- Verification Query:
+--   EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+--   SELECT * FROM leads 
+--   WHERE campaign_id = '<some-campaign-id>' 
+--   AND campaign_id IS NOT NULL;
+--
+-- Expected: Should use existing idx_leads_campaign_id index
+-- If shows sequential scan, uncomment below.
+-- ============================================================================
+
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_campaign_id_valid 
+--     ON leads(campaign_id, created_at DESC) 
+--     WHERE campaign_id IS NOT NULL;
+
+-- ============================================================================
+-- Index 5: Pings - Result + Created At (Optional)
+-- ============================================================================
+-- Purpose: Optimize queries that filter pings by result status and order by time
+-- Condition: Only uncomment if EXPLAIN ANALYZE shows sequential scan
+-- 
+-- Note: Check if pings table has a result column and if queries filter by it
+-- This is conditional on the actual schema of the pings table
+--
+-- Verification Query (if pings table exists with result column):
+--   EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+--   SELECT * FROM pings 
+--   WHERE result = '<some-result>' 
+--   ORDER BY created_at DESC;
+--
+-- Expected: Should use existing indexes
+-- If shows sequential scan, uncomment below.
+-- ============================================================================
+
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pings_result_created_at 
+--     ON pings(result, created_at DESC) 
+--     WHERE result IS NOT NULL;
+
+-- ============================================================================
+-- POST-INDEX CREATION VERIFICATION
+-- ============================================================================
+-- After uncommenting and creating any index:
+-- 
+-- 1. Verify index was created:
+--    SELECT indexname, indexdef 
+--    FROM pg_indexes 
+--    WHERE tablename = '<table_name>' 
+--    AND indexname = '<index_name>';
+--
+-- 2. Check index size:
+--    SELECT pg_size_pretty(pg_relation_size('<index_name>'));
+--
+-- 3. Monitor index usage (run after 1 week):
+--    ./scripts/monitor-index-usage.sh prod
+--
+-- 4. Verify index is being used:
+--    SELECT idx_scan, idx_tup_read, idx_tup_fetch 
+--    FROM pg_stat_user_indexes 
+--    WHERE indexrelid = '<index_name>'::regclass;
+--
+-- 5. If index is unused after 2 weeks (idx_scan = 0), consider dropping:
+--    DROP INDEX CONCURRENTLY <index_name>;
+-- ============================================================================
