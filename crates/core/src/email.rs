@@ -9,15 +9,8 @@ pub struct EmailService {
 
 impl EmailService {
     pub async fn new(from_email: String) -> anyhow::Result<Self> {
-        // Configure AWS SDK - unset AWS_WEB_IDENTITY_TOKEN_FILE to skip web identity token provider
-        std::env::remove_var("AWS_WEB_IDENTITY_TOKEN_FILE");
-        std::env::remove_var("AWS_ROLE_ARN");
-        std::env::remove_var("AWS_ROLE_SESSION_NAME");
-
-        // Load config with explicit sleep_impl
-        use aws_smithy_async::rt::sleep::TokioSleep;
+        // Load config - rt-tokio feature automatically configures sleep_impl
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .sleep_impl(TokioSleep::new())
             .load()
             .await;
         let client = SesClient::new(&config);
