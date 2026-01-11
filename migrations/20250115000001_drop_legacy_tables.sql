@@ -1,17 +1,26 @@
 -- Drop legacy tables and schemas
 -- This migration removes Rails-specific and test artifacts that are no longer needed
 
--- Verify ar_internal_metadata is empty before dropping
+-- Verify ar_internal_metadata is empty before dropping (only if it exists)
 DO $$
 DECLARE
+    table_exists BOOLEAN;
     row_count INTEGER;
 BEGIN
-    SELECT COUNT(*) INTO row_count FROM ar_internal_metadata;
-    
-    IF row_count > 0 THEN
-        RAISE WARNING 'ar_internal_metadata contains % rows. Please verify before dropping.', row_count;
+    SELECT EXISTS(
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'ar_internal_metadata'
+    ) INTO table_exists;
+
+    IF table_exists THEN
+        SELECT COUNT(*) INTO row_count FROM ar_internal_metadata;
+        IF row_count > 0 THEN
+            RAISE WARNING 'ar_internal_metadata contains % rows. Please verify before dropping.', row_count;
+        ELSE
+            RAISE NOTICE 'ar_internal_metadata is empty. Safe to drop.';
+        END IF;
     ELSE
-        RAISE NOTICE 'ar_internal_metadata is empty. Safe to drop.';
+        RAISE NOTICE 'ar_internal_metadata does not exist; skipping verification.';
     END IF;
 END $$;
 

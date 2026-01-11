@@ -18,15 +18,45 @@
 
 -- Index for dashboard: sold leads ordered by created_at
 -- Query analysis shows: Dashboard queries benefit from composite index
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_status_created_at ON leads(status, created_at DESC);
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'leads'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_leads_status_created_at ON leads(status, created_at DESC)';
+	ELSE
+		RAISE NOTICE 'Table leads does not exist; skipping idx_leads_status_created_at.';
+	END IF;
+END $$;
 
 -- Index for leads dashboard: filter by publisher with ordering
 -- Query analysis shows: Sequential scan on publisher filtering - needs index
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_publisher_id_created_at ON leads(publisher_id, created_at DESC) WHERE publisher_id IS NOT NULL;
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'leads'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_leads_publisher_id_created_at ON leads(publisher_id, created_at DESC) WHERE publisher_id IS NOT NULL';
+	ELSE
+		RAISE NOTICE 'Table leads does not exist; skipping idx_leads_publisher_id_created_at.';
+	END IF;
+END $$;
 
 -- Index for leads dashboard: filter by buyer with ordering
 -- Query analysis shows: Sequential scan on buyer filtering - needs index
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_buyer_id_created_at ON leads(buyer_id, created_at DESC) WHERE buyer_id IS NOT NULL;
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'leads'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_leads_buyer_id_created_at ON leads(buyer_id, created_at DESC) WHERE buyer_id IS NOT NULL';
+	ELSE
+		RAISE NOTICE 'Table leads does not exist; skipping idx_leads_buyer_id_created_at.';
+	END IF;
+END $$;
 
 -- Index for leads dashboard: filter by status (already have idx_leads_status if exists, but composite may be better)
 -- Uncomment if EXPLAIN ANALYZE shows sequential scan on: WHERE status = X ORDER BY created_at DESC
@@ -47,12 +77,32 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_buyer_id_created_at ON leads(b
 -- Index for pings dashboard: most recent ping for lead
 -- Query analysis shows: Index exists but verify it covers lead_id + created_at
 -- Note: idx_pings_created_at exists, but composite with lead_id is better for lead-specific queries
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pings_lead_id_created_at ON pings(lead_id, created_at DESC) WHERE lead_id IS NOT NULL;
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'pings'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_pings_lead_id_created_at ON pings(lead_id, created_at DESC) WHERE lead_id IS NOT NULL';
+	ELSE
+		RAISE NOTICE 'Table pings does not exist; skipping idx_pings_lead_id_created_at.';
+	END IF;
+END $$;
 
 -- Index for pings dashboard: filter by lead publisher (via join)
 -- Query analysis shows: Sequential scan when joining with leads for publisher filtering
 -- The join uses lead_id, so the above index should help, but we also need updated_at for ordering
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pings_updated_at ON pings(updated_at DESC);
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'pings'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_pings_updated_at ON pings(updated_at DESC)';
+	ELSE
+		RAISE NOTICE 'Table pings does not exist; skipping idx_pings_updated_at.';
+	END IF;
+END $$;
 
 -- ============================================
 -- POSTS TABLE INDEXES
@@ -92,7 +142,17 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pings_updated_at ON pings(updated_at
 
 -- Index for publishers: active publishers
 -- Query analysis shows: Sequential scan on publishers table - needs index
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_publishers_active ON publishers(status, deleted_at) WHERE status = 'active' AND deleted_at IS NULL;
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'publishers'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_publishers_active ON publishers(status, deleted_at) WHERE status = ''active'' AND deleted_at IS NULL';
+	ELSE
+		RAISE NOTICE 'Table publishers does not exist; skipping idx_publishers_active.';
+	END IF;
+END $$;
 
 -- ============================================
 -- LEAD ACCOUNTING TABLE INDEXES
@@ -117,7 +177,17 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_publishers_active ON publishers(stat
 
 -- Index for audit logs: recent audit logs
 -- Query analysis shows: Sequential scan on audit_logs - needs index for ordering
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_logs_created_at_desc ON audit_logs(created_at DESC);
+DO $$
+BEGIN
+	IF EXISTS(
+		SELECT 1 FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'audit_logs'
+	) THEN
+		EXECUTE 'CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at_desc ON audit_logs(created_at DESC)';
+	ELSE
+		RAISE NOTICE 'Table audit_logs does not exist; skipping idx_audit_logs_created_at_desc.';
+	END IF;
+END $$;
 
 -- ============================================
 -- NOTES:

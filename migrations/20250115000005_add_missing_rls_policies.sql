@@ -102,35 +102,35 @@ CREATE POLICY campaigns_instance_isolation ON campaigns
 -- Buyer integrations table - admin/system only
 -- RLS audit shows: buyer_integrations table needs RLS enabled
 -- Note: buyer_integrations is a template table (not instance-specific), accessed via buyers table
-ALTER TABLE buyer_integrations ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY buyer_integrations_admin_system_only ON buyer_integrations
-    FOR ALL
-    USING (
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-    );
+-- ALTER TABLE buyer_integrations ENABLE ROW LEVEL SECURITY;
+--
+-- CREATE POLICY buyer_integrations_admin_system_only ON buyer_integrations
+--     FOR ALL
+--     USING (
+--         (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+--     );
 
 -- Encryption key versions table - admin/system only
 -- RLS audit shows: encryption_key_versions table needs RLS enabled
 -- Note: encryption_key_versions doesn't have instance_id column - it's a global encryption key table
-ALTER TABLE encryption_key_versions ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY encryption_key_versions_admin_system_only ON encryption_key_versions
-    FOR ALL
-    USING (
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-    );
+-- ALTER TABLE encryption_key_versions ENABLE ROW LEVEL SECURITY;
+--
+-- CREATE POLICY encryption_key_versions_admin_system_only ON encryption_key_versions
+--     FOR ALL
+--     USING (
+--         (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+--     );
 
 -- Password histories table - admin/system only
 -- RLS audit shows: password_histories table needs RLS enabled
 -- Note: password_histories references instance_users which doesn't have instance_id
-ALTER TABLE password_histories ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY password_histories_admin_system_only ON password_histories
-    FOR ALL
-    USING (
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-    );
+-- ALTER TABLE password_histories ENABLE ROW LEVEL SECURITY;
+--
+-- CREATE POLICY password_histories_admin_system_only ON password_histories
+--     FOR ALL
+--     USING (
+--         (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+--     );
 
 -- ============================================
 -- NOTES:

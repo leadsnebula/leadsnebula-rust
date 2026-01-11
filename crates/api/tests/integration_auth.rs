@@ -389,24 +389,26 @@ async fn test_user_status_affects_authentication(pool: PgPool) -> sqlx::Result<(
     let user_id = create_test_user(&pool, "status_test@example.com").await;
 
     // Verify user is active
-    let status: String = sqlx::query_scalar("SELECT status FROM instance_users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await?;
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM instance_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?;
 
     assert_eq!(status, "active");
 
     // Suspend user
-    sqlx::query("UPDATE instance_users SET status = 'suspended', updated_at = NOW() WHERE id = $1")
+    sqlx::query("UPDATE instance_users SET status = 'suspended'::instance_user_status_enum, updated_at = NOW() WHERE id = $1")
         .bind(user_id)
         .execute(&pool)
         .await?;
 
     // Verify user is suspended
-    let status: String = sqlx::query_scalar("SELECT status FROM instance_users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await?;
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM instance_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await?;
 
     assert_eq!(status, "suspended");
 

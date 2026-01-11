@@ -243,7 +243,7 @@ COMMENT ON TABLE verticals IS 'Business vertical categories (e.g., solar, insura
 COMMENT ON COLUMN verticals.id IS 'Primary key UUID';
 COMMENT ON COLUMN verticals.name IS 'Vertical name (e.g., "Solar", "Insurance")';
 COMMENT ON COLUMN verticals.slug IS 'URL-friendly identifier (unique)';
-COMMENT ON COLUMN verticals.description IS 'Vertical description';
+COMMENT ON COLUMN verticals.is_active IS 'Flag indicating if vertical is active';
 COMMENT ON COLUMN verticals.created_at IS 'Record creation timestamp';
 COMMENT ON COLUMN verticals.updated_at IS 'Record last update timestamp';
 
