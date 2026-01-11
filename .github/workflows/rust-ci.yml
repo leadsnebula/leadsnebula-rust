@@ -219,6 +219,17 @@ jobs:
         with:
           workspaces: "."
 
+      - name: Wait for database
+        run: |
+          echo "Waiting for PostgreSQL to be ready..."
+          # Install postgresql-client if not available (for pg_isready)
+          sudo apt-get update -qq && sudo apt-get install -y postgresql-client || true
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "Database not ready, waiting..."
+            sleep 2
+          done
+          echo "✅ Database is ready"
+
       - name: Generate coverage report
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
@@ -228,6 +239,7 @@ jobs:
           cargo llvm-cov clean --workspace || true
           
           # Generate coverage report - continue even if tests fail
+          # Use --no-fail-fast to run all tests, and || true to continue even on failure
           cargo llvm-cov --locked --all-features \
             --lcov --output-path lcov.info \
             --workspace \
@@ -243,5 +255,6 @@ jobs:
           # Show coverage summary
           echo "📊 Coverage report generated successfully"
           echo "File size: $(du -h lcov.info | cut -f1)"
+
       - name: Upload coverage to artifacts
         uses: actions/upload-artifact@v4
