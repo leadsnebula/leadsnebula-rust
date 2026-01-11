@@ -44,7 +44,6 @@ jobs:
             cargo install cargo-deny --locked
           fi
           cargo deny check || echo "⚠️  cargo-deny found license issues (non-blocking)"
-        run: cargo clippy --all-targets --all-features -- -D warnings
 
   test-unit:
     name: Unit Tests
