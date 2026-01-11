@@ -169,6 +169,7 @@ jobs:
       - name: Run integration tests
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          RUST_TEST_THREADS: 1
         run: |
           # Run integration tests with nextest for faster execution
           # Run health endpoint tests
@@ -219,6 +220,9 @@ jobs:
           workspaces: "."
 
       - name: Generate coverage report
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          RUST_TEST_THREADS: 1
         run: |
           # Clean old coverage artifacts (optional but recommended)
           cargo llvm-cov clean --workspace || true
@@ -227,7 +231,6 @@ jobs:
           cargo llvm-cov --locked --all-features \
             --lcov --output-path lcov.info \
             --workspace \
-            --test-threads=1 \
             --no-fail-fast || true
           
           # Verify lcov.info was generated
