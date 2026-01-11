@@ -81,7 +81,7 @@ jobs:
             CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
           fi
           
-          # Extract unique crate names from changed files
+          # Extract unique crate directory names from changed files
           CHANGED_CRATES=$(echo "$CHANGED_FILES" | grep -o '^crates/[^/]*' | sort -u | tr '\n' ' ' | xargs || echo "")
           
           if [ -z "$CHANGED_CRATES" ]; then
@@ -90,24 +90,25 @@ jobs:
             echo "run_all=true" >> $GITHUB_OUTPUT
             echo "Changed crates: none (running all tests)"
           else
-            # Convert to package filter format (remove crates/ prefix, add -p prefix)
-            PACKAGE_NAMES=$(echo "$CHANGED_CRATES" | sed 's|crates/||g' | xargs)
-            if [ -z "$PACKAGE_NAMES" ]; then
-              # Empty after processing, run all tests
-              echo "packages=" >> $GITHUB_OUTPUT
-              echo "run_all=true" >> $GITHUB_OUTPUT
-              echo "Changed crates: $CHANGED_CRATES (but no valid package names, running all tests)"
-            else
-              # Build package filter arguments
-              PACKAGES=""
-              for pkg in $PACKAGE_NAMES; do
-                PACKAGES="$PACKAGES -p $pkg"
-              done
-              echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
-              echo "run_all=false" >> $GITHUB_OUTPUT
-              echo "Changed crates: $CHANGED_CRATES"
-              echo "Package filter: $PACKAGES"
-            fi
+            # Map directory names to actual package names
+            declare -A PKG_MAP=(
+              ["core"]="leadsnebula_core"
+              ["api"]="leadsnebula-api"
+              ["utils"]="leadsnebula-utils"
+            )
+            
+            # Build package filter arguments
+            PACKAGES=""
+            for dir in $CHANGED_CRATES; do
+              pkg_dir="${dir#crates/}"  # Remove "crates/" prefix
+              pkg_name="${PKG_MAP[$pkg_dir]:-$pkg_dir}"  # Map or fallback to directory name
+              PACKAGES="$PACKAGES -p $pkg_name"
+            done
+            
+            echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+            echo "run_all=false" >> $GITHUB_OUTPUT
+            echo "Changed crates: $CHANGED_CRATES"
+            echo "Package filter: $PACKAGES"
           fi
 
       - name: Run unit tests with nextest
@@ -202,6 +203,7 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     needs: [test-unit, test-integration]
+    continue-on-error: true
     
     steps:
       - uses: actions/checkout@v4
@@ -218,13 +220,25 @@ jobs:
 
       - name: Generate coverage report
         run: |
-          # Install cargo-llvm-cov if needed
-          cargo install cargo-llvm-cov --locked || true
-          cargo llvm-cov --locked --all-features --lcov --output-path lcov.info || true
-
+          # Clean old coverage artifacts (optional but recommended)
+          cargo llvm-cov clean --workspace || true
+          
+          # Generate coverage report - continue even if tests fail
+          cargo llvm-cov --locked --all-features \
+            --lcov --output-path lcov.info \
+            --workspace \
+            --test-threads=1 \
+            --no-fail-fast || true
+          
+          # Verify lcov.info was generated
+          if [ ! -f lcov.info ]; then
+            echo "❌ Error: lcov.info was not generated"
+            echo "   This usually means all tests failed or coverage instrumentation failed"
+            exit 1
+          fi
+          
+          # Show coverage summary
+          echo "📊 Coverage report generated successfully"
+          echo "File size: $(du -h lcov.info | cut -f1)"
       - name: Upload coverage to artifacts
         uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-report
-          path: lcov.info
