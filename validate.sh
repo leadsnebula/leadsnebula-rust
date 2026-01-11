@@ -399,6 +399,18 @@ if [ -d ".github/workflows" ]; then
                     echo "✅ $WORKFLOW_NAME has correct GHCR permissions"
                 fi
             fi
+            
+            # Check for invalid cargo llvm-cov options (e.g., --test-threads which doesn't exist)
+            if grep -q "cargo llvm-cov" "$workflow"; then
+                if grep -A 5 "cargo llvm-cov" "$workflow" | grep -q "\\--test-threads"; then
+                    echo "❌ $WORKFLOW_NAME uses invalid '--test-threads' option with cargo llvm-cov"
+                    echo "   Use 'RUST_TEST_THREADS' environment variable instead"
+                    echo "   Example: env: { RUST_TEST_THREADS: 1 }"
+                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                else
+                    echo "✅ $WORKFLOW_NAME cargo llvm-cov command OK"
+                fi
+            fi
         fi
     done
     
@@ -440,6 +452,40 @@ if cargo tree --duplicates 2>/dev/null | grep -q "(*)$"; then
     echo "⚠️  Duplicate dependencies found. Review with 'cargo tree --duplicates'"
 else
     echo "✅ No duplicate dependencies"
+fi
+echo ""
+
+# 11a. Validate cargo-deny configuration
+echo "1️⃣1️⃣a️⃣  Validating cargo-deny configuration..."
+if [ -f "deny.toml" ]; then
+    if command -v cargo-deny > /dev/null 2>&1; then
+        # Run cargo-deny check to validate deny.toml syntax
+        if cargo deny check 2>&1 | grep -q "error\|failed to deserialize"; then
+            echo "❌ deny.toml has syntax errors"
+            cargo deny check 2>&1 | grep -A 3 "error\|failed" | head -10 || true
+            echo "   Common issues:"
+            echo "   - 'OR' expressions in allow list (use individual licenses instead)"
+            echo "   - Invalid license identifiers (use SPDX format)"
+            ERRORS=$((ERRORS + 1))
+        else
+            echo "✅ deny.toml syntax OK"
+        fi
+    else
+        # Basic TOML syntax check if cargo-deny not installed
+        if command -v python3 > /dev/null 2>&1; then
+            if python3 -c "import tomli; tomli.load(open('deny.toml', 'rb'))" 2>/dev/null || \
+               python3 -c "import tomllib; tomllib.load(open('deny.toml', 'rb'))" 2>/dev/null; then
+                echo "✅ deny.toml TOML syntax OK (cargo-deny not installed, basic validation only)"
+            else
+                echo "⚠️  deny.toml TOML syntax validation skipped (tomli/tomllib not available)"
+                echo "   Install cargo-deny for full validation: cargo install cargo-deny"
+            fi
+        else
+            echo "⚠️  deny.toml exists but cannot validate (cargo-deny and python3 not available)"
+        fi
+    fi
+else
+    echo "⚠️  deny.toml not found (optional, but recommended for license compliance)"
 fi
 echo ""
 
