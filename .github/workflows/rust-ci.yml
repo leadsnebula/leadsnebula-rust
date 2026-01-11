@@ -30,6 +30,20 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run cargo clippy
+
+      - name: Security audit (cargo audit)
+        run: |
+          if ! command -v cargo-audit &> /dev/null; then
+            cargo install cargo-audit --locked
+          fi
+          cargo audit --deny warnings || echo "⚠️  cargo-audit found vulnerabilities (non-blocking)"
+
+      - name: License check (cargo deny)
+        run: |
+          if ! command -v cargo-deny &> /dev/null; then
+            cargo install cargo-deny --locked
+          fi
+          cargo deny check || echo "⚠️  cargo-deny found license issues (non-blocking)"
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test-unit:

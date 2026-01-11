@@ -22,8 +22,8 @@
 
 ### Documentation Policy (External Only)
 - No documentation files in the repository root (except README.md)
-- All temporary documentation, summaries, and review files (.md files) should be placed in `/home/badinoff/projects/documentation`
-- All helper scripts, Postman collections, and testing utilities should be placed in `/home/badinoff/projects/leadsNebula/helperScripts`
+- All temporary documentation, summaries, and review files (.md files) should be placed in `/home/badinoff/projects/leadsnebula/docs`
+- All helper scripts, Postman collections, and testing utilities should be placed in `/home/badinoff/projects/leadsnebula/scripts`
 - README.md should be minimal and focused on essential development information only
 - Code should be self-documenting through clear naming and structure
 
