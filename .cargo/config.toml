@@ -1,0 +1,14 @@
+[alias]
+# Fast tests: unit tests only, no database required (~3 seconds)
+test-fast = "test --lib --no-fail-fast"
+
+# Slow tests: integration tests with database, sequential execution (~2 minutes)
+test-slow = "test --test '*' --no-fail-fast --locked -- --test-threads=1"
+
+# All tests: full test suite with all features
+test-all = "test --all-targets --all-features --locked"
+
+# Nextest aliases (faster parallel execution)
+nextest-fast = "nextest run --lib --locked --all-features"
+nextest-slow = "nextest run --test '*' --locked --all-features"
+nextest-all = "nextest run --locked --all-features"

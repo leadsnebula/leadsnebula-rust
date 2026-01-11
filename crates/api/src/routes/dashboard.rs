@@ -300,7 +300,7 @@ async fn setup_otp(
     let mut rng = OsRng;
     let mut secret_bytes = [0u8; 20];
     rng.fill_bytes(&mut secret_bytes);
-    let secret = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &secret_bytes);
+    let secret = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &secret_bytes);
 
     // Create or update OTP setting (but don't enable it yet - wait for verification)
     sqlx::query(
@@ -1124,7 +1124,7 @@ async fn _setup_otp_with_user(
     let mut rng = OsRng;
     let mut secret_bytes = [0u8; 20];
     rng.fill_bytes(&mut secret_bytes);
-    let secret = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &secret_bytes);
+    let secret = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &secret_bytes);
 
     // #region agent log
     let log_data = serde_json::json!({
