@@ -20,6 +20,8 @@ jsonwebtoken = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
+pbkdf2 = { workspace = true }
+sha1 = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -47,4 +49,6 @@ otp = ["dep:totp-rs"]
 [dev-dependencies]
 proptest = { workspace = true }
 loom = { workspace = true }
+mockito = "1.2"
+wiremock = "0.6"
 

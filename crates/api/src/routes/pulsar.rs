@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::AppState;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine;
+use chrono::Utc;
 
 #[derive(Deserialize)]
 pub struct PulsarLeadRequest {
@@ -117,16 +120,16 @@ async fn handle_ping(
     buyer_id: Uuid,
     lead_data: PulsarLeadData,
 ) -> Result<Json<PulsarResponse>, StatusCode> {
-    let _lead_id = lead_data
+    let lead_id = lead_data
         .lead_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // Generate ping_id and promise_id
-    let ping_id = format!(
-        "PING_{}",
-        hex::encode(rand::random::<[u8; 8]>()).to_uppercase()
-    );
+    // Generate ping_id similar to Ruby: FP_<base64(lead_id|timestamp|result)>
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let payload = format!("{}|{}|accepted", lead_id, timestamp);
+    let encoded = BASE64_STD.encode(payload);
+    let ping_id = format!("FP_{}", encoded);
     let promise_id = format!(
         "PROMISE_{}",
         hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
@@ -136,10 +139,10 @@ async fn handle_ping(
     let accepted = true; // Default accept for now
 
     if !accepted {
-        let rejected_ping_id = format!(
-            "PING_REJECTED_{}",
-            hex::encode(rand::random::<[u8; 8]>()).to_uppercase()
-        );
+        let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+        let payload = format!("{}|{}|rejected", lead_id, timestamp);
+        let encoded = BASE64_STD.encode(payload);
+        let rejected_ping_id = format!("FP_{}", encoded);
         return Ok(Json(PulsarResponse {
             success: false,
             status: "rejected".to_string(),
@@ -174,7 +177,7 @@ async fn handle_ping(
         ping_id: Some(ping_id),
         post_id: None,
         promise_id: Some(promise_id),
-        price: Some(rand::random::<u32>() % 200 + 100),
+        price: Some((rand::random::<u32>() % 200 + 100) as u32),
         message: Some("Lead accepted for ping".to_string()),
         error: None,
         reason: None,
@@ -238,10 +241,11 @@ async fn handle_post(
         }));
     }
 
-    let post_id = format!(
-        "POST_{}",
-        hex::encode(rand::random::<[u8; 8]>()).to_uppercase()
-    );
+    // Generate post id similar to Ruby: RP_<base64(lead_id|timestamp|sold)>
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let payload = format!("{}|{}|sold", lead_id, timestamp);
+    let encoded = BASE64_STD.encode(payload);
+    let post_id = format!("RP_{}", encoded);
 
     // Log decision
     let _ = sqlx::query(
@@ -284,10 +288,17 @@ async fn handle_fullpost(
         "PING_{}",
         hex::encode(rand::random::<[u8; 8]>()).to_uppercase()
     );
-    let post_id = format!(
-        "POST_{}",
-        hex::encode(rand::random::<[u8; 8]>()).to_uppercase()
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let payload = format!(
+        "{}|{}|sold",
+        lead_data
+            .lead_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        timestamp
     );
+    let encoded = BASE64_STD.encode(payload);
+    let post_id = format!("RP_{}", encoded);
     let promise_id = format!(
         "PROMISE_{}",
         hex::encode(rand::random::<[u8; 6]>()).to_uppercase()

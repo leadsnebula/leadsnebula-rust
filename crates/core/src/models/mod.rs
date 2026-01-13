@@ -1,5 +1,6 @@
 pub mod audit_log;
 pub mod buyer;
+pub mod buyer_integration;
 pub mod buyer_qualification_config;
 pub mod campaign;
 pub mod enums;

@@ -259,6 +259,25 @@ impl PingTreeRouter {
             responses.len()
         );
 
+        // Persist each buyer response for audit (best-effort). Store plaintext JSON; API layer will encrypt rows when SSM keys are available.
+        for (resp, campaign_id, _pri) in &responses {
+            // Find buyer_id from campaigns list
+            let buyer_id_opt = campaigns
+                .iter()
+                .find(|c| c.id == *campaign_id)
+                .map(|c| c.buyer_id);
+            let resp_json = serde_json::to_value(resp).unwrap_or(serde_json::json!({}));
+            let ping_id_val = resp.ping_id.clone();
+            let _ = sqlx::query("INSERT INTO buyer_responses (lead_id, ping_id, buyer_id, campaign_id, payload, created_at) VALUES ($1, $2, $3, $4, $5, now())")
+                .bind(self.lead.uuid)
+                .bind(ping_id_val)
+                .bind(buyer_id_opt)
+                .bind(*campaign_id)
+                .bind(sqlx::types::Json(&resp_json))
+                .execute(pool)
+                .await;
+        }
+
         // Filter valid responses (success=true, price > 0, status != timeout)
         let valid_responses: Vec<_> = responses
             .iter()
@@ -349,7 +368,7 @@ impl PingTreeRouter {
             "rejected" | "declined" | "denied" => "rejected".to_string(),
             "accepted" => {
                 if success {
-                    "ping_accepted".to_string()
+                    "accepted".to_string()
                 } else {
                     "error".to_string()
                 }
@@ -368,28 +387,94 @@ impl PingTreeRouter {
     }
 
     async fn route_post(&self, pool: &PgPool, campaigns: &[Campaign]) -> Result<RoutingResult> {
-        // For post, use the campaign_id from the lead (set during ping)
-        let campaign = if let Some(campaign_id) = self.lead.campaign_id {
-            campaigns.iter().find(|c| c.id == campaign_id)
+        use crate::services::buyer_router::BuyerRouter;
+
+        // For post, prefer campaign_id from the lead but fallback to first available
+        let campaign_opt = if let Some(campaign_id) = self.lead.campaign_id {
+            campaigns.iter().find(|c| c.id == campaign_id).cloned()
         } else {
-            campaigns.first()
+            campaigns.first().cloned()
         };
 
-        if let Some(campaign) = campaign {
-            let post_id = format!("post_{}", uuid::Uuid::new_v4());
-            self.update_lead_with_post(pool, &post_id).await?;
+        if let Some(campaign) = campaign_opt {
+            // Delegate to BuyerRouter for post handling (mocked for now)
+            let buyer_router = BuyerRouter::new(
+                self.lead.clone(),
+                vec![campaign.clone()],
+                self.request_type.clone(),
+            );
+            match buyer_router.route().await {
+                Ok(bresp) => {
+                    // Persist buyer response for this post attempt (best-effort)
+                    let bresp_json = serde_json::to_value(&bresp).unwrap_or(serde_json::json!({}));
+                    let _ = sqlx::query("INSERT INTO buyer_responses (lead_id, post_id, buyer_id, campaign_id, payload, created_at) VALUES ($1, $2, $3, $4, $5, now())")
+                        .bind(self.lead.uuid)
+                        .bind(bresp.post_id.clone())
+                        .bind(Some(campaign.buyer_id))
+                        .bind(campaign.id)
+                        .bind(sqlx::types::Json(&bresp_json))
+                        .execute(pool)
+                        .await;
 
-            Ok(RoutingResult {
-                success: true,
-                status: "post_accepted".to_string(),
-                error: None,
-                promise_id: self.lead.promise_id.clone(),
-                ping_id: self.lead.ping_id.clone(),
-                post_id: Some(post_id),
-                price: None,
-                campaign_id: Some(campaign.id),
-                buyer_id: Some(campaign.buyer_id),
-            })
+                    if bresp.success && bresp.post_id.is_some() {
+                        let post_id = bresp.post_id.clone().unwrap();
+                        // Persist post acceptance
+                        self.update_lead_with_post(pool, &post_id).await?;
+
+                        Ok(RoutingResult {
+                            success: true,
+                            status: "sold".to_string(),
+                            error: None,
+                            promise_id: bresp.promise_id.clone(),
+                            ping_id: bresp.ping_id.clone(),
+                            post_id: Some(post_id),
+                            price: bresp.price,
+                            campaign_id: Some(campaign.id),
+                            buyer_id: Some(campaign.buyer_id),
+                        })
+                    } else {
+                        // Buyer rejected or errored
+                        let final_status = match bresp.status.as_str() {
+                            "rejected" => LeadStatus::Rejected,
+                            "timeout" => LeadStatus::Timeout,
+                            _ => LeadStatus::Error,
+                        };
+                        self.update_lead_status(pool, final_status.clone(), bresp.error.as_deref())
+                            .await?;
+                        Ok(RoutingResult {
+                            success: false,
+                            status: match final_status.clone() {
+                                LeadStatus::Rejected => "rejected".to_string(),
+                                LeadStatus::Timeout => "timeout".to_string(),
+                                _ => "error".to_string(),
+                            },
+                            error: bresp.error.clone(),
+                            promise_id: bresp.promise_id.clone(),
+                            ping_id: bresp.ping_id.clone(),
+                            post_id: bresp.post_id.clone(),
+                            price: bresp.price,
+                            campaign_id: Some(campaign.id),
+                            buyer_id: Some(campaign.buyer_id),
+                        })
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("BuyerRouter error during post: {}", e);
+                    self.update_lead_status(pool, LeadStatus::Error, Some("Buyer routing failed"))
+                        .await?;
+                    Ok(RoutingResult {
+                        success: false,
+                        status: "error".to_string(),
+                        error: Some(e.to_string()),
+                        promise_id: None,
+                        ping_id: None,
+                        post_id: None,
+                        price: None,
+                        campaign_id: Some(campaign.id),
+                        buyer_id: Some(campaign.buyer_id),
+                    })
+                }
+            }
         } else {
             self.update_lead_status(pool, LeadStatus::Error, Some("No campaign found for post"))
                 .await?;
@@ -422,8 +507,36 @@ impl PingTreeRouter {
             if !ping_result.success {
                 return Ok(ping_result);
             }
-            // Now send post
-            self.route_post(pool, campaigns).await
+
+            // Reload lead from database to get promise_id and campaign_id set by ping auction
+            let updated_lead = sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
+                .bind(self.lead.uuid)
+                .fetch_one(pool)
+                .await?;
+
+            // Create new router with updated lead for post routing
+            let post_router = PingTreeRouter::new(
+                updated_lead,
+                self.publisher_id,
+                self.vertical.clone(),
+                "post".to_string(),
+            );
+
+            // Route post using the updated lead (which now has promise_id and campaign_id)
+            let post_result = post_router.route_post(pool, campaigns).await?;
+
+            // Merge ping and post results
+            Ok(RoutingResult {
+                success: post_result.success,
+                status: post_result.status,
+                error: post_result.error,
+                promise_id: ping_result.promise_id.or(post_result.promise_id),
+                ping_id: ping_result.ping_id.or(post_result.ping_id),
+                post_id: post_result.post_id,
+                price: post_result.price.or(ping_result.price),
+                campaign_id: post_result.campaign_id.or(ping_result.campaign_id),
+                buyer_id: post_result.buyer_id.or(ping_result.buyer_id),
+            })
         } else {
             self.update_lead_status(
                 pool,
@@ -733,6 +846,56 @@ mod tests {
         assert_eq!(winner_id, campaign2); // Highest price wins
     }
 
+    #[test]
+    fn test_map_ping_status_to_lead_status_various() {
+        // accepted + success => accepted
+        assert_eq!(
+            PingTreeRouter::map_ping_status_to_lead_status("accepted", true),
+            "accepted"
+        );
+        // accepted + failure => error
+        assert_eq!(
+            PingTreeRouter::map_ping_status_to_lead_status("accepted", false),
+            "error"
+        );
+        // rejected => rejected
+        assert_eq!(
+            PingTreeRouter::map_ping_status_to_lead_status("rejected", false),
+            "rejected"
+        );
+        // timeout => timeout
+        assert_eq!(
+            PingTreeRouter::map_ping_status_to_lead_status("timeout", false),
+            "timeout"
+        );
+        // unknown but success => ping_accepted
+        assert_eq!(
+            PingTreeRouter::map_ping_status_to_lead_status("weirdstatus", true),
+            "ping_accepted"
+        );
+        // unknown and not success => error
+        assert_eq!(
+            PingTreeRouter::map_ping_status_to_lead_status("weirdstatus", false),
+            "error"
+        );
+    }
+
+    #[test]
+    fn test_select_winner_epsilon_tie_by_priority() {
+        let campaign1 = Uuid::new_v4();
+        let campaign2 = Uuid::new_v4();
+
+        // Prices within epsilon (0.01) should be considered tied
+        let resp1 = create_buyer_response(true, Some(100.0), "accepted");
+        let resp2 = create_buyer_response(true, Some(100.005), "accepted");
+
+        let responses = vec![(&resp1, campaign1, Some(2)), (&resp2, campaign2, Some(1))];
+
+        let (_winner, winner_id, _) = select_winner_for_test(responses);
+        // campaign2 has better (lower) priority and should win the tie
+        assert_eq!(winner_id, campaign2);
+    }
+
     // Property-based test: winner should always have highest price or best priority
     proptest! {
         #[test]
@@ -775,3 +938,35 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ping_tree_router_unit_tests.rs"]
+mod ping_tree_router_unit_tests;
+
+#[cfg(test)]
+#[path = "ping_tree_router_integration_tests.rs"]
+mod ping_tree_router_integration_tests;
+
+#[cfg(test)]
+#[path = "ping_tree_router_fullpost_tests.rs"]
+mod ping_tree_router_fullpost_tests;
+
+#[cfg(test)]
+#[path = "ping_tree_router_edge_case_tests.rs"]
+mod ping_tree_router_edge_case_tests;
+
+#[cfg(test)]
+#[path = "ping_tree_router_db_integration_tests.rs"]
+mod ping_tree_router_db_integration_tests;
+
+#[cfg(test)]
+#[path = "duplicate_post_concurrency_tests.rs"]
+mod duplicate_post_concurrency_tests;
+
+#[cfg(test)]
+#[path = "load_tests.rs"]
+mod load_tests;
+
+#[cfg(test)]
+#[path = "persistence_error_tests.rs"]
+mod persistence_error_tests;

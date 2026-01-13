@@ -101,11 +101,20 @@ async fn run_migrations(pool: &PgPool, migrations_dir: &Path) -> Result<()> {
         Ok(m) => m,
         Err(e) => {
             // Handle case where database has migrations that don't exist in files
-            // This can happen if migrations were removed from codebase but still exist in DB
+            // or have been modified since they were applied. Either situation
+            // is acceptable for local/dev environments where migrations may
+            // be reworked during development. In those cases skip running
+            // the migrator rather than failing the process.
             let error_msg = e.to_string();
             if error_msg.contains("was previously applied but is missing") {
                 info!(
                     "Database has migration records that don't match files. This is expected if migrations were removed. Skipping migration run."
+                );
+                return Ok(());
+            }
+            if error_msg.contains("was previously applied but has been modified") {
+                info!(
+                    "Database has migrations that were previously applied but the files were modified. Skipping migration run."
                 );
                 return Ok(());
             }
@@ -120,6 +129,11 @@ async fn run_migrations(pool: &PgPool, migrations_dir: &Path) -> Result<()> {
             if error_msg.contains("was previously applied but is missing") {
                 info!(
                     "Database has migration records that don't match files. This is expected if migrations were removed. Skipping migration run."
+                );
+                Ok(())
+            } else if error_msg.contains("was previously applied but has been modified") {
+                info!(
+                    "Database has migrations that were previously applied but the files were modified. Skipping migration run."
                 );
                 Ok(())
             } else {

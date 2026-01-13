@@ -88,8 +88,33 @@ else
     echo "✅ Clippy OK"
 fi
 echo ""
+# 3. Rust module references check - catch missing `mod` files early
+echo "3️⃣  Checking Rust 'mod' references exist..."
+MISSING_MODS=0
+# For each .rs file under crates/, look for `mod name;` or `pub mod name;` declarations
+while IFS= read -r file; do
+    # For each matching line in the file
+    while IFS= read -r line; do
+        mod=$(echo "$line" | sed -E 's/^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+([a-zA-Z0-9_]+);.*/\2/')
+        dir=$(dirname "$file")
+        if [ ! -f "$dir/$mod.rs" ] && [ ! -f "$dir/$mod/mod.rs" ]; then
+            echo "❌ Missing module '$mod' referenced in $file"
+            MISSING_MODS=1
+        fi
+    done < <(grep -E '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+[a-zA-Z0-9_]+;' "$file" || true)
+done < <(find crates -type f \( -name 'mod.rs' -o -path '*/src/services/*.rs' -o -path '*/src/models/mod.rs' -o -path '*/src/routes/mod.rs' -o -path '*/tests/*.rs' \) -print)
 
-# 3. Nextest config validation (if config exists)
+if [ "$MISSING_MODS" -eq 1 ]; then
+    echo "❌ One or more Rust module files referenced by 'mod' are missing."
+    echo "   Example: create the file crates/core/src/models/buyer_integration.rs or crates/core/src/models/buyer_integration/mod.rs"
+    echo "   (Local untracked files may exist; do not commit until you approve.)"
+    exit 1
+else
+    echo "✅ Rust module references OK"
+fi
+echo ""
+
+# 4. Nextest config validation (if config exists)
 if [ -f ".config/nextest.toml" ]; then
     echo "3️⃣  Validating nextest configuration..."
     if command -v cargo-nextest > /dev/null 2>&1; then
@@ -519,6 +544,88 @@ else
     echo "⚠️  Redis TLS configuration (rediss://, port 6380) not documented in code"
 fi
 echo ""
+
+    # 13. Optional security scans and dependency audits
+    echo "1️⃣3️⃣  Optional security scans (cargo-audit, cargo-deny)..."
+    if command -v cargo-audit > /dev/null 2>&1; then
+        echo "   Running cargo-audit (vulnerabilities)..."
+        if ! cargo audit; then
+            echo "⚠️  cargo-audit found issues. Review and fix vulnerabilities." || true
+        else
+            echo "✅ cargo-audit OK"
+        fi
+    else
+        echo "   cargo-audit not installed - skip (install: cargo install cargo-audit)"
+    fi
+
+    if command -v cargo-deny > /dev/null 2>&1; then
+        echo "   Running cargo-deny (policies)..."
+        if ! cargo deny check; then
+            echo "⚠️  cargo-deny reported policy issues. Review deny.toml and fixes." || true
+        else
+            echo "✅ cargo-deny OK"
+        fi
+    else
+        echo "   cargo-deny not installed - skip (install: cargo install cargo-deny)"
+    fi
+    echo ""
+
+    # 14. Optional SQLX prepare / migrations check (requires DATABASE_URL)
+    echo "1️⃣4️⃣  Optional SQLX prepare / migrations (if DATABASE_URL set)"
+    if [ -n "${DATABASE_URL:-}" ] && command -v cargo-sqlx > /dev/null 2>&1; then
+        echo "   Preparing SQLX (cargo sqlx prepare)..."
+        if ! cargo sqlx prepare -- --lib; then
+            echo "⚠️  cargo sqlx prepare failed - ensure DATABASE_URL points to a writable DB or skip this check." || true
+        else
+            echo "✅ cargo sqlx prepare OK"
+        fi
+    else
+        echo "   Skipping SQLX prepare (DATABASE_URL not set or cargo-sqlx not installed)"
+    fi
+    echo ""
+
+    # 15. Optional frontend lint/build (guarded by RUN_FRONTEND env var)
+    echo "1️⃣5️⃣  Optional frontend checks (npm lint/build - guarded by RUN_FRONTEND)"
+    if [ -f "../frontend/package.json" ] && [ "${RUN_FRONTEND:-false}" = "true" ]; then
+        echo "   Running frontend lint/build in ../frontend"
+        (cd ../frontend && npm ci && npm run lint && npm run build) || {
+            echo "⚠️  Frontend checks failed. Ensure node/npm and scripts are available." || true
+        }
+    else
+        echo "   Skipping frontend checks (set RUN_FRONTEND=true to enable)"
+    fi
+    echo ""
+
+    # 16. Shell script linting and secret detection
+    echo "1️⃣6️⃣  Shell linting and secret scanning (shellcheck, git-secrets)"
+    if command -v shellcheck > /dev/null 2>&1; then
+        echo "   Running shellcheck on scripts/*.sh"
+        shellcheck -x ./scripts/*.sh || echo "   shellcheck issues (non-fatal)"
+    else
+        echo "   shellcheck not installed - skip (install: apt install shellcheck)"
+    fi
+
+    if command -v git-secrets > /dev/null 2>&1; then
+        echo "   Running git-secrets scan"
+        git-secrets --scan || echo "   git-secrets found potential secrets (non-fatal)"
+    else
+        echo "   git-secrets not installed - skip"
+    fi
+    echo ""
+
+    # 17. Optional coverage (tarpaulin) guarded by RUN_COVERAGE
+    echo "1️⃣7️⃣  Optional coverage (cargo-tarpaulin, RUN_COVERAGE=true)"
+    if [ "${RUN_COVERAGE:-false}" = "true" ]; then
+        if command -v cargo-tarpaulin > /dev/null 2>&1; then
+            echo "   Running cargo-tarpaulin (coverage)"
+            cargo tarpaulin --out Xml || echo "   cargo-tarpaulin failed or produced no coverage"
+        else
+            echo "   cargo-tarpaulin not installed - skip"
+        fi
+    else
+        echo "   Skipping coverage (set RUN_COVERAGE=true to enable)"
+    fi
+    echo ""
 
 # Summary
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

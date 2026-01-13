@@ -15,7 +15,7 @@
 //    - test_jwt_token_with_different_secrets
 //    - test_jwt_token_expiration_validation
 //
-// 2. Integration tests (using #[sqlx::test]) - Require DATABASE_URL
+// 2. Integration tests (using #[tokio::test] with create_test_pool helper) - Require DATABASE_URL
 //    - All OTP tests
 //    - All passkey tests
 //    - User-related tests
@@ -28,9 +28,12 @@
 //
 // Run with: cargo test --test integration_auth --features otp,webauthn
 //
-// Note: Tests that require a database will be skipped in CI if DATABASE_URL is not set.
-// The sqlx::test macro will panic if DATABASE_URL is missing, which is expected behavior.
+// Note: Tests that require a database will panic if DATABASE_URL is not set, which is expected behavior.
+// The create_test_pool helper handles migrations gracefully, even if they're already applied.
 
+mod common;
+
+use common::create_test_pool;
 use leadsnebula_core::auth::{hash_password, verify_password, JwtService};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -44,10 +47,21 @@ fn load_test_env() {
     let _ = dotenv::dotenv();
 }
 
-// Helper function to create a test user
+// Helper function to create a test user with a unique email
 async fn create_test_user(pool: &PgPool, email: &str) -> Uuid {
     let user_id = Uuid::new_v4();
     let password_hash = hash_password("TestPassword123!").unwrap();
+
+    // Make email unique by appending timestamp and random UUID
+    let unique_email = format!(
+        "{}_{}_{}@test.invalid",
+        email.split('@').next().unwrap_or(email),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        Uuid::new_v4().to_string().split('-').next().unwrap()
+    );
 
     sqlx::query(
         r#"
@@ -56,7 +70,7 @@ async fn create_test_user(pool: &PgPool, email: &str) -> Uuid {
         "#,
     )
     .bind(user_id)
-    .bind(email)
+    .bind(&unique_email)
     .bind(password_hash)
     .execute(pool)
     .await
@@ -124,8 +138,11 @@ async fn test_jwt_token_with_different_secrets() {
     assert!(service2.decode(&token).is_err());
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_otp_setup_creates_secret(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "otp_test@example.com").await;
 
     // Create OTP setting
@@ -161,8 +178,11 @@ async fn test_otp_setup_creates_secret(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_otp_enable_and_disable(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "otp_enable_test@example.com").await;
 
     // Create OTP setting (disabled)
@@ -229,8 +249,11 @@ async fn test_otp_enable_and_disable(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_otp_backup_codes_storage(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "otp_backup_test@example.com").await;
 
     // Create OTP setting with backup codes
@@ -269,13 +292,16 @@ async fn test_otp_backup_codes_storage(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_passkey_credential_storage(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_passkey_credential_storage() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "passkey_test@example.com").await;
 
     // Create a test passkey credential
     let passkey_id = Uuid::new_v4();
-    let external_id = "test_credential_id_12345";
+    let external_id = format!("test_credential_id_{}", Uuid::new_v4());
     let public_key = r#"{"kty":"EC","crv":"P-256","x":"test_x","y":"test_y"}"#;
     let sign_count = 0i32;
     let name = "Test Passkey";
@@ -292,7 +318,7 @@ async fn test_passkey_credential_storage(pool: PgPool) -> sqlx::Result<()> {
     .bind(passkey_id)
     .bind(user_id)
     .bind(user_id)
-    .bind(external_id)
+    .bind(&external_id)
     .bind(public_key)
     .bind(sign_count)
     .bind(name)
@@ -305,7 +331,7 @@ async fn test_passkey_credential_storage(pool: PgPool) -> sqlx::Result<()> {
         "SELECT name FROM webauthn_credentials WHERE platform_user_id = $1 AND external_id = $2",
     )
     .bind(user_id)
-    .bind(external_id)
+    .bind(&external_id)
     .fetch_optional(&pool)
     .await?
     .flatten();
@@ -324,14 +350,17 @@ async fn test_passkey_credential_storage(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_passkey_max_limit_enforcement(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "passkey_limit_test@example.com").await;
 
     // Create 3 passkeys (max limit)
     for i in 0..3 {
         let passkey_id = Uuid::new_v4();
-        let external_id = format!("test_credential_id_{}", i);
+        let external_id = format!("test_credential_id_{}_{}", i, Uuid::new_v4());
         let public_key = r#"{"kty":"EC","crv":"P-256","x":"test_x","y":"test_y"}"#;
 
         sqlx::query(
@@ -364,8 +393,11 @@ async fn test_passkey_max_limit_enforcement(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_user_password_verification(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_user_password_verification() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "password_test@example.com").await;
 
     // Retrieve stored password hash
@@ -384,8 +416,11 @@ async fn test_user_password_verification(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn test_user_status_affects_authentication(pool: PgPool) -> sqlx::Result<()> {
+#[tokio::test]
+async fn test_user_status_affects_authentication() -> sqlx::Result<()> {
+    let pool = create_test_pool()
+        .await
+        .expect("Failed to create test pool");
     let user_id = create_test_user(&pool, "status_test@example.com").await;
 
     // Verify user is active

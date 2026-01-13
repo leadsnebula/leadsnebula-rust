@@ -1,9 +1,15 @@
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
 };
 use anyhow::anyhow;
 use base64::{engine::general_purpose, Engine as _};
+use hmac::{Hmac, Mac};
+use pbkdf2::pbkdf2;
+use rand::RngCore;
+use serde_json::json;
+use sha1::Sha1;
+use sha2::Sha256;
 
 pub struct EncryptionService {
     cipher: Aes256Gcm,
@@ -20,14 +26,18 @@ impl EncryptionService {
     }
 
     pub fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        // Legacy simple envelope: base64(nonce + ciphertext_with_tag)
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let nonce = Nonce::from_slice(&nonce);
+
         let ciphertext = self
             .cipher
-            .encrypt(&nonce, plaintext.as_bytes())
+            .encrypt(nonce, plaintext.as_bytes())
             .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?;
 
-        // Combine nonce and ciphertext: nonce (12 bytes) + ciphertext
-        let mut combined = nonce.to_vec();
+        // Compose combined blob: nonce + ciphertext_with_tag
+        let mut combined = nonce.as_slice().to_vec();
         combined.extend_from_slice(&ciphertext);
 
         Ok(general_purpose::STANDARD.encode(combined))
@@ -47,6 +57,106 @@ impl EncryptionService {
             .cipher
             .decrypt(nonce, ciphertext_bytes)
             .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
+        Ok(String::from_utf8(plaintext)?)
+    }
+
+    // Derive a 32-byte AES key using PBKDF2-HMAC-SHA1 to match Rails ActiveSupport::KeyGenerator
+    // iterations: 65536 (as used in Ruby code)
+    pub fn derive_key_from_secret(secret: &str, salt: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        // Use pbkdf2 with HMAC-SHA1 to match Rails' ActiveSupport::KeyGenerator default
+        pbkdf2::<Hmac<Sha1>>(secret.as_bytes(), salt.as_bytes(), 65536, &mut out);
+        out
+    }
+
+    // Encrypt into a Rails-like JSON envelope: {"p":"<base64_payload>","h":{"iv":"...","at":"...","c":false}}
+    // For deterministic: derive IV from HMAC-SHA256(payload, key) to produce deterministic nonce (12 bytes)
+    pub fn encrypt_envelope(
+        key_bytes: &[u8],
+        plaintext: &str,
+        deterministic: bool,
+    ) -> anyhow::Result<String> {
+        if key_bytes.len() != 32 {
+            return Err(anyhow!("Encryption key must be 32 bytes"));
+        }
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key_bytes));
+
+        // Determine IV
+        let iv: [u8; 12] = if deterministic {
+            // HMAC-SHA256 of plaintext with key_bytes, take first 12 bytes
+            type HmacSha256 = Hmac<Sha256>;
+            let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(key_bytes)
+                .map_err(|e| anyhow!(format!("HMAC init error: {:?}", e)))?;
+            mac.update(plaintext.as_bytes());
+            let result = mac.finalize().into_bytes();
+            let mut iv = [0u8; 12];
+            iv.copy_from_slice(&result[..12]);
+            iv
+        } else {
+            let mut iv = [0u8; 12];
+            OsRng.fill_bytes(&mut iv);
+            iv
+        };
+
+        let nonce = Nonce::from_slice(&iv);
+        let ciphertext_with_tag = cipher
+            .encrypt(nonce, plaintext.as_bytes())
+            .map_err(|e| anyhow!(format!("encrypt failed: {:?}", e)))?;
+
+        // AES-GCM appends auth tag at the end; split it off
+        if ciphertext_with_tag.len() < 16 {
+            return Err(anyhow!("ciphertext too short"));
+        }
+        let tag_pos = ciphertext_with_tag.len() - 16;
+        let payload = &ciphertext_with_tag[..tag_pos];
+        let tag = &ciphertext_with_tag[tag_pos..];
+
+        let envelope = json!({
+            "p": general_purpose::STANDARD.encode(payload),
+            "h": {
+                "iv": general_purpose::STANDARD.encode(iv),
+                "at": general_purpose::STANDARD.encode(tag),
+                "c": false
+            }
+        });
+
+        Ok(envelope.to_string())
+    }
+
+    pub fn decrypt_envelope(key_bytes: &[u8], envelope: &str) -> anyhow::Result<String> {
+        let v: serde_json::Value = serde_json::from_str(envelope)?;
+        let payload_b64 = v
+            .get("p")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("missing payload"))?;
+        let headers = v.get("h").ok_or_else(|| anyhow!("missing headers"))?;
+        let iv_b64 = headers
+            .get("iv")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("missing iv"))?;
+        let at_b64 = headers
+            .get("at")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("missing at"))?;
+
+        let payload = general_purpose::STANDARD.decode(payload_b64)?;
+        let iv = general_purpose::STANDARD.decode(iv_b64)?;
+        let tag = general_purpose::STANDARD.decode(at_b64)?;
+
+        if iv.len() != 12 || tag.len() != 16 {
+            return Err(anyhow!("invalid iv/tag lengths"));
+        }
+
+        // Reconstruct ciphertext_with_tag
+        let mut ciphertext_with_tag = payload.clone();
+        ciphertext_with_tag.extend_from_slice(&tag);
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key_bytes));
+        let nonce = Nonce::from_slice(&iv);
+        let plaintext = cipher
+            .decrypt(nonce, &ciphertext_with_tag[..])
+            .map_err(|e| anyhow!(format!("decrypt failed: {:?}", e)))?;
         Ok(String::from_utf8(plaintext)?)
     }
 }

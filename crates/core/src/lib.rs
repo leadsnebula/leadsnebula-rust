@@ -1,3 +1,17 @@
+#![cfg_attr(
+    test,
+    allow(
+        unused_imports,
+        dead_code,
+        unused_variables,
+        clippy::module_inception,
+        clippy::needless_borrows_for_generic_args,
+        clippy::assertions_on_constants,
+        clippy::bool_assert_comparison,
+        clippy::unnecessary_cast
+    )
+)]
+
 pub mod auth;
 pub mod cache;
 pub mod email;
@@ -10,6 +24,9 @@ pub mod redis;
 pub mod rls;
 pub mod services;
 pub mod ssm;
+
+#[cfg(test)]
+mod encryption_compatibility_tests;
 
 #[cfg(feature = "otp")]
 pub mod otp;
