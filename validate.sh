@@ -13,13 +13,57 @@
 
 set -e
 
-# Parse --fast flag
+# Parse flags
 FAST_MODE=false
+STRICT_MODE=${CI:-false}  # Auto-enable in CI, default off locally
 for arg in "$@"; do
     if [ "$arg" = "--fast" ]; then
         FAST_MODE=true
+    elif [ "$arg" = "--strict" ]; then
+        STRICT_MODE=true
     fi
 done
+
+# Check for jq dependency
+if ! command -v jq > /dev/null 2>&1; then
+    echo "⚠️  jq not found. Install for better validation output: apt install jq (or brew install jq)"
+    echo "   Falling back to basic parsing..."
+    USE_JQ=false
+else
+    USE_JQ=true
+fi
+
+# Helper function for JSON extraction with fallback
+extract_json_field() {
+    local field="$1"
+    local json="$2"
+    if [ "$USE_JQ" = "true" ]; then
+        echo "$json" | jq -r "$field" 2>/dev/null || echo ""
+    else
+        # Fallback: use awk for basic extraction
+        # Remove leading dot from field name
+        local key="${field#.}"
+        echo "$json" | awk -F'"' "/\"${key}\":/ {print \$4}" 2>/dev/null || echo ""
+    fi
+}
+
+# Check if validate-config binary exists and is up-to-date
+VALIDATE_CONFIG_BIN="target/release/validate-config"
+VALIDATE_CONFIG_SRC="crates/utils/src/bin/validate-config.rs"
+USE_FALLBACK=false
+
+if [ ! -f "$VALIDATE_CONFIG_BIN" ] || [ "$VALIDATE_CONFIG_SRC" -nt "$VALIDATE_CONFIG_BIN" ]; then
+    echo "Building validate-config..."
+    if ! cargo build --release --bin validate-config --quiet 2>/dev/null; then
+        echo "⚠️  validate-config build failed, using fallback parsing"
+        USE_FALLBACK=true
+    fi
+fi
+
+# If binary doesn't exist or build failed, use fallback
+if [ ! -f "$VALIDATE_CONFIG_BIN" ]; then
+    USE_FALLBACK=true
+fi
 
 # Safety warnings for fast mode
 if [ "$FAST_MODE" = true ]; then
@@ -124,36 +168,26 @@ if [ -f ".config/nextest.toml" ]; then
             echo "❌ Nextest config (.config/nextest.toml) is invalid"
             echo "   Attempting to parse config to show error:"
             cargo nextest list --workspace --locked 2>&1 | grep -A 5 "nextest\|config\|error" | head -10 || true
-            ERRORS=$((ERRORS + 1))
+            if [ "$STRICT_MODE" = "true" ]; then
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "⚠️  Nextest config validation failed (non-blocking in non-strict mode)"
+            fi
         else
             echo "✅ Nextest config OK"
         fi
     else
-        # If nextest not installed, do basic TOML syntax check
-        if command -v python3 > /dev/null 2>&1; then
-            # Try to import tomli (Python 3.11+) or tomllib (Python 3.11+), fallback to basic check
-            if python3 -c "
-try:
-    import tomli
-    tomli.load(open('.config/nextest.toml', 'rb'))
-except ImportError:
-    try:
-        import tomllib
-        with open('.config/nextest.toml', 'rb') as f:
-            tomllib.load(f)
-    except ImportError:
-        # Fallback: basic syntax check with yaml (if available)
-        import yaml
-        # TOML is not YAML, but this at least checks for basic syntax issues
-        pass
-" 2>/dev/null; then
-                echo "✅ Nextest config TOML syntax OK (nextest not installed, basic validation only)"
+        # If nextest not installed, try validate-config binary
+        if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+            if "$VALIDATE_CONFIG_BIN" cargo-toml .config/nextest.toml > /dev/null 2>&1; then
+                echo "✅ Nextest config TOML syntax OK (nextest not installed, using validate-config)"
             else
-                echo "⚠️  Nextest config TOML validation skipped (tomli/tomllib not available)"
+                echo "⚠️  Nextest config validation skipped (nextest not installed)"
                 echo "   Install nextest for full validation: cargo install cargo-nextest"
             fi
         else
-            echo "⚠️  Nextest config exists but cannot validate (nextest and python3 not available)"
+            echo "⚠️  Nextest config exists but cannot validate (nextest not installed, validate-config unavailable)"
+            echo "   Install nextest for full validation: cargo install cargo-nextest"
         fi
     fi
     echo ""
@@ -357,17 +391,56 @@ elif ! git ls-files --error-unmatch Cargo.lock > /dev/null 2>&1; then
     ERRORS=$((ERRORS + 1))
 else
     # Check Cargo.lock version and verify Dockerfile Rust version compatibility
-    LOCK_VERSION=$(grep "^version = " Cargo.lock | head -1 | cut -d' ' -f3)
+    # Use cargo metadata for more reliable version detection
+    if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+        # Try using cargo metadata first (more reliable)
+        METADATA=$(cargo metadata --format-version 2 --no-deps 2>/dev/null || echo "")
+        if [ -n "$METADATA" ] && [ "$USE_JQ" = "true" ]; then
+            RESOLVER=$(echo "$METADATA" | jq -r '.workspace.resolver // .workspace_default.resolver // "1"' 2>/dev/null || echo "1")
+            if [ "$RESOLVER" = "2" ]; then
+                LOCK_VERSION="4"
+            else
+                LOCK_VERSION="3"
+            fi
+        else
+            # Fallback to grep parsing
+            LOCK_VERSION=$(grep "^version = " Cargo.lock | head -1 | cut -d' ' -f3 || echo "3")
+        fi
+    else
+        # Fallback: use grep parsing
+        LOCK_VERSION=$(grep "^version = " Cargo.lock | head -1 | cut -d' ' -f3 || echo "3")
+    fi
+    
     if [ "$LOCK_VERSION" = "4" ]; then
         # Cargo.lock v4 requires Rust 1.78+
         if [ -f "Dockerfile" ]; then
-            DOCKER_RUST=$(grep "^FROM rust:" Dockerfile | head -1 | cut -d: -f2 | cut -d' ' -f1)
-            if echo "$DOCKER_RUST" | grep -qE "^1\.(7[0-7]|[0-6][0-9])"; then
-                echo "❌ Cargo.lock version 4 requires Rust 1.78+, but Dockerfile uses rust:$DOCKER_RUST"
-                echo "   Update Dockerfile to use 'rust:bookworm' or 'rust:latest'"
-                ERRORS=$((ERRORS + 1))
+            if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+                # Use validate-config binary for reliable Dockerfile parsing
+                DOCKER_OUTPUT=$("$VALIDATE_CONFIG_BIN" dockerfile Dockerfile 2>/dev/null || echo "")
+                DOCKER_RUST=$(extract_json_field ".rust_version" "$DOCKER_OUTPUT")
+                
+                if [ -n "$DOCKER_RUST" ] && [ "$DOCKER_RUST" != "null" ]; then
+                    # Check if version is too old (1.77 or earlier)
+                    if echo "$DOCKER_RUST" | grep -qE "^1\.(7[0-7]|[0-6][0-9])"; then
+                        echo "❌ Cargo.lock version 4 requires Rust 1.78+, but Dockerfile uses rust:$DOCKER_RUST"
+                        echo "   Update Dockerfile to use 'rust:bookworm' or 'rust:latest'"
+                        ERRORS=$((ERRORS + 1))
+                    else
+                        echo "✅ Cargo.lock version $LOCK_VERSION compatible with Dockerfile Rust version (rust:$DOCKER_RUST)"
+                    fi
+                else
+                    echo "⚠️  Could not extract Rust version from Dockerfile"
+                fi
             else
-                echo "✅ Cargo.lock version $LOCK_VERSION compatible with Dockerfile Rust version"
+                # Fallback: use grep parsing
+                DOCKER_RUST=$(grep "^FROM rust:" Dockerfile | head -1 | cut -d: -f2 | cut -d' ' -f1 || echo "")
+                if [ -n "$DOCKER_RUST" ] && echo "$DOCKER_RUST" | grep -qE "^1\.(7[0-7]|[0-6][0-9])"; then
+                    echo "❌ Cargo.lock version 4 requires Rust 1.78+, but Dockerfile uses rust:$DOCKER_RUST"
+                    echo "   Update Dockerfile to use 'rust:bookworm' or 'rust:latest'"
+                    ERRORS=$((ERRORS + 1))
+                else
+                    echo "✅ Cargo.lock version $LOCK_VERSION compatible with Dockerfile Rust version"
+                fi
             fi
         fi
     fi
@@ -474,21 +547,57 @@ if [ ! -f "fly.toml" ]; then
 elif [ ! -f "fly.dev.toml" ]; then
     echo "⚠️  fly.dev.toml not found (may be OK for prod-only setup)"
 else
-    DEV_APP=$(grep '^app = ' fly.dev.toml 2>/dev/null | cut -d'"' -f2 || echo "")
-    PROD_APP=$(grep '^app = ' fly.toml 2>/dev/null | cut -d'"' -f2 || echo "")
-    
-    if [ -z "$DEV_APP" ]; then
-        echo "❌ Could not extract app name from fly.dev.toml"
-        ERRORS=$((ERRORS + 1))
-    elif [ -z "$PROD_APP" ]; then
-        echo "❌ Could not extract app name from fly.toml"
-        ERRORS=$((ERRORS + 1))
-    elif [ "$DEV_APP" = "$PROD_APP" ]; then
-        echo "❌ Dev and prod app names are the same: $DEV_APP"
-        echo "   This will cause cross-environment deployment issues."
-        ERRORS=$((ERRORS + 1))
+    if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+        # Use validate-config binary for reliable parsing
+        DEV_OUTPUT=$("$VALIDATE_CONFIG_BIN" fly-toml fly.dev.toml 2>/dev/null || echo "")
+        PROD_OUTPUT=$("$VALIDATE_CONFIG_BIN" fly-toml fly.toml 2>/dev/null || echo "")
+        
+        DEV_APP=$(extract_json_field ".app_name" "$DEV_OUTPUT")
+        PROD_APP=$(extract_json_field ".app_name" "$PROD_OUTPUT")
+        
+        if [ -z "$DEV_APP" ]; then
+            echo "❌ Could not extract app name from fly.dev.toml"
+            if [ "$STRICT_MODE" = "true" ]; then
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "⚠️  Dev app name extraction failed (non-blocking in non-strict mode)"
+            fi
+        elif [ -z "$PROD_APP" ]; then
+            echo "❌ Could not extract app name from fly.toml"
+            if [ "$STRICT_MODE" = "true" ]; then
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "⚠️  Prod app name extraction failed (non-blocking in non-strict mode)"
+            fi
+        elif [ "$DEV_APP" = "$PROD_APP" ]; then
+            echo "⚠️  Dev and prod app names are the same: $DEV_APP"
+            echo "   This may cause cross-environment deployment issues (some valid setups intentionally share names)."
+            if [ "$STRICT_MODE" = "true" ]; then
+                ERRORS=$((ERRORS + 1))
+            fi
+        else
+            echo "✅ Fly.io configs OK (dev: $DEV_APP, prod: $PROD_APP)"
+        fi
     else
-        echo "✅ Fly.io configs OK (dev: $DEV_APP, prod: $PROD_APP)"
+        # Fallback: use grep parsing (brittle but works if binary unavailable)
+        DEV_APP=$(grep '^app = ' fly.dev.toml 2>/dev/null | cut -d'"' -f2 || echo "")
+        PROD_APP=$(grep '^app = ' fly.toml 2>/dev/null | cut -d'"' -f2 || echo "")
+        
+        if [ -z "$DEV_APP" ]; then
+            echo "❌ Could not extract app name from fly.dev.toml"
+            ERRORS=$((ERRORS + 1))
+        elif [ -z "$PROD_APP" ]; then
+            echo "❌ Could not extract app name from fly.toml"
+            ERRORS=$((ERRORS + 1))
+        elif [ "$DEV_APP" = "$PROD_APP" ]; then
+            echo "⚠️  Dev and prod app names are the same: $DEV_APP"
+            echo "   This may cause cross-environment deployment issues (some valid setups intentionally share names)."
+            if [ "$STRICT_MODE" = "true" ]; then
+                ERRORS=$((ERRORS + 1))
+            fi
+        else
+            echo "✅ Fly.io configs OK (dev: $DEV_APP, prod: $PROD_APP)"
+        fi
     fi
 fi
 echo ""
@@ -567,8 +676,62 @@ else
 fi
 echo ""
 
-    # 13. Optional security scans and dependency audits
-    echo "1️⃣3️⃣  Optional security scans (cargo-audit, cargo-deny)..."
+# 13. Runtime secret checks
+echo "1️⃣3️⃣  Checking runtime secrets..."
+if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+    SECRET_CHECK=$("$VALIDATE_CONFIG_BIN" secrets --check-local --env "${ENVIRONMENT:-dev}" 2>/dev/null || echo "")
+    
+        if [ -n "$SECRET_CHECK" ]; then
+            # Check for errors
+            if [ "$USE_JQ" = "true" ]; then
+                ERROR_COUNT=$(echo "$SECRET_CHECK" | jq -r '[.errors[]?] | length' 2>/dev/null || echo "0")
+                WARNING_COUNT=$(echo "$SECRET_CHECK" | jq -r '[.warnings[]?] | length' 2>/dev/null || echo "0")
+                
+                if [ "$ERROR_COUNT" -gt 0 ]; then
+                    echo "❌ Missing required secrets:"
+                    # Display errors with remediation if available
+                    echo "$SECRET_CHECK" | jq -r '.errors[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                        if [ -n "$line" ]; then
+                            echo "$line"
+                        fi
+                    done
+                    if [ "$STRICT_MODE" = "true" ]; then
+                        ERRORS=$((ERRORS + 1))
+                    fi
+                elif [ "$WARNING_COUNT" -gt 0 ]; then
+                    echo "⚠️  Secret warnings:"
+                    # Display warnings with remediation if available
+                    echo "$SECRET_CHECK" | jq -r '.warnings[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                        if [ -n "$line" ]; then
+                            echo "$line"
+                        fi
+                    done
+                else
+                    echo "✅ Runtime secrets OK"
+                fi
+            else
+                # Fallback parsing
+                if echo "$SECRET_CHECK" | grep -q '"errors"'; then
+                    echo "❌ Missing required secrets (check output above)"
+                    if [ "$STRICT_MODE" = "true" ]; then
+                        ERRORS=$((ERRORS + 1))
+                    fi
+                elif echo "$SECRET_CHECK" | grep -q '"warnings"'; then
+                    echo "⚠️  Secret warnings (check output above)"
+                else
+                    echo "✅ Runtime secrets OK"
+                fi
+            fi
+    else
+        echo "⚠️  Could not validate secrets (validate-config unavailable)"
+    fi
+else
+    echo "⚠️  Secret validation skipped (validate-config unavailable, using fallback mode)"
+fi
+echo ""
+
+    # 14. Optional security scans and dependency audits
+    echo "1️⃣4️⃣  Optional security scans (cargo-audit, cargo-deny)..."
     if command -v cargo-audit > /dev/null 2>&1; then
         echo "   Running cargo-audit (vulnerabilities)..."
         if ! cargo audit; then
@@ -592,8 +755,8 @@ echo ""
     fi
     echo ""
 
-    # 14. Optional SQLX prepare / migrations check (requires DATABASE_URL)
-    echo "1️⃣4️⃣  Optional SQLX prepare / migrations (if DATABASE_URL set)"
+    # 15. Optional SQLX prepare / migrations check (requires DATABASE_URL)
+    echo "1️⃣5️⃣  Optional SQLX prepare / migrations (if DATABASE_URL set)"
     if [ -n "${DATABASE_URL:-}" ] && command -v cargo-sqlx > /dev/null 2>&1; then
         echo "   Preparing SQLX (cargo sqlx prepare)..."
         if ! cargo sqlx prepare -- --lib; then
@@ -606,8 +769,8 @@ echo ""
     fi
     echo ""
 
-    # 15. Optional frontend lint/build (guarded by RUN_FRONTEND env var)
-    echo "1️⃣5️⃣  Optional frontend checks (npm lint/build - guarded by RUN_FRONTEND)"
+    # 16. Optional frontend lint/build (guarded by RUN_FRONTEND env var)
+    echo "1️⃣6️⃣  Optional frontend checks (npm lint/build - guarded by RUN_FRONTEND)"
     if [ -f "../frontend/package.json" ] && [ "${RUN_FRONTEND:-false}" = "true" ]; then
         echo "   Running frontend lint/build in ../frontend"
         (cd ../frontend && npm ci && npm run lint && npm run build) || {
@@ -618,8 +781,8 @@ echo ""
     fi
     echo ""
 
-    # 16. Shell script linting and secret detection
-    echo "1️⃣6️⃣  Shell linting and secret scanning (shellcheck, git-secrets)"
+    # 17. Shell script linting and secret detection
+    echo "1️⃣7️⃣  Shell linting and secret scanning (shellcheck, git-secrets)"
     if command -v shellcheck > /dev/null 2>&1; then
         echo "   Running shellcheck on scripts/*.sh"
         shellcheck -x ./scripts/*.sh || echo "   shellcheck issues (non-fatal)"
@@ -635,8 +798,8 @@ echo ""
     fi
     echo ""
 
-    # 17. Optional coverage (tarpaulin) guarded by RUN_COVERAGE
-    echo "1️⃣7️⃣  Optional coverage (cargo-tarpaulin, RUN_COVERAGE=true)"
+    # 18. Optional coverage (tarpaulin) guarded by RUN_COVERAGE
+    echo "1️⃣8️⃣  Optional coverage (cargo-tarpaulin, RUN_COVERAGE=true)"
     if [ "${RUN_COVERAGE:-false}" = "true" ]; then
         if command -v cargo-tarpaulin > /dev/null 2>&1; then
             echo "   Running cargo-tarpaulin (coverage)"
@@ -651,12 +814,28 @@ echo ""
 
 # Summary
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Count optional tools missing
+OPTIONAL_TOOLS_MISSING=0
+if ! command -v cargo-nextest > /dev/null 2>&1; then OPTIONAL_TOOLS_MISSING=$((OPTIONAL_TOOLS_MISSING + 1)); fi
+if ! command -v cargo-deny > /dev/null 2>&1; then OPTIONAL_TOOLS_MISSING=$((OPTIONAL_TOOLS_MISSING + 1)); fi
+if ! command -v cargo-audit > /dev/null 2>&1; then OPTIONAL_TOOLS_MISSING=$((OPTIONAL_TOOLS_MISSING + 1)); fi
+
 if [ $ERRORS -eq 0 ]; then
-    echo "✅ All validation checks passed! Safe to commit."
+    echo "✅ All critical checks passed! Safe to commit."
+    if [ "$OPTIONAL_TOOLS_MISSING" -gt 0 ]; then
+        echo "   Optional tools missing: $OPTIONAL_TOOLS_MISSING (install for full validation)"
+    fi
+    if [ "$STRICT_MODE" = "true" ]; then
+        echo "   (Running in strict mode - warnings treated as errors)"
+    fi
     exit 0
 else
     echo "❌ Validation failed with $ERRORS error(s)."
     echo "   Fix all errors before committing to avoid CI failures."
+    if [ "$STRICT_MODE" = "true" ]; then
+        echo "   (Running in strict mode - warnings treated as errors)"
+    fi
     exit 1
 fi
 

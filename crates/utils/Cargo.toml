@@ -77,6 +77,10 @@ path = "src/bin/apply-single-migration.rs"
 name = "verify-email-index"
 path = "src/bin/verify-email-index.rs"
 
+[[bin]]
+name = "validate-config"
+path = "src/bin/validate-config.rs"
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
@@ -95,4 +99,6 @@ hex = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
+serde_yaml = "0.9"
 

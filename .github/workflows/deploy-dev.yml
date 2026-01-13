@@ -238,6 +238,12 @@ jobs:
 
       - name: Deploy to Fly.io Dev
         run: |
+          # NOTE: --skip-tests flag (planned for Phase 3)
+          # This flag would be manual-only for hotfixes after local validation.
+          # It would skip CI tests but requires local validate.sh/autotests.sh to pass first.
+          # This is a safety mechanism for rapid hotfix deployments when full CI is not needed.
+          # Implementation: Add --skip-tests input to workflow_dispatch, then conditionally skip test jobs.
+          
           VERIFY_APP=$(grep '^app = ' fly.dev.toml | cut -d'"' -f2)
           if [ "$VERIFY_APP" != "${{ env.APP_NAME }}" ]; then
             echo "ERROR: App name mismatch detected before deployment"

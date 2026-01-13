@@ -1,0 +1,29 @@
+name: 'Setup sccache'
+description: 'Install and configure sccache for Rust compilation caching'
+inputs:
+  # No inputs needed - sccache setup is standard
+runs:
+  using: 'composite'
+  steps:
+    - name: Install sccache
+      shell: bash
+      run: |
+        if ! command -v sccache &> /dev/null; then
+          cargo install sccache --locked || true
+        fi
+
+    - name: Cache sccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/sccache
+        key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-sccache-
+
+    - name: Set sccache wrapper
+      shell: bash
+      run: |
+        if command -v sccache >/dev/null 2>&1; then
+          echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
+          echo "Using sccache at $(which sccache)"
+        fi

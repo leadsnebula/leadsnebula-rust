@@ -8,6 +8,14 @@ cd "$ROOT_DIR"
 LOGDIR="$ROOT_DIR/autotest-logs"
 mkdir -p "$LOGDIR"
 
+# Parse --strict flag (optional, default off)
+STRICT_MODE=${STRICT_MODE:-false}
+for arg in "$@"; do
+    if [ "$arg" = "--strict" ]; then
+        STRICT_MODE=true
+    fi
+done
+
 declare -A status
 
 run_step() {
@@ -37,16 +45,57 @@ run_step "fmt-check" cargo fmt --all -- --check || true
 # 2) Lint (clippy)
 run_step "clippy" bash -lc 'cargo clippy --all-targets --all-features -- -D warnings' || true
 
-# 3) Ensure cargo-nextest is installed
-if ! command -v cargo-nextest &>/dev/null; then
-  echo "cargo-nextest not found; installing (may take a minute)..."
-  cargo install cargo-nextest --locked || true
+# 3) Pre-tests validation (config and secrets check)
+echo "==> Running pre-tests validation..."
+VALIDATE_CONFIG_BIN="target/release/validate-config"
+VALIDATE_CONFIG_SRC="crates/utils/src/bin/validate-config.rs"
+
+# Build validate-config if needed
+if [ ! -f "$VALIDATE_CONFIG_BIN" ] || [ "$VALIDATE_CONFIG_SRC" -nt "$VALIDATE_CONFIG_BIN" ]; then
+  echo "Building validate-config..."
+  cargo build --release --bin validate-config --quiet 2>/dev/null || true
 fi
 
-# 4) Run workspace tests with nextest
-run_step "workspace-tests" bash -lc 'cargo nextest run --workspace --all-features --retries 2' || true
+# Run config validation (non-blocking)
+if [ -f "$VALIDATE_CONFIG_BIN" ]; then
+  if [ -f "fly.dev.toml" ]; then
+    "$VALIDATE_CONFIG_BIN" fly-toml fly.dev.toml > "$LOGDIR/validate-config.log" 2>&1 || true
+  fi
+  
+  # Check secrets if .env.local exists
+  if [ -f ".env.local" ]; then
+    STRICT_FLAG=""
+    if [ "$STRICT_MODE" = "true" ]; then
+      STRICT_FLAG="--strict"
+    fi
+    "$VALIDATE_CONFIG_BIN" secrets --check-local $STRICT_FLAG >> "$LOGDIR/validate-config.log" 2>&1 || true
+  fi
+  echo "Pre-tests validation logged to $LOGDIR/validate-config.log"
+else
+  echo "validate-config binary not available, skipping pre-tests validation"
+fi
+echo ""
 
-# 5) Integration tests requiring a database
+# 4) Ensure cargo-nextest is installed or use fallback
+if ! command -v cargo-nextest &>/dev/null; then
+  echo "cargo-nextest not found; attempting to install (may take a minute)..."
+  cargo install cargo-nextest --locked || {
+    echo "⚠️  cargo-nextest installation failed, using cargo test fallback"
+    USE_NEXTEST=false
+  }
+fi
+
+USE_NEXTEST=${USE_NEXTEST:-true}
+
+# 5) Run workspace tests with nextest or fallback
+if [ "$USE_NEXTEST" = "true" ] && command -v cargo-nextest &>/dev/null; then
+  run_step "workspace-tests" bash -lc 'cargo nextest run --workspace --all-features --retries 2' || true
+else
+  echo "Using cargo test (nextest not available)"
+  run_step "workspace-tests" bash -lc 'cargo test --quiet --color always --workspace --all-features' || true
+fi
+
+# 6) Integration tests requiring a database
 # Prefer DATABASE_URL from .env.local, then environment. Do NOT start Docker here.
 DB_URL=""
 if [ -f .env.local ]; then
@@ -93,7 +142,7 @@ else
   status["async-persistence-tests"]="skipped"
 fi
 
-# 6) Coverage (optional but run by default if cargo-llvm-cov is installed)
+# 7) Coverage (optional but run by default if cargo-llvm-cov is installed)
 if [ "${SKIP_COVERAGE:-0}" != "1" ]; then
   if ! command -v cargo-llvm-cov &>/dev/null; then
     echo "cargo-llvm-cov not found; installing..."

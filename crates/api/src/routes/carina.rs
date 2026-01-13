@@ -1209,7 +1209,9 @@ async fn create_lead(
                     let env_clone = state.config.environment.clone();
                     let lead_uuid_clone = lead_uuid;
 
-                    tokio::spawn(async move {
+                    let ping_id_for_log = ping_id_val.clone();
+                    let lead_uuid_for_log = lead_uuid_clone;
+                    let handle = tokio::spawn(async move {
                         if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND ping_id = $2 AND response_payload_encrypted IS NULL")
                                 .bind(lead_uuid_clone)
                                 .bind(ping_id_val)
@@ -1239,6 +1241,24 @@ async fn create_lead(
                                     }
                                 }
                             }
+                    });
+                    // Log errors if task panics (fire-and-forget, but log for observability)
+                    tokio::spawn(async move {
+                        if let Err(e) = handle.await {
+                            tracing::error!(
+                                "Payload encryption task panicked for lead {} ping_id {}: {:?}",
+                                lead_uuid_for_log,
+                                ping_id_for_log,
+                                e
+                            );
+                            #[cfg(feature = "sentry")]
+                            {
+                                sentry::capture_message(
+                                    &format!("Payload encryption task panicked: {:?}", e),
+                                    sentry::Level::Error,
+                                );
+                            }
+                        }
                     });
                 }
             }

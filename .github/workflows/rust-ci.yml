@@ -21,31 +21,16 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install sccache
-        run: |
-          if ! command -v sccache &> /dev/null; then
-            cargo install sccache --locked || true
-          fi
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-
-
-      - name: Set sccache wrapper
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
-            echo "Using sccache at $(which sccache)"
-          fi
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
+
+      - name: Build validate-config binary
+        run: cargo build --release --bin validate-config
 
       - name: Run cargo fmt check
         run: cargo fmt --all -- --check
@@ -80,35 +65,30 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install sccache
-        run: |
-          if ! command -v sccache &> /dev/null; then
-            cargo install sccache --locked || true
-          fi
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-
-
-      - name: Set sccache wrapper
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
-            echo "Using sccache at $(which sccache)"
-          fi
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
 
+      - name: Build validate-config binary
+        run: cargo build --release --bin validate-config
+
+      - name: Cache cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-nextest-${{ runner.os }}-
+
       - name: Install cargo-nextest
         run: |
-          if ! command -v cargo-nextest &> /dev/null; then
+          if [ -f ~/.cargo/bin/cargo-nextest ]; then
+            echo "Using cached cargo-nextest"
+          elif ! command -v cargo-nextest &> /dev/null; then
             cargo install cargo-nextest --locked
           fi
 
@@ -197,26 +177,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install sccache
-        run: |
-          if ! command -v sccache &> /dev/null; then
-            cargo install sccache --locked || true
-          fi
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-
-
-      - name: Set sccache wrapper
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
-            echo "Using sccache at $(which sccache)"
-          fi
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -232,16 +194,16 @@ jobs:
       - name: Run integration tests
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
-          RUST_TEST_THREADS: 1
         run: |
           # Run integration tests with nextest for faster execution
           # Run health endpoint tests
           cargo nextest run --test integration_health --locked --all-features \
             --retries 2 || \
           cargo test --test integration_health --locked --all-features
-          # Run authentication integration tests sequentially to avoid database conflicts
-          # sqlx::test creates/drops test databases which can conflict when run in parallel
-          cargo test --test integration_auth --locked --all-features -- --test-threads=1
+          # Run authentication integration tests
+          # Note: sqlx::test handles database isolation automatically, so parallel execution is safe
+          # If you encounter database conflicts locally, test with: cargo test --test integration_auth -- --test-threads=4
+          cargo test --test integration_auth --locked --all-features
 
   build:
     name: Build Release
@@ -255,29 +217,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install sccache
-        run: |
-          if ! command -v sccache &> /dev/null; then
-            cargo install sccache --locked || true
-          fi
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
 
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-      - name: Set sccache wrapper
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
-            echo "Using sccache at $(which sccache)"
-          fi
 
       - name: Build release
         run: cargo build --release --locked
@@ -309,31 +255,13 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install sccache
-        run: |
-          if ! command -v sccache &> /dev/null; then
-            cargo install sccache --locked || true
-          fi
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-
-      - name: Set sccache wrapper
-        run: |
-          if command -v sccache >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
-            echo "Using sccache at $(which sccache)"
-          fi
 
       - name: Wait for database
         run: |
@@ -377,3 +305,27 @@ jobs:
         with:
           name: coverage-lcov
           path: lcov.info
+
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    # Only run on main branch or manual trigger (optional, not blocking)
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Run Criterion benchmarks
+        run: |
+          cargo bench --bench ping_auction_bench --locked --all-features || echo "⚠️  Benchmarks failed (non-blocking)"

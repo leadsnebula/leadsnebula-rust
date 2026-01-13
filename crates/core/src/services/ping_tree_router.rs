@@ -227,13 +227,14 @@ impl PingTreeRouter {
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
         use crate::services::buyer_router::BuyerRouter;
+        use futures::future::join_all;
         use tokio::time::{timeout, Duration};
 
         let start_time = std::time::Instant::now();
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
 
         // Send concurrent pings to all campaigns
-        let mut tasks = Vec::new();
+        let mut task_futures = Vec::new();
         for campaign in campaigns {
             let lead = self.lead.clone();
             let campaign_clone = campaign.clone();
@@ -241,24 +242,32 @@ impl PingTreeRouter {
 
             let pool_clone = pool.clone();
             let encryption_key_clone = encryption_key.clone();
-            let task = tokio::spawn(async move {
-                let router = BuyerRouter::new(
-                    lead,
-                    vec![campaign_clone],
-                    request_type,
-                    pool_clone,
-                    encryption_key_clone,
-                );
-                router.route().await
-            });
-            tasks.push((task, campaign.id));
+            let campaign_id = campaign.id;
+
+            // Wrap each task with timeout and store campaign_id for result mapping
+            let task_future = async move {
+                let task = tokio::spawn(async move {
+                    let router = BuyerRouter::new(
+                        lead,
+                        vec![campaign_clone],
+                        request_type,
+                        pool_clone,
+                        encryption_key_clone,
+                    );
+                    router.route().await
+                });
+                let result = timeout(PING_AUCTION_TIMEOUT, task).await;
+                (result, campaign_id)
+            };
+            task_futures.push(task_future);
         }
 
-        // Wait for all responses with timeout
+        // Wait for all responses concurrently (instead of sequentially)
+        let task_results = join_all(task_futures).await;
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
 
-        for (task, campaign_id) in tasks {
-            match timeout(PING_AUCTION_TIMEOUT, task).await {
+        for (result, campaign_id) in task_results {
+            match result {
                 Ok(Ok(Ok(response))) => {
                     let priority = priority_map.get(&campaign_id).copied().flatten();
                     responses.push((response, campaign_id, priority));
@@ -327,6 +336,15 @@ impl PingTreeRouter {
             responses.len()
         );
 
+        // Log performance metrics to Sentry for monitoring
+        #[cfg(feature = "sentry")]
+        {
+            sentry::configure_scope(|scope| {
+                scope.set_extra("ping_auction_duration_ms", total_time_ms.to_string().into());
+                scope.set_tag("ping_auction_responses", responses.len().to_string());
+            });
+        }
+
         // Persist each buyer response for audit (with retry logic). Store plaintext JSON; API layer will encrypt rows when SSM keys are available.
         for (resp, campaign_id, _pri) in &responses {
             // Find buyer_id from campaigns list
@@ -348,7 +366,7 @@ impl PingTreeRouter {
             let post_owned: Option<String> = None;
             let buyer_id_owned = buyer_id_opt;
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 PingTreeRouter::persist_buyer_response_with_retry(
                     pool_clone,
                     lead_id_val,
@@ -359,6 +377,24 @@ impl PingTreeRouter {
                     payload_owned,
                 )
                 .await;
+            });
+            // Log errors if task panics (fire-and-forget, but log for observability)
+            tokio::spawn(async move {
+                if let Err(e) = handle.await {
+                    tracing::error!(
+                        "Persistence task panicked for lead {} campaign {}: {:?}",
+                        lead_id_val,
+                        campaign_id_val,
+                        e
+                    );
+                    #[cfg(feature = "sentry")]
+                    {
+                        sentry::capture_message(
+                            &format!("Persistence task panicked: {:?}", e),
+                            sentry::Level::Error,
+                        );
+                    }
+                }
             });
         }
 
@@ -482,9 +518,21 @@ impl PingTreeRouter {
     ) -> Result<RoutingResult> {
         use crate::services::buyer_router::BuyerRouter;
 
+        #[allow(unused_variables)]
+        let start_time = std::time::Instant::now();
+
         // Validate that lead.campaign_id exists in the provided campaigns (from ping tree)
         if let Some(campaign_id) = self.lead.campaign_id {
             if !campaigns.iter().any(|c| c.id == campaign_id) {
+                // Log performance metrics to Sentry for monitoring (even on error)
+                #[cfg(feature = "sentry")]
+                {
+                    let total_time_ms = start_time.elapsed().as_millis() as u64;
+                    sentry::configure_scope(|scope| {
+                        scope.set_extra("post_duration_ms", total_time_ms.to_string().into());
+                    });
+                }
+
                 self.update_lead_status(
                     pool.as_ref(),
                     LeadStatus::Error,
@@ -537,7 +585,7 @@ impl PingTreeRouter {
                     let post_owned = bresp.post_id.clone(); // Clone since bresp is used later
                     let buyer_id_owned = Some(campaign.buyer_id);
 
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         PingTreeRouter::persist_buyer_response_with_retry(
                             pool_clone,
                             lead_id_val,
@@ -549,8 +597,38 @@ impl PingTreeRouter {
                         )
                         .await;
                     });
+                    // Log errors if task panics (fire-and-forget, but log for observability)
+                    tokio::spawn(async move {
+                        if let Err(e) = handle.await {
+                            tracing::error!(
+                                "Post persistence task panicked for lead {} campaign {}: {:?}",
+                                lead_id_val,
+                                campaign_id_val,
+                                e
+                            );
+                            #[cfg(feature = "sentry")]
+                            {
+                                sentry::capture_message(
+                                    &format!("Post persistence task panicked: {:?}", e),
+                                    sentry::Level::Error,
+                                );
+                            }
+                        }
+                    });
 
                     if bresp.success && bresp.post_id.is_some() {
+                        // Log performance metrics to Sentry for monitoring
+                        #[cfg(feature = "sentry")]
+                        {
+                            let total_time_ms = start_time.elapsed().as_millis() as u64;
+                            sentry::configure_scope(|scope| {
+                                scope.set_extra(
+                                    "post_duration_ms",
+                                    total_time_ms.to_string().into(),
+                                );
+                            });
+                        }
+
                         let post_id = bresp.post_id.clone().unwrap();
                         // Persist post acceptance
                         self.update_lead_with_post(pool.as_ref(), &post_id).await?;
@@ -567,6 +645,18 @@ impl PingTreeRouter {
                             buyer_id: Some(campaign.buyer_id),
                         })
                     } else {
+                        // Log performance metrics to Sentry for monitoring (even on rejection)
+                        #[cfg(feature = "sentry")]
+                        {
+                            let total_time_ms = start_time.elapsed().as_millis() as u64;
+                            sentry::configure_scope(|scope| {
+                                scope.set_extra(
+                                    "post_duration_ms",
+                                    total_time_ms.to_string().into(),
+                                );
+                            });
+                        }
+
                         // Buyer rejected or errored
                         let final_status = match bresp.status.as_str() {
                             "rejected" => LeadStatus::Rejected,
@@ -618,6 +708,15 @@ impl PingTreeRouter {
                 }
             }
         } else {
+            // Log performance metrics to Sentry for monitoring (even on error)
+            #[cfg(feature = "sentry")]
+            {
+                let total_time_ms = start_time.elapsed().as_millis() as u64;
+                sentry::configure_scope(|scope| {
+                    scope.set_extra("post_duration_ms", total_time_ms.into());
+                });
+            }
+
             self.update_lead_status(
                 pool.as_ref(),
                 LeadStatus::Error,
@@ -646,6 +745,9 @@ impl PingTreeRouter {
         priority_map: &std::collections::HashMap<Uuid, Option<i32>>,
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
+        #[allow(unused_variables)]
+        let start_time = std::time::Instant::now();
+
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
             let ping_result = self
@@ -657,6 +759,14 @@ impl PingTreeRouter {
                 )
                 .await?;
             if !ping_result.success {
+                // Log performance metrics to Sentry for monitoring (even on early return)
+                #[cfg(feature = "sentry")]
+                {
+                    let total_time_ms = start_time.elapsed().as_millis() as u64;
+                    sentry::configure_scope(|scope| {
+                        scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
+                    });
+                }
                 return Ok(ping_result);
             }
 
@@ -679,6 +789,15 @@ impl PingTreeRouter {
                 .route_post(pool.clone(), campaigns, encryption_key.clone())
                 .await?;
 
+            // Log performance metrics to Sentry for monitoring
+            #[cfg(feature = "sentry")]
+            {
+                let total_time_ms = start_time.elapsed().as_millis() as u64;
+                sentry::configure_scope(|scope| {
+                    scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
+                });
+            }
+
             // Merge ping and post results
             Ok(RoutingResult {
                 success: post_result.success,
@@ -692,6 +811,15 @@ impl PingTreeRouter {
                 buyer_id: post_result.buyer_id.or(ping_result.buyer_id),
             })
         } else {
+            // Log performance metrics to Sentry for monitoring (even on error)
+            #[cfg(feature = "sentry")]
+            {
+                let total_time_ms = start_time.elapsed().as_millis() as u64;
+                sentry::configure_scope(|scope| {
+                    scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
+                });
+            }
+
             self.update_lead_status(
                 pool.as_ref(),
                 LeadStatus::Error,
