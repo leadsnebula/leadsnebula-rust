@@ -54,4 +54,19 @@ impl Campaign {
         .fetch_optional(pool)
         .await
     }
+
+    pub async fn find_by_ids(
+        pool: &sqlx::PgPool,
+        ids: &[Uuid],
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, Campaign>(
+            "SELECT * FROM campaigns WHERE id = ANY($1) AND deleted_at IS NULL",
+        )
+        .bind(ids)
+        .fetch_all(pool)
+        .await
+    }
 }

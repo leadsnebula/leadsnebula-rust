@@ -433,7 +433,7 @@ async fn create_lead(
             request_type.clone(),
         );
         let start_processing = std::time::Instant::now();
-        match router.route(&state.db_pool).await {
+        match router.route(state.db_pool.clone(), std::sync::Arc::new(state.config.encryption_key.clone())).await {
             Ok(routing_result) => {
                 // Determine buyer and campaign names (best-effort)
                 let buyer_name = if let Some(bid) = routing_result.buyer_id {
@@ -1037,7 +1037,7 @@ async fn create_lead(
     );
 
     let start_processing = std::time::Instant::now();
-    match router.route(&state.db_pool).await {
+        match router.route(state.db_pool.clone(), std::sync::Arc::new(state.config.encryption_key.clone())).await {
         Ok(routing_result) => {
             let processing_time_ms = start_processing.elapsed().as_millis() as u64;
             // Determine a clearer message and include price when available

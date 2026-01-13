@@ -1235,8 +1235,11 @@ async fn list_publishers(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
+    use sqlx::Row;
     // TODO: Get instance_ids from user's JWT token
     // For now, get all publishers
+    let start = std::time::Instant::now();
+
     let publishers = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
         "SELECT * FROM publishers ORDER BY created_at DESC",
     )
@@ -1249,32 +1252,44 @@ async fn list_publishers(
 
     info!("Found {} publishers", publishers.len());
 
-    let mut response: Vec<PublisherResponse> = Vec::new();
+    // If there are publishers, fetch all publisher vertical associations in one query (avoid N+1)
+    let mut publisher_verticals_map: std::collections::HashMap<uuid::Uuid, Vec<VerticalInfo>> = std::collections::HashMap::new();
 
-    for p in &publishers {
-        // Get verticals for this publisher
-        let verticals = sqlx::query_as::<_, leadsnebula_core::models::vertical::Vertical>(
-            r#"
-            SELECT v.* FROM verticals v
-            INNER JOIN publisher_verticals pv ON v.id = pv.vertical_id
-            WHERE pv.publisher_id = $1
-            ORDER BY v.name
-            "#,
+    if !publishers.is_empty() {
+        let ids: Vec<uuid::Uuid> = publishers.iter().map(|p| p.id).collect();
+
+        let pv_rows = sqlx::query(
+            r#"SELECT pv.publisher_id AS publisher_id, v.id AS id, v.name AS name, v.slug AS slug
+               FROM publisher_verticals pv
+               JOIN verticals v ON v.id = pv.vertical_id
+               WHERE pv.publisher_id = ANY($1)
+               ORDER BY v.name"#,
         )
-        .bind(p.id)
+        .bind(&ids)
         .fetch_all(state.db_pool.as_ref())
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            error!("Database error loading publisher verticals: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-        let vertical_info: Vec<VerticalInfo> = verticals
-            .iter()
-            .map(|v| VerticalInfo {
-                id: v.id.to_string(),
-                name: v.name.clone(),
-                slug: v.slug.clone(),
-            })
-            .collect();
+        for row in pv_rows {
+            let pub_id: uuid::Uuid = row.get("publisher_id");
+            let v_id: uuid::Uuid = row.get("id");
+            let v_name: String = row.get("name");
+            let v_slug: String = row.get("slug");
 
+            publisher_verticals_map.entry(pub_id).or_default().push(VerticalInfo {
+                id: v_id.to_string(),
+                name: v_name,
+                slug: v_slug,
+            });
+        }
+    }
+
+    let mut response: Vec<PublisherResponse> = Vec::with_capacity(publishers.len());
+    for p in &publishers {
+        let vertical_info = publisher_verticals_map.remove(&p.id).unwrap_or_default();
         response.push(PublisherResponse {
             id: p.id.to_string(),
             name: p.name.clone(),
@@ -1287,6 +1302,9 @@ async fn list_publishers(
             verticals: vertical_info,
         });
     }
+
+    let elapsed = start.elapsed().as_millis();
+    info!("list_publishers completed in {}ms", elapsed);
 
     Ok(Json(serde_json::json!({
         "success": true,

@@ -6,6 +6,7 @@ mod ping_tree_router_db_integration_tests {
     use crate::models::{campaign::Campaign, enums::CampaignStatus, enums::LeadStatus, lead::Lead};
     use crate::services::ping_tree_router::PingTreeRouter;
     use sqlx::PgPool;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     // Use common test helper from api crate
@@ -241,7 +242,9 @@ mod ping_tree_router_db_integration_tests {
             vertical_slug,
             "ping".to_string(),
         );
-        let result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
+        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
 
         // Verify lead status was updated
         let updated_lead = sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
@@ -286,7 +289,9 @@ mod ping_tree_router_db_integration_tests {
             vertical_slug,
             "ping".to_string(),
         );
-        let _result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
+        let _result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
 
         // Verify buyer_responses were persisted
         let count: i64 =
@@ -326,7 +331,9 @@ mod ping_tree_router_db_integration_tests {
             vertical_slug,
             "fullpost".to_string(),
         );
-        let result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
+        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
 
         if result.success {
             // Verify ping_payloads exists

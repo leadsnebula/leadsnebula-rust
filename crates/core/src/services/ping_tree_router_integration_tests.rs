@@ -12,6 +12,7 @@ mod ping_tree_router_integration_tests {
     };
     use crate::services::ping_tree_router::PingTreeRouter;
     use sqlx::PgPool;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     // Helper to create test data
@@ -206,7 +207,9 @@ mod ping_tree_router_integration_tests {
         let lead = create_test_lead(&pool, publisher_id, vertical_id, "ping").await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
-        let result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
+        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");
@@ -232,7 +235,9 @@ mod ping_tree_router_integration_tests {
         create_ping_tree(&pool, publisher_id, &vertical_slug, "paused").await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
-        let result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
+        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");
@@ -254,7 +259,9 @@ mod ping_tree_router_integration_tests {
         create_ping_tree(&pool, publisher_id, &vertical_slug, "active").await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
-        let result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
+        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");
