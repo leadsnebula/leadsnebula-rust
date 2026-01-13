@@ -488,53 +488,149 @@ if [ -f "Dockerfile" ]; then
     echo ""
 fi
 
-# 9. GitHub Actions workflow validation
-if [ -d ".github/workflows" ]; then
-    echo "9️⃣  Validating GitHub Actions workflows..."
+# 9. GitHub Actions workflow and action validation
+if [ -d ".github" ]; then
+    echo "9️⃣  Validating GitHub Actions workflows and actions..."
     WORKFLOW_ERRORS=0
-    for workflow in .github/workflows/*.yml; do
-        if [ -f "$workflow" ]; then
-            WORKFLOW_NAME=$(basename "$workflow")
-            
-            # Validate YAML syntax
-            if command -v python3 > /dev/null 2>&1; then
-                if ! python3 -c "import yaml; yaml.safe_load(open('$workflow'))" > /dev/null 2>&1; then
-                    echo "❌ $WORKFLOW_NAME has invalid YAML syntax"
-                    python3 -c "import yaml; yaml.safe_load(open('$workflow'))" 2>&1 | head -5 || true
-                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
-                else
-                    echo "✅ $WORKFLOW_NAME YAML syntax OK"
-                fi
-            else
-                echo "⚠️  Cannot validate YAML syntax (python3 not available)"
-            fi
-            
-            # Check if workflow pushes to GHCR but doesn't have packages: write permission
-            if grep -q "ghcr.io" "$workflow" && grep -q "push: true" "$workflow"; then
-                if ! grep -q "packages: write" "$workflow"; then
-                    echo "❌ $WORKFLOW_NAME pushes to GHCR but missing 'packages: write' permission"
-                    echo "   Add 'permissions: { packages: write }' to the job"
-                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
-                else
-                    echo "✅ $WORKFLOW_NAME has correct GHCR permissions"
-                fi
-            fi
-            
-            # Check for invalid cargo llvm-cov options (e.g., --test-threads which doesn't exist)
-            if grep -q "cargo llvm-cov" "$workflow"; then
-                if grep -A 5 "cargo llvm-cov" "$workflow" | grep -q "\\--test-threads"; then
-                    echo "❌ $WORKFLOW_NAME uses invalid '--test-threads' option with cargo llvm-cov"
-                    echo "   Use 'RUST_TEST_THREADS' environment variable instead"
-                    echo "   Example: env: { RUST_TEST_THREADS: 1 }"
-                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
-                else
-                    echo "✅ $WORKFLOW_NAME cargo llvm-cov command OK"
-                fi
-            fi
-        fi
-    done
     
-    if [ $WORKFLOW_ERRORS -gt 0 ]; then
+    # Validate workflows
+    if [ -d ".github/workflows" ]; then
+        for workflow in .github/workflows/*.yml; do
+            if [ -f "$workflow" ]; then
+                WORKFLOW_NAME=$(basename "$workflow")
+                
+                if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+                    # Use validate-config binary for comprehensive validation
+                    WORKFLOW_OUTPUT=$("$VALIDATE_CONFIG_BIN" github-workflow "$workflow" 2>/dev/null || echo "")
+                    
+                    if [ -n "$WORKFLOW_OUTPUT" ]; then
+                        if [ "$USE_JQ" = "true" ]; then
+                            WARNING_COUNT=$(echo "$WORKFLOW_OUTPUT" | jq -r '[.warnings[]?] | length' 2>/dev/null || echo "0")
+                            ERROR_COUNT=$(echo "$WORKFLOW_OUTPUT" | jq -r '[.errors[]?] | length' 2>/dev/null || echo "0")
+                            
+                            if [ "$ERROR_COUNT" -gt 0 ]; then
+                                echo "❌ $WORKFLOW_NAME validation failed:"
+                                echo "$WORKFLOW_OUTPUT" | jq -r '.errors[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                                    if [ -n "$line" ]; then
+                                        echo "$line"
+                                    fi
+                                done
+                                WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                            elif [ "$WARNING_COUNT" -gt 0 ]; then
+                                echo "⚠️  $WORKFLOW_NAME has warnings:"
+                                echo "$WORKFLOW_OUTPUT" | jq -r '.warnings[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                                    if [ -n "$line" ]; then
+                                        echo "$line"
+                                    fi
+                                done
+                                if [ "$STRICT_MODE" = "true" ]; then
+                                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                                fi
+                            else
+                                echo "✅ $WORKFLOW_NAME validation OK"
+                            fi
+                        else
+                            # Fallback: basic check
+                            if echo "$WORKFLOW_OUTPUT" | grep -q '"errors"'; then
+                                echo "❌ $WORKFLOW_NAME validation failed"
+                                WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                            elif echo "$WORKFLOW_OUTPUT" | grep -q '"warnings"'; then
+                                echo "⚠️  $WORKFLOW_NAME has warnings"
+                            else
+                                echo "✅ $WORKFLOW_NAME validation OK"
+                            fi
+                        fi
+                    else
+                        echo "⚠️  Could not validate $WORKFLOW_NAME (validate-config unavailable)"
+                    fi
+                else
+                    # Fallback: use Python YAML validation
+                    if command -v python3 > /dev/null 2>&1; then
+                        if ! python3 -c "import yaml; yaml.safe_load(open('$workflow'))" > /dev/null 2>&1; then
+                            echo "❌ $WORKFLOW_NAME has invalid YAML syntax"
+                            python3 -c "import yaml; yaml.safe_load(open('$workflow'))" 2>&1 | head -5 || true
+                            WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                        else
+                            echo "✅ $WORKFLOW_NAME YAML syntax OK"
+                        fi
+                    else
+                        echo "⚠️  Cannot validate YAML syntax (python3 not available)"
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    # Validate composite actions
+    if [ -d ".github/actions" ]; then
+        for action_dir in .github/actions/*/; do
+            if [ -d "$action_dir" ]; then
+                ACTION_NAME=$(basename "$action_dir")
+                ACTION_FILE="$action_dir/action.yml"
+                if [ -f "$ACTION_FILE" ]; then
+                    if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+                        ACTION_OUTPUT=$("$VALIDATE_CONFIG_BIN" github-workflow "$ACTION_FILE" 2>/dev/null || echo "")
+                        
+                        if [ -n "$ACTION_OUTPUT" ]; then
+                            if [ "$USE_JQ" = "true" ]; then
+                                ERROR_COUNT=$(echo "$ACTION_OUTPUT" | jq -r '[.errors[]?] | length' 2>/dev/null || echo "0")
+                                WARNING_COUNT=$(echo "$ACTION_OUTPUT" | jq -r '[.warnings[]?] | length' 2>/dev/null || echo "0")
+                                
+                                if [ "$ERROR_COUNT" -gt 0 ]; then
+                                    echo "❌ Composite action '$ACTION_NAME' validation failed:"
+                                    echo "$ACTION_OUTPUT" | jq -r '.errors[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                                        if [ -n "$line" ]; then
+                                            echo "$line"
+                                        fi
+                                    done
+                                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                                elif [ "$WARNING_COUNT" -gt 0 ]; then
+                                    echo "⚠️  Composite action '$ACTION_NAME' has warnings:"
+                                    echo "$ACTION_OUTPUT" | jq -r '.warnings[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                                        if [ -n "$line" ]; then
+                                            echo "$line"
+                                        fi
+                                    done
+                                    if [ "$STRICT_MODE" = "true" ]; then
+                                        WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                                    fi
+                                else
+                                    echo "✅ Composite action '$ACTION_NAME' validation OK"
+                                fi
+                            else
+                                # Fallback: basic check
+                                if echo "$ACTION_OUTPUT" | grep -q '"errors"'; then
+                                    echo "❌ Composite action '$ACTION_NAME' validation failed"
+                                    WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                                elif echo "$ACTION_OUTPUT" | grep -q '"warnings"'; then
+                                    echo "⚠️  Composite action '$ACTION_NAME' has warnings"
+                                else
+                                    echo "✅ Composite action '$ACTION_NAME' validation OK"
+                                fi
+                            fi
+                        else
+                            echo "⚠️  Could not validate composite action '$ACTION_NAME' (validate-config unavailable)"
+                        fi
+                    else
+                        # Fallback: basic YAML syntax check
+                        if command -v python3 > /dev/null 2>&1; then
+                            if ! python3 -c "import yaml; yaml.safe_load(open('$ACTION_FILE'))" > /dev/null 2>&1; then
+                                echo "❌ Composite action '$ACTION_NAME' has invalid YAML syntax"
+                                python3 -c "import yaml; yaml.safe_load(open('$ACTION_FILE'))" 2>&1 | head -5 || true
+                                WORKFLOW_ERRORS=$((WORKFLOW_ERRORS + 1))
+                            else
+                                echo "✅ Composite action '$ACTION_NAME' YAML syntax OK"
+                            fi
+                        else
+                            echo "⚠️  Cannot validate composite action '$ACTION_NAME' (python3 not available)"
+                        fi
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    if [ "$WORKFLOW_ERRORS" -gt 0 ]; then
         ERRORS=$((ERRORS + WORKFLOW_ERRORS))
     fi
     echo ""

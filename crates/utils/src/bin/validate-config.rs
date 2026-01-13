@@ -573,6 +573,40 @@ fn validate_github_workflow(path: &PathBuf) -> Result<ValidationResult> {
 
     let yaml: YamlValue = serde_yaml::from_str(&content).context("Failed to parse YAML")?;
 
+    // Check if this is a composite action (has runs.using: composite)
+    let is_composite_action = yaml
+        .get("runs")
+        .and_then(|r| r.get("using"))
+        .and_then(|u| u.as_str())
+        .map(|u| u == "composite")
+        .unwrap_or(false);
+
+    // For composite actions, validate inputs structure
+    if is_composite_action {
+        if let Some(inputs) = yaml.get("inputs") {
+            // If inputs key exists, it must be a mapping (object), not null
+            if inputs.is_null() {
+                result.errors.push(ErrorMessage::with_remediation(
+                    format!(
+                        "Composite action '{}' has null 'inputs' - must be a mapping or omitted",
+                        path.display()
+                    ),
+                    "Remove 'inputs:' line if no inputs needed, or add 'inputs: {}' for empty mapping".to_string(),
+                ));
+                result.valid = false;
+            } else if inputs.as_mapping().is_none() {
+                result.errors.push(ErrorMessage::with_remediation(
+                    format!(
+                        "Composite action '{}' has invalid 'inputs' type - must be a mapping",
+                        path.display()
+                    ),
+                    "Change 'inputs:' to a valid YAML mapping (object) or remove it".to_string(),
+                ));
+                result.valid = false;
+            }
+        }
+    }
+
     // Check if workflow pushes to GHCR but doesn't have packages: write permission
     let mut pushes_to_ghcr = false;
     let mut has_packages_write = false;

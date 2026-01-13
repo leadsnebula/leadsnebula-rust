@@ -1,7 +1,5 @@
 name: 'Setup sccache'
 description: 'Install and configure sccache for Rust compilation caching'
-inputs:
-  # No inputs needed - sccache setup is standard
 runs:
   using: 'composite'
   steps:
