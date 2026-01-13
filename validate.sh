@@ -268,6 +268,28 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                 fi
             fi
         done
+        
+        # Run E2E tests if they exist (full API flow tests)
+        if cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
+            echo "   Running E2E tests (full API flow)..."
+            if ! cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored; then
+                echo "❌ E2E tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "✅ E2E tests OK"
+            fi
+        fi
+        
+        # Run async persistence tests
+        if cargo test --lib -p leadsnebula_core --list 2>/dev/null | grep -q "async_persistence"; then
+            echo "   Running async persistence tests..."
+            if ! cargo test --lib -p leadsnebula_core async_persistence_tests --locked --all-features -- --test-threads=1 --ignored; then
+                echo "❌ Async persistence tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "✅ Async persistence tests OK"
+            fi
+        fi
     else
         echo "   DATABASE_URL not set - running unit tests only..."
         echo "   (Set DATABASE_URL to run full test suite including database integration tests)"

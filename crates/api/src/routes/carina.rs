@@ -433,32 +433,43 @@ async fn create_lead(
             request_type.clone(),
         );
         let start_processing = std::time::Instant::now();
-        match router.route(state.db_pool.clone(), std::sync::Arc::new(state.config.encryption_key.clone())).await {
+        match router
+            .route(
+                state.db_pool.clone(),
+                std::sync::Arc::new(state.config.encryption_key.clone()),
+            )
+            .await
+        {
             Ok(routing_result) => {
-                // Determine buyer and campaign names (best-effort)
-                let buyer_name = if let Some(bid) = routing_result.buyer_id {
-                    (sqlx::query_scalar::<_, String>(
-                        "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
-                    )
-                    .bind(bid)
-                    .fetch_optional(&*state.db_pool)
-                    .await)
-                        .unwrap_or_default()
-                } else {
-                    None
-                };
-
-                let campaign_name = if let Some(cid) = routing_result.campaign_id {
-                    (sqlx::query_scalar::<_, String>(
-                        "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
-                    )
-                    .bind(cid)
-                    .fetch_optional(&*state.db_pool)
-                    .await)
-                        .unwrap_or_default()
-                } else {
-                    None
-                };
+                // Batch load buyer and campaign names in parallel (performance optimization)
+                let (buyer_name, campaign_name) = tokio::join!(
+                    async {
+                        if let Some(bid) = routing_result.buyer_id {
+                            sqlx::query_scalar::<_, String>(
+                                "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                            )
+                            .bind(bid)
+                            .fetch_optional(&*state.db_pool)
+                            .await
+                            .unwrap_or_default()
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(cid) = routing_result.campaign_id {
+                            sqlx::query_scalar::<_, String>(
+                                "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                            )
+                            .bind(cid)
+                            .fetch_optional(&*state.db_pool)
+                            .await
+                            .unwrap_or_default()
+                        } else {
+                            None
+                        }
+                    }
+                );
 
                 // Round price to 2 decimals for response
                 let rounded_price = routing_result.price.map(|p| (p * 100.0).round() / 100.0);
@@ -488,7 +499,7 @@ async fn create_lead(
 
                 // Persist post payload (request + response) into post_payloads with encryption when possible
                 let post_request_json =
-                    serde_json::to_value(&lead_data).unwrap_or(serde_json::json!({}));
+                    serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
                 let post_response_json = serde_json::json!({
                     "routing_result": {
                         "status": routing_result.status,
@@ -544,10 +555,12 @@ async fn create_lead(
                 }
 
                 // Insert into post_payloads
+                // Clone post_id once for both branches
+                let post_id_for_insert = routing_result.post_id.clone();
                 let _ = if let (Some(er), Some(epr)) = (enc_req_opt, enc_resp_opt) {
                     sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, $5, now())")
                         .bind(lead.uuid)
-                        .bind(routing_result.post_id.clone())
+                        .bind(&post_id_for_insert)
                         .bind(sqlx::types::Json(&post_request_json))
                         .bind(er)
                         .bind(epr)
@@ -556,42 +569,50 @@ async fn create_lead(
                 } else {
                     sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, created_at) VALUES ($1, $2, $3, now())")
                         .bind(lead.uuid)
-                        .bind(routing_result.post_id.clone())
+                        .bind(&post_id_for_insert)
                         .bind(sqlx::types::Json(&post_request_json))
                         .execute(&*state.db_pool)
                         .await
                 };
 
                 // Encrypt any buyer_responses rows for this lead/post_id using SSM deterministic key (best-effort)
+                // Move to async background task to avoid blocking response
                 if let Some(post_id_val) = routing_result.post_id.clone() {
-                    if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND post_id = $2 AND response_payload_encrypted IS NULL")
-                            .bind(lead.uuid)
-                            .bind(post_id_val)
-                            .fetch_all(&*state.db_pool)
-                            .await
-                        {
-                        let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
-                        let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
-                        let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
-                        if let Ok(Some(det_key)) = state.ssm.get_parameter(&det_path, true).await {
-                            if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path, true).await {
-                                let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
-                                for r in rows {
-                                    let id: i64 = r.get("id");
-                                    let payload_val: serde_json::Value = r.get("payload");
-                                    if let Ok(payload_str) = serde_json::to_string(&payload_val) {
-                                        if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(&derived, &payload_str, true) {
-                                            let _ = sqlx::query("UPDATE buyer_responses SET response_payload_encrypted = $1 WHERE id = $2")
-                                                .bind(envelope)
-                                                .bind(id)
-                                                .execute(&*state.db_pool)
-                                                .await;
+                    let pool_clone = state.db_pool.clone();
+                    let ssm_clone = state.ssm.clone();
+                    let env_clone = state.config.environment.clone();
+                    let lead_uuid_clone = lead.uuid;
+
+                    tokio::spawn(async move {
+                        if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND post_id = $2 AND response_payload_encrypted IS NULL")
+                                .bind(lead_uuid_clone)
+                                .bind(post_id_val)
+                                .fetch_all(&*pool_clone)
+                                .await
+                            {
+                                let env_norm = leadsnebula_core::normalize_env_for_ssm(&env_clone).to_string();
+                                let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
+                                let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
+                                if let Ok(Some(det_key)) = ssm_clone.get_parameter(&det_path, true).await {
+                                    if let Ok(Some(salt)) = ssm_clone.get_parameter(&salt_path, true).await {
+                                        let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
+                                        for r in rows {
+                                            let id: i64 = r.get("id");
+                                            let payload_val: serde_json::Value = r.get("payload");
+                                            if let Ok(payload_str) = serde_json::to_string(&payload_val) {
+                                                if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(&derived, &payload_str, true) {
+                                                    let _ = sqlx::query("UPDATE buyer_responses SET response_payload_encrypted = $1 WHERE id = $2")
+                                                        .bind(envelope)
+                                                        .bind(id)
+                                                        .execute(&*pool_clone)
+                                                        .await;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                    }
+                    });
                 }
 
                 // Update lead final state: if sold, set post_id and status sold; if not, clear in-progress placeholder
@@ -932,7 +953,8 @@ async fn create_lead(
     };
 
     // Persist incoming request payload into ping_payloads for later inspection.
-    let request_payload_json = serde_json::to_value(&lead_data).unwrap_or(serde_json::json!({}));
+    let request_payload_json =
+        serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
     // Try to encrypt the request payload using Rails-compatible keys from SSM (deterministic)
     let mut encrypted_request_opt: Option<String> = None;
     let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
@@ -1037,7 +1059,13 @@ async fn create_lead(
     );
 
     let start_processing = std::time::Instant::now();
-        match router.route(state.db_pool.clone(), std::sync::Arc::new(state.config.encryption_key.clone())).await {
+    match router
+        .route(
+            state.db_pool.clone(),
+            std::sync::Arc::new(state.config.encryption_key.clone()),
+        )
+        .await
+    {
         Ok(routing_result) => {
             let processing_time_ms = start_processing.elapsed().as_millis() as u64;
             // Determine a clearer message and include price when available
@@ -1055,27 +1083,14 @@ async fn create_lead(
                 price = round2(routing_result.price);
             }
 
-            // Build a clearer message. For accepted pings include buyer name and winning bid when available.
+            // Build a clearer message. For accepted pings include winning bid when available.
+            // Note: Buyer name lookup removed to avoid blocking response (performance optimization)
+            // Buyer name can be included in verbose response if needed
             let message = if routing_result.status == "accepted" {
-                let buyer_name = if let Some(bid) = routing_result.buyer_id {
-                    (sqlx::query_scalar::<_, String>(
-                        "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
-                    )
-                    .bind(bid)
-                    .fetch_optional(&*state.db_pool)
-                    .await)
-                        .unwrap_or_default()
+                if let Some(b) = bid {
+                    Some(format!("Ping Accepted with a bid of ${:.2}", b))
                 } else {
-                    None
-                };
-
-                match (buyer_name, bid) {
-                    (Some(name), Some(b)) => {
-                        Some(format!("Ping Accepted by {} with a bid of ${:.2}", name, b))
-                    }
-                    (Some(name), None) => Some(format!("Ping Accepted by {}", name)),
-                    (_, Some(b)) => Some(format!("Ping Accepted with a bid of ${:.2}", b)),
-                    _ => Some("Ping Accepted".to_string()),
+                    Some("Ping Accepted".to_string())
                 }
             } else if routing_result.status == "sold" {
                 if let Some(p) = price {
@@ -1168,60 +1183,70 @@ async fn create_lead(
                     }
                 }
 
+                // Clone ping_id once for both branches
+                let ping_id_for_update = routing_result.ping_id.clone();
                 if let Some(encrypted_response) = encrypted_response_opt {
                     let _ = sqlx::query("UPDATE ping_payloads SET payload = COALESCE(payload, 'null'::jsonb), response_payload_encrypted = $1, external_ping_id = $2, updated_at = now() WHERE id = $3")
                             .bind(encrypted_response)
-                            .bind(routing_result.ping_id.clone())
+                            .bind(&ping_id_for_update)
                             .bind(row_id)
                             .execute(&*state.db_pool)
                             .await;
                 } else {
                     let _ = sqlx::query("UPDATE ping_payloads SET payload = COALESCE(payload, 'null'::jsonb), response_payload = $1, external_ping_id = $2, updated_at = now() WHERE id = $3")
                             .bind(sqlx::types::Json(&response_json))
-                            .bind(routing_result.ping_id.clone())
+                            .bind(&ping_id_for_update)
                             .bind(row_id)
                             .execute(&*state.db_pool)
                             .await;
                 }
 
                 // Encrypt any buyer_responses rows for this lead/ping_id using SSM deterministic key (best-effort)
+                // Move to async background task to avoid blocking response
                 if let Some(ping_id_val) = routing_result.ping_id.clone() {
-                    if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND ping_id = $2 AND response_payload_encrypted IS NULL")
-                            .bind(lead_uuid)
-                            .bind(ping_id_val)
-                            .fetch_all(&*state.db_pool)
-                            .await
-                        {
-                            // Try to load deterministic key/salt from SSM
-                            let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
-                            let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
-                            let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
-                            if let Ok(Some(det_key)) = state.ssm.get_parameter(&det_path, true).await {
-                                if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path, true).await {
-                                    let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
-                                    for r in rows {
-                                        let id: i64 = r.get("id");
-                                        let payload_val: serde_json::Value = r.get("payload");
-                                        if let Ok(payload_str) = serde_json::to_string(&payload_val) {
-                                            if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(&derived, &payload_str, true) {
-                                                let _ = sqlx::query("UPDATE buyer_responses SET response_payload_encrypted = $1 WHERE id = $2")
-                                                    .bind(envelope)
-                                                    .bind(id)
-                                                    .execute(&*state.db_pool)
-                                                    .await;
+                    let pool_clone = state.db_pool.clone();
+                    let ssm_clone = state.ssm.clone();
+                    let env_clone = state.config.environment.clone();
+                    let lead_uuid_clone = lead_uuid;
+
+                    tokio::spawn(async move {
+                        if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND ping_id = $2 AND response_payload_encrypted IS NULL")
+                                .bind(lead_uuid_clone)
+                                .bind(ping_id_val)
+                                .fetch_all(&*pool_clone)
+                                .await
+                            {
+                                // Try to load deterministic key/salt from SSM
+                                let env_norm = leadsnebula_core::normalize_env_for_ssm(&env_clone).to_string();
+                                let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
+                                let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
+                                if let Ok(Some(det_key)) = ssm_clone.get_parameter(&det_path, true).await {
+                                    if let Ok(Some(salt)) = ssm_clone.get_parameter(&salt_path, true).await {
+                                        let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
+                                        for r in rows {
+                                            let id: i64 = r.get("id");
+                                            let payload_val: serde_json::Value = r.get("payload");
+                                            if let Ok(payload_str) = serde_json::to_string(&payload_val) {
+                                                if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(&derived, &payload_str, true) {
+                                                    let _ = sqlx::query("UPDATE buyer_responses SET response_payload_encrypted = $1 WHERE id = $2")
+                                                        .bind(envelope)
+                                                        .bind(id)
+                                                        .execute(&*pool_clone)
+                                                        .await;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
+                    });
                 }
             }
 
             // For fullpost requests, also save post payloads if post_id is present
             if request_type == "fullpost" && routing_result.post_id.is_some() {
                 let post_request_json =
-                    serde_json::to_value(&lead_data).unwrap_or(serde_json::json!({}));
+                    serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
                 let post_response_json = serde_json::json!({
                     "routing_result": {
                         "status": routing_result.status.clone(),
@@ -1277,10 +1302,12 @@ async fn create_lead(
                 }
 
                 // Insert into post_payloads for fullpost
+                // Clone post_id once for both branches
+                let post_id_for_insert_fp = routing_result.post_id.clone();
                 let _ = if let (Some(er), Some(epr)) = (enc_req_opt_fp, enc_resp_opt_fp) {
                     sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, $5, now())")
                         .bind(lead_uuid)
-                        .bind(routing_result.post_id.clone())
+                        .bind(&post_id_for_insert_fp)
                         .bind(sqlx::types::Json(&post_request_json))
                         .bind(er)
                         .bind(epr)
@@ -1289,7 +1316,7 @@ async fn create_lead(
                 } else {
                     sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, created_at) VALUES ($1, $2, $3, now())")
                         .bind(lead_uuid)
-                        .bind(routing_result.post_id.clone())
+                        .bind(&post_id_for_insert_fp)
                         .bind(sqlx::types::Json(&post_request_json))
                         .execute(&*state.db_pool)
                         .await

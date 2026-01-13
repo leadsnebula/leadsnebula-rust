@@ -55,30 +55,35 @@ impl PingTreeRouter {
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
         // Find active ping tree for publisher and vertical
-        let ping_tree = match PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
-            .await?
-        {
-            Some(pt) => pt,
-            None => {
-                // Update lead status to error
-                self.update_lead_status(pool.as_ref(), LeadStatus::Error, Some("No active ping tree found"))
+        let ping_tree =
+            match PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
+                .await?
+            {
+                Some(pt) => pt,
+                None => {
+                    // Update lead status to error
+                    self.update_lead_status(
+                        pool.as_ref(),
+                        LeadStatus::Error,
+                        Some("No active ping tree found"),
+                    )
                     .await?;
-                return Ok(RoutingResult {
-                    success: false,
-                    status: "error".to_string(),
-                    error: Some(format!(
-                        "No active ping tree found for publisher {} and vertical {}",
-                        self.publisher_id, self.vertical
-                    )),
-                    promise_id: None,
-                    ping_id: None,
-                    post_id: None,
-                    price: None,
-                    campaign_id: None,
-                    buyer_id: None,
-                });
-            }
-        };
+                    return Ok(RoutingResult {
+                        success: false,
+                        status: "error".to_string(),
+                        error: Some(format!(
+                            "No active ping tree found for publisher {} and vertical {}",
+                            self.publisher_id, self.vertical
+                        )),
+                        promise_id: None,
+                        ping_id: None,
+                        post_id: None,
+                        price: None,
+                        campaign_id: None,
+                        buyer_id: None,
+                    });
+                }
+            };
 
         // Check ping tree status
         if !ping_tree.is_active() {
@@ -129,9 +134,12 @@ impl PingTreeRouter {
         }
 
         // Load campaigns in batch (optimize N+1 queries)
-        let campaign_ids: Vec<Uuid> = ping_tree_campaigns.iter().map(|ptc| ptc.campaign_id).collect();
+        let campaign_ids: Vec<Uuid> = ping_tree_campaigns
+            .iter()
+            .map(|ptc| ptc.campaign_id)
+            .collect();
         let all_campaigns = Campaign::find_by_ids(pool.as_ref(), &campaign_ids).await?;
-        
+
         let mut campaigns = Vec::new();
         let mut priority_map = std::collections::HashMap::new();
 
@@ -145,8 +153,12 @@ impl PingTreeRouter {
         }
 
         if campaigns.is_empty() {
-            self.update_lead_status(pool.as_ref(), LeadStatus::Error, Some("No valid campaigns found"))
-                .await?;
+            self.update_lead_status(
+                pool.as_ref(),
+                LeadStatus::Error,
+                Some("No valid campaigns found"),
+            )
+            .await?;
             return Ok(RoutingResult {
                 success: false,
                 status: "error".to_string(),
@@ -163,13 +175,27 @@ impl PingTreeRouter {
         // Route based on request type
         match self.request_type.as_str() {
             "ping" => {
-                self.route_ping_auction(pool.clone(), &campaigns, &priority_map, encryption_key.clone())
+                self.route_ping_auction(
+                    pool.clone(),
+                    &campaigns,
+                    &priority_map,
+                    encryption_key.clone(),
+                )
+                .await
+            }
+            "post" => {
+                self.route_post(pool.clone(), &campaigns, encryption_key.clone())
                     .await
             }
-            "post" => self.route_post(pool.clone(), &campaigns, encryption_key.clone()).await,
             "fullpost" => {
-                self.route_fullpost(pool.clone(), &campaigns, &ping_tree, &priority_map, encryption_key.clone())
-                    .await
+                self.route_fullpost(
+                    pool.clone(),
+                    &campaigns,
+                    &ping_tree,
+                    &priority_map,
+                    encryption_key.clone(),
+                )
+                .await
             }
             _ => {
                 self.update_lead_status(
@@ -308,15 +334,17 @@ impl PingTreeRouter {
                 .iter()
                 .find(|c| c.id == *campaign_id)
                 .map(|c| c.buyer_id);
-            let resp_json = serde_json::to_value(resp).unwrap_or(serde_json::json!({}));
+            // Serialize response - use empty object on error (best-effort persistence)
+            let resp_json = serde_json::to_value(resp).unwrap_or_else(|_| serde_json::json!({}));
             let ping_id_val = resp.ping_id.clone();
-            
+
             // Persist with retry logic for transient database errors asynchronously
+            // Clone only what's necessary for the async task
             let pool_clone = pool.as_ref().clone();
             let lead_id_val = self.lead.uuid;
             let campaign_id_val = *campaign_id;
-            let payload_owned = resp_json.clone();
-            let ping_owned = ping_id_val.clone();
+            let payload_owned = resp_json; // Move instead of clone since we don't need it after
+            let ping_owned = ping_id_val; // Move instead of clone
             let post_owned: Option<String> = None;
             let buyer_id_owned = buyer_id_opt;
 
@@ -329,7 +357,8 @@ impl PingTreeRouter {
                     buyer_id_owned,
                     campaign_id_val,
                     payload_owned,
-                ).await;
+                )
+                .await;
             });
         }
 
@@ -363,8 +392,12 @@ impl PingTreeRouter {
             };
 
             let status_str = final_status.as_str().to_string();
-            self.update_lead_status(pool.as_ref(), final_status, Some("No valid buyer responses"))
-                .await?;
+            self.update_lead_status(
+                pool.as_ref(),
+                final_status,
+                Some("No valid buyer responses"),
+            )
+            .await?;
 
             return Ok(RoutingResult {
                 success: false,
@@ -493,14 +526,15 @@ impl PingTreeRouter {
             match buyer_router.route().await {
                 Ok(bresp) => {
                     // Persist buyer response for this post attempt (with retry logic)
-                    let bresp_json = serde_json::to_value(&bresp).unwrap_or(serde_json::json!({}));
+                    let bresp_json =
+                        serde_json::to_value(&bresp).unwrap_or_else(|_| serde_json::json!({}));
                     // Persist asynchronously
                     let pool_clone = pool.as_ref().clone();
                     let lead_id_val = self.lead.uuid;
                     let campaign_id_val = campaign.id;
-                    let payload_owned = bresp_json.clone();
+                    let payload_owned = bresp_json; // Move instead of clone
                     let ping_owned: Option<String> = None;
-                    let post_owned = bresp.post_id.clone();
+                    let post_owned = bresp.post_id.clone(); // Clone since bresp is used later
                     let buyer_id_owned = Some(campaign.buyer_id);
 
                     tokio::spawn(async move {
@@ -512,7 +546,8 @@ impl PingTreeRouter {
                             buyer_id_owned,
                             campaign_id_val,
                             payload_owned,
-                        ).await;
+                        )
+                        .await;
                     });
 
                     if bresp.success && bresp.post_id.is_some() {
@@ -538,8 +573,12 @@ impl PingTreeRouter {
                             "timeout" => LeadStatus::Timeout,
                             _ => LeadStatus::Error,
                         };
-                        self.update_lead_status(pool.as_ref(), final_status.clone(), bresp.error.as_deref())
-                            .await?;
+                        self.update_lead_status(
+                            pool.as_ref(),
+                            final_status.clone(),
+                            bresp.error.as_deref(),
+                        )
+                        .await?;
                         Ok(RoutingResult {
                             success: false,
                             status: match final_status.clone() {
@@ -559,8 +598,12 @@ impl PingTreeRouter {
                 }
                 Err(e) => {
                     tracing::error!("BuyerRouter error during post: {}", e);
-                    self.update_lead_status(pool.as_ref(), LeadStatus::Error, Some("Buyer routing failed"))
-                        .await?;
+                    self.update_lead_status(
+                        pool.as_ref(),
+                        LeadStatus::Error,
+                        Some("Buyer routing failed"),
+                    )
+                    .await?;
                     Ok(RoutingResult {
                         success: false,
                         status: "error".to_string(),
@@ -575,8 +618,12 @@ impl PingTreeRouter {
                 }
             }
         } else {
-            self.update_lead_status(pool.as_ref(), LeadStatus::Error, Some("No campaign found for post"))
-                .await?;
+            self.update_lead_status(
+                pool.as_ref(),
+                LeadStatus::Error,
+                Some("No campaign found for post"),
+            )
+            .await?;
             Ok(RoutingResult {
                 success: false,
                 status: "error".to_string(),
@@ -602,7 +649,12 @@ impl PingTreeRouter {
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
             let ping_result = self
-                .route_ping_auction(pool.clone(), campaigns, priority_map, encryption_key.clone())
+                .route_ping_auction(
+                    pool.clone(),
+                    campaigns,
+                    priority_map,
+                    encryption_key.clone(),
+                )
                 .await?;
             if !ping_result.success {
                 return Ok(ping_result);
@@ -623,7 +675,9 @@ impl PingTreeRouter {
             );
 
             // Route post using the updated lead (which now has promise_id and campaign_id)
-            let post_result = post_router.route_post(pool.clone(), campaigns, encryption_key.clone()).await?;
+            let post_result = post_router
+                .route_post(pool.clone(), campaigns, encryption_key.clone())
+                .await?;
 
             // Merge ping and post results
             Ok(RoutingResult {
@@ -669,7 +723,7 @@ impl PingTreeRouter {
         payload: serde_json::Value,
     ) {
         let mut retries = PERSISTENCE_MAX_RETRIES;
-        
+
         while retries > 0 {
             let result = if ping_id.is_some() {
                 sqlx::query("INSERT INTO buyer_responses (lead_id, ping_id, buyer_id, campaign_id, payload, created_at) VALUES ($1, $2, $3, $4, $5, now())")
@@ -863,7 +917,9 @@ fn select_winner(
     // Find all candidates with highest price (within epsilon tolerance)
     let candidates: Vec<_> = sorted
         .iter()
-        .take_while(|(resp, _, _)| (resp.price.unwrap_or(0.0) - highest_price).abs() < PRICE_EPSILON)
+        .take_while(|(resp, _, _)| {
+            (resp.price.unwrap_or(0.0) - highest_price).abs() < PRICE_EPSILON
+        })
         .collect();
 
     // If only one, return it
@@ -889,7 +945,6 @@ fn select_winner(
     let (resp, id, pri) = winner;
     (resp.clone(), *id, *pri)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1110,6 +1165,10 @@ mod ping_tree_router_integration_tests;
 #[cfg(test)]
 #[path = "ping_tree_router_fullpost_tests.rs"]
 mod ping_tree_router_fullpost_tests;
+
+#[cfg(test)]
+#[path = "async_persistence_tests.rs"]
+mod async_persistence_tests;
 
 #[cfg(test)]
 #[path = "ping_tree_router_edge_case_tests.rs"]

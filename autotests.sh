@@ -54,8 +54,8 @@ if [ -f .env.local ]; then
   if [ -n "$DB_URL_LINE" ]; then
     DB_URL=${DB_URL_LINE#DATABASE_URL=}
     # strip possible surrounding quotes
-    DB_URL=${DB_URL%"}
-    DB_URL=${DB_URL#"}
+    DB_URL=${DB_URL%\"}
+    DB_URL=${DB_URL#\"}
   fi
 fi
 if [ -z "${DB_URL:-}" ] && [ -n "${DATABASE_URL:-}" ]; then
@@ -66,11 +66,31 @@ if [ -n "${DB_URL:-}" ]; then
   echo "Using DATABASE_URL from .env.local or environment for integration tests"
   export DATABASE_URL="$DB_URL"
   export RUST_TEST_THREADS=1
+  
+  # Run integration tests (including DB-backed tests)
   run_step "integration-tests" bash -lc 'cargo nextest run --tests --workspace --all-features --retries 2' || true
+  
+  # Run E2E tests if they exist
+  if cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
+    run_step "e2e-tests" bash -lc 'cargo test --test integration_carina_e2e --all-features -- --ignored' || true
+  else
+    echo "E2E tests not found; skipping"
+    status["e2e-tests"]="skipped"
+  fi
+  
+  # Run async persistence tests
+  if cargo test --lib -p leadsnebula_core --list 2>/dev/null | grep -q "async_persistence"; then
+    run_step "async-persistence-tests" bash -lc 'cargo test --lib -p leadsnebula_core async_persistence_tests --all-features -- --ignored' || true
+  else
+    echo "Async persistence tests not found; skipping"
+    status["async-persistence-tests"]="skipped"
+  fi
 else
   echo "No DATABASE_URL found in .env.local or environment; skipping DB-backed integration tests."
   echo "Set DATABASE_URL to your Neon dev branch connection string (or populate .env.local) to run them."
   status["integration-tests"]="skipped"
+  status["e2e-tests"]="skipped"
+  status["async-persistence-tests"]="skipped"
 fi
 
 # 6) Coverage (optional but run by default if cargo-llvm-cov is installed)
@@ -92,14 +112,14 @@ fi
 echo
 echo "================== autotests summary =================="
 fail_count=0
-for k in "fmt-check" "clippy" "workspace-tests" "integration-tests" "coverage"; do
+for k in "fmt-check" "clippy" "workspace-tests" "integration-tests" "e2e-tests" "async-persistence-tests" "coverage"; do
   rc=${status[$k]:-"not-run"}
   if [ "$rc" = "0" ]; then
-    printf "- %-18s : PASS\n" "$k"
+    printf -- "- %-18s : PASS\n" "$k"
   elif [ "$rc" = "skipped" ]; then
-    printf "- %-18s : SKIPPED\n" "$k"
+    printf -- "- %-18s : SKIPPED\n" "$k"
   else
-    printf "- %-18s : FAIL (code=%s) -> see %s/%s.log\n" "$k" "$rc" "$LOGDIR" "${k// /_}"
+    printf -- "- %-18s : FAIL (code=%s) -> see %s/%s.log\n" "$k" "$rc" "$LOGDIR" "${k// /_}"
     fail_count=$((fail_count+1))
   fi
 done

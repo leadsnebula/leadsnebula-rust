@@ -244,7 +244,10 @@ mod ping_tree_router_db_integration_tests {
         );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
-        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
+        let result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         // Verify lead status was updated
         let updated_lead = sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
@@ -291,7 +294,10 @@ mod ping_tree_router_db_integration_tests {
         );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
-        let _result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
+        let _result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         // Verify buyer_responses were persisted
         let count: i64 =
@@ -333,7 +339,10 @@ mod ping_tree_router_db_integration_tests {
         );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
-        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
+        let result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         if result.success {
             // Verify ping_payloads exists

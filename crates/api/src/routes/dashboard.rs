@@ -1234,8 +1234,8 @@ async fn _setup_otp_with_user(
 async fn list_publishers(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use tracing::{error, info};
     use sqlx::Row;
+    use tracing::{error, info};
     // TODO: Get instance_ids from user's JWT token
     // For now, get all publishers
     let start = std::time::Instant::now();
@@ -1253,7 +1253,8 @@ async fn list_publishers(
     info!("Found {} publishers", publishers.len());
 
     // If there are publishers, fetch all publisher vertical associations in one query (avoid N+1)
-    let mut publisher_verticals_map: std::collections::HashMap<uuid::Uuid, Vec<VerticalInfo>> = std::collections::HashMap::new();
+    let mut publisher_verticals_map: std::collections::HashMap<uuid::Uuid, Vec<VerticalInfo>> =
+        std::collections::HashMap::new();
 
     if !publishers.is_empty() {
         let ids: Vec<uuid::Uuid> = publishers.iter().map(|p| p.id).collect();
@@ -1279,11 +1280,14 @@ async fn list_publishers(
             let v_name: String = row.get("name");
             let v_slug: String = row.get("slug");
 
-            publisher_verticals_map.entry(pub_id).or_default().push(VerticalInfo {
-                id: v_id.to_string(),
-                name: v_name,
-                slug: v_slug,
-            });
+            publisher_verticals_map
+                .entry(pub_id)
+                .or_default()
+                .push(VerticalInfo {
+                    id: v_id.to_string(),
+                    name: v_name,
+                    slug: v_slug,
+                });
         }
     }
 

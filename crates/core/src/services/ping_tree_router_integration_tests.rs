@@ -209,7 +209,10 @@ mod ping_tree_router_integration_tests {
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
-        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
+        let result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");
@@ -237,7 +240,10 @@ mod ping_tree_router_integration_tests {
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
-        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
+        let result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");
@@ -261,7 +267,10 @@ mod ping_tree_router_integration_tests {
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
-        let result = router.route(pool_arc, encryption_key).await.expect("Route should complete");
+        let result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");
@@ -286,7 +295,12 @@ mod ping_tree_router_integration_tests {
         add_campaign_to_ping_tree(&pool, ping_tree_id, campaign.id, Some(1)).await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "unknown".to_string());
-        let result = router.route(&pool).await.expect("Route should complete");
+        let pool_arc = Arc::new(pool.clone());
+        let encryption_key = Arc::new(vec![0u8; 32]);
+        let result = router
+            .route(pool_arc, encryption_key)
+            .await
+            .expect("Route should complete");
 
         assert!(!result.success);
         assert_eq!(result.status, "error");

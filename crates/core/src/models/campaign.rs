@@ -55,10 +55,7 @@ impl Campaign {
         .await
     }
 
-    pub async fn find_by_ids(
-        pool: &sqlx::PgPool,
-        ids: &[Uuid],
-    ) -> Result<Vec<Self>, sqlx::Error> {
+    pub async fn find_by_ids(pool: &sqlx::PgPool, ids: &[Uuid]) -> Result<Vec<Self>, sqlx::Error> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
