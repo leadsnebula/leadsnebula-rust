@@ -8,7 +8,7 @@ use sqlx::PgPool;
 ///
 /// The sqlx Migrator should handle already-applied migrations gracefully,
 /// but we catch any errors related to duplicate migration records.
-pub async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
+pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     // Load local env if present (non-fatal)
     let _ = dotenvy::from_filename(".env.local");
     let _ = dotenvy::dotenv();
@@ -33,16 +33,15 @@ pub async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
 /// }
 /// ```
 #[allow(dead_code)]
-pub async fn run_test_in_transaction<F, Fut>(test_fn: F) -> Result<(), Box<dyn std::error::Error>>
+pub async fn run_test_in_transaction<F, Fut>(test_fn: F) -> anyhow::Result<()>
 where
     F: FnOnce(PgPool) -> Fut,
-    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     // Create pool and run provided test function. Tests should manage explicit
     // transactions (begin/rollback) if they need isolation.
     let pool = create_test_pool().await?;
-    let result = test_fn(pool).await;
-    result
+    test_fn(pool).await
 }
 
 /// Create a test pool and begin a transaction.
@@ -65,7 +64,7 @@ where
 /// ```
 #[allow(dead_code)]
 pub async fn create_test_pool_with_transaction(
-) -> Result<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>), Box<dyn std::error::Error>> {
+) -> anyhow::Result<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>)> {
     let pool = create_test_pool().await?;
     let tx = pool.begin().await?;
     Ok((pool, tx))

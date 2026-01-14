@@ -10,11 +10,8 @@ mod ping_tree_router_db_integration_tests {
     use uuid::Uuid;
 
     // Use unified test helper from `leadsnebula_core` for consistent behavior
-    async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
-        match crate::test_helpers::create_test_pool().await {
-            Ok(p) => Ok(p),
-            Err(e) => Err(e),
-        }
+    async fn create_test_pool() -> anyhow::Result<PgPool> {
+        crate::test_helpers::create_test_pool().await
     }
 
     async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, Uuid, String) {

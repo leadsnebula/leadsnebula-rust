@@ -1,3 +1,4 @@
+use anyhow;
 use once_cell::sync::Lazy;
 use sqlx::migrate::Migrator;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -14,23 +15,25 @@ static MIGRATION_CACHE: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(H
 /// - Connects to `DATABASE_URL`
 /// - Checks `_sqlx_migrations` and only runs migrations if needed (cached)
 /// - Fails fast on migration errors
-pub async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
+///
+/// Note: `PgPool::clone()` is cheap (Arc-based), so cached pools are efficiently shared.
+pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     // Load environment files if present (non-fatal)
     let _ = dotenvy::from_filename(".env.local");
     let _ = dotenvy::dotenv();
 
     let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL must be set for integration tests".to_string())?;
+        .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set for integration tests"))?;
 
     if database_url.contains("://root@") || database_url.contains("://root:") {
-        return Err(format!(
+        return Err(anyhow::anyhow!(
             "DATABASE_URL must not use 'root' user. Use 'postgres' instead. Current DATABASE_URL: {}",
             database_url
-        )
-        .into());
+        ));
     }
 
     // Return cached pool if available
+    // Note: PgPool::clone() is cheap (Arc-based), so this is efficient
     {
         let cache = POOL_CACHE.lock().unwrap();
         if let Some(p) = cache.get(&database_url) {
@@ -48,13 +51,13 @@ pub async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&database_url)
         .await
-        .map_err(|e| format!("Failed to connect to database: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
 
     // Quick health test
     sqlx::query("SELECT 1")
         .execute(&pool)
         .await
-        .map_err(|e| format!("Database connection test failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Database connection test failed: {}", e))?;
 
     // Find migrations directory
     if let Ok(migrations_path) = find_migrations_dir() {
@@ -67,52 +70,60 @@ pub async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
         }
 
         if should_run {
-            // Only run migrations if needed (check _sqlx_migrations)
-            match should_run_migrations(&pool).await {
-                Ok(true) => {
-                    // Run migrations with a timeout and fail fast on errors
-                    let migrator = Migrator::new(migrations_path.as_path()).await?;
-                    let run = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                        migrator.run(&pool).await
-                    })
-                    .await;
+            // Atomic check-and-set: Check migration cache again after acquiring lock
+            // This prevents race conditions where multiple tests try to run migrations simultaneously
+            let needs_migration = {
+                let mc = MIGRATION_CACHE.lock().unwrap();
+                !mc.contains(&database_url)
+            };
 
-                    match run {
-                        Ok(Ok(_)) => {
-                            // success
-                            let mut mc = MIGRATION_CACHE.lock().unwrap();
-                            mc.insert(database_url.clone());
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!("Migrations failed: {}", e);
-                            return Err(Box::new(e));
-                        }
-                        Err(_) => {
-                            return Err("Migrations timed out after 60s".into());
-                        }
-                    }
-                }
-                Ok(false) => {
-                    // Migrations not needed
+            if needs_migration {
+                // Mark as in-progress to prevent other threads from running migrations
+                {
                     let mut mc = MIGRATION_CACHE.lock().unwrap();
                     mc.insert(database_url.clone());
-                }
-                Err(e) => {
-                    // If we can't determine migration state, err on the side of caution and run migrations
-                    eprintln!("Could not check migration status: {}", e);
-                    let migrator = Migrator::new(migrations_path.as_path()).await?;
-                    let run = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                        migrator.run(&pool).await
-                    })
-                    .await;
+                } // Release lock before async operations
 
-                    match run {
-                        Ok(Ok(_)) => {
-                            let mut mc = MIGRATION_CACHE.lock().unwrap();
-                            mc.insert(database_url.clone());
-                        }
-                        Ok(Err(e)) => return Err(Box::new(e)),
-                        Err(_) => return Err("Migrations timed out after 60s".into()),
+                // Only run migrations if needed (check _sqlx_migrations)
+                let migration_result = match should_run_migrations(&pool).await {
+                    Ok(true) => {
+                        // Run migrations with a timeout and fail fast on errors
+                        let migrator = Migrator::new(migrations_path.as_path()).await?;
+                        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                            migrator.run(&pool).await
+                        })
+                        .await
+                    }
+                    Ok(false) => {
+                        // Migrations not needed - return success
+                        Ok(Ok(()))
+                    }
+                    Err(e) => {
+                        // If we can't determine migration state, err on the side of caution and run migrations
+                        eprintln!("Could not check migration status: {}", e);
+                        let migrator = Migrator::new(migrations_path.as_path()).await?;
+                        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                            migrator.run(&pool).await
+                        })
+                        .await
+                    }
+                };
+
+                match migration_result {
+                    Ok(Ok(_)) => {
+                        // Success - migration cache already updated
+                    }
+                    Ok(Err(e)) => {
+                        // Migration failed - remove from cache so it can be retried
+                        let mut mc = MIGRATION_CACHE.lock().unwrap();
+                        mc.remove(&database_url);
+                        return Err(anyhow::anyhow!("Migrations failed: {}", e));
+                    }
+                    Err(_) => {
+                        // Timeout - remove from cache so it can be retried
+                        let mut mc = MIGRATION_CACHE.lock().unwrap();
+                        mc.remove(&database_url);
+                        return Err(anyhow::anyhow!("Migrations timed out after 60s"));
                     }
                 }
             }
@@ -148,7 +159,7 @@ async fn should_run_migrations(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(applied == 0)
 }
 
-fn find_migrations_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+fn find_migrations_dir() -> anyhow::Result<std::path::PathBuf> {
     // Try current directory first
     let migrations_dir = Path::new("migrations");
     if migrations_dir.exists() {
@@ -178,7 +189,7 @@ fn find_migrations_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error
         }
     }
 
-    Err("Could not find migrations directory".into())
+    Err(anyhow::anyhow!("Could not find migrations directory"))
 }
 
 #[cfg(test)]
@@ -197,7 +208,7 @@ pub(crate) fn is_migration_cached(database_url: &str) -> bool {
 
 /// Create a test pool and begin a transaction
 pub async fn create_test_pool_with_transaction(
-) -> Result<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>), Box<dyn std::error::Error>> {
+) -> anyhow::Result<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>)> {
     let pool = create_test_pool().await?;
     let tx = pool.begin().await?;
     Ok((pool, tx))

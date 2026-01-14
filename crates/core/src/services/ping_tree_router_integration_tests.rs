@@ -339,7 +339,7 @@ mod ping_tree_router_integration_tests {
     }
 
     // Use unified test helper
-    async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
+    async fn create_test_pool() -> anyhow::Result<PgPool> {
         crate::test_helpers::create_test_pool().await
     }
 }

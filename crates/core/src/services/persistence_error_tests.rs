@@ -8,7 +8,7 @@ mod persistence_error_tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
+    async fn create_test_pool() -> anyhow::Result<PgPool> {
         crate::test_helpers::create_test_pool().await
     }
 
