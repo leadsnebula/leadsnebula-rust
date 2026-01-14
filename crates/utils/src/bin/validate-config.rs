@@ -318,18 +318,59 @@ fn validate_fly_toml(path: &PathBuf) -> Result<ValidationResult> {
 }
 
 fn validate_cargo_toml(path: &PathBuf) -> Result<ValidationResult> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read Cargo.toml: {}", path.display()))?;
-
-    let _parsed: toml::Value =
-        toml::from_str(&content).context("Failed to parse Cargo.toml as TOML")?;
-
-    // For now, just validate it's valid TOML
-    // Phase 2 will add more specific checks
-    let result = ValidationResult {
+    let mut result = ValidationResult {
         valid: true,
         ..Default::default()
     };
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read Cargo.toml: {}", path.display()))?;
+
+    let parsed: toml::Value =
+        toml::from_str(&content).context("Failed to parse Cargo.toml as TOML")?;
+
+    // Validate bench declarations - ensure bench files exist
+    // TOML [[bench]] syntax creates an array under the "bench" key
+    if let Some(benches) = parsed.get("bench") {
+        if let Some(bench_array) = benches.as_array() {
+            for bench in bench_array {
+                if let Some(bench_table) = bench.as_table() {
+                    if let Some(name) = bench_table.get("name").and_then(|n| n.as_str()) {
+                        // Get the path (explicit or default)
+                        let bench_path = if let Some(path_val) =
+                            bench_table.get("path").and_then(|p| p.as_str())
+                        {
+                            path_val.to_string()
+                        } else {
+                            // Default path: benches/{name}.rs or benches/{name}/main.rs
+                            format!("benches/{}.rs", name)
+                        };
+
+                        // Resolve relative to Cargo.toml directory
+                        let cargo_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                        let full_bench_path = cargo_dir.join(&bench_path);
+
+                        // Check if bench file exists
+                        if !full_bench_path.exists() {
+                            result.errors.push(ErrorMessage::with_remediation(
+                                format!(
+                                    "Bench '{}' declared in {} but file not found at {}",
+                                    name,
+                                    path.display(),
+                                    full_bench_path.display()
+                                ),
+                                format!(
+                                    "Create the bench file at {} or remove the [[bench]] declaration from Cargo.toml",
+                                    full_bench_path.display()
+                                ),
+                            ));
+                            result.valid = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(result)
 }

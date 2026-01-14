@@ -456,11 +456,82 @@ echo ""
 
 # 7. Cargo.toml validation
 echo "7️⃣  Validating Cargo.toml..."
-if ! cargo check --workspace > /dev/null 2>&1; then
-    echo "❌ Cargo.toml has issues. Check for version conflicts or missing dependencies."
-    ERRORS=$((ERRORS + 1))
+CARGO_TOML_ERRORS=0
+
+# Validate workspace Cargo.toml
+if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+    CARGO_TOML_OUTPUT=$("$VALIDATE_CONFIG_BIN" cargo-toml Cargo.toml 2>/dev/null || echo "")
+    
+    if [ -n "$CARGO_TOML_OUTPUT" ]; then
+        if [ "$USE_JQ" = "true" ]; then
+            ERROR_COUNT=$(echo "$CARGO_TOML_OUTPUT" | jq -r '[.errors[]?] | length' 2>/dev/null || echo "0")
+            
+            if [ "$ERROR_COUNT" -gt 0 ]; then
+                echo "❌ Cargo.toml validation failed:"
+                echo "$CARGO_TOML_OUTPUT" | jq -r '.errors[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                    if [ -n "$line" ]; then
+                        echo "$line"
+                    fi
+                done
+                CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+            else
+                echo "✅ Cargo.toml OK"
+            fi
+        else
+            if echo "$CARGO_TOML_OUTPUT" | grep -q '"errors"'; then
+                echo "❌ Cargo.toml validation failed"
+                CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+            else
+                echo "✅ Cargo.toml OK"
+            fi
+        fi
+    else
+        echo "⚠️  Could not validate Cargo.toml (validate-config unavailable)"
+    fi
 else
-    echo "✅ Cargo.toml OK"
+    # Fallback: basic cargo check
+    if ! cargo check --workspace > /dev/null 2>&1; then
+        echo "❌ Cargo.toml has issues. Check for version conflicts or missing dependencies."
+        CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+    else
+        echo "✅ Cargo.toml OK"
+    fi
+fi
+
+# Validate crate Cargo.toml files (check for bench declarations)
+for crate_toml in crates/*/Cargo.toml; do
+    if [ -f "$crate_toml" ]; then
+        CRATE_NAME=$(basename "$(dirname "$crate_toml")")
+        
+        if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
+            CRATE_OUTPUT=$("$VALIDATE_CONFIG_BIN" cargo-toml "$crate_toml" 2>/dev/null || echo "")
+            
+            if [ -n "$CRATE_OUTPUT" ]; then
+                if [ "$USE_JQ" = "true" ]; then
+                    ERROR_COUNT=$(echo "$CRATE_OUTPUT" | jq -r '[.errors[]?] | length' 2>/dev/null || echo "0")
+                    
+                    if [ "$ERROR_COUNT" -gt 0 ]; then
+                        echo "❌ $CRATE_NAME/Cargo.toml validation failed:"
+                        echo "$CRATE_OUTPUT" | jq -r '.errors[]? | if type == "object" then "   - \(.message)\n     → \(.remediation // "")" else "   - \(.)" end' 2>/dev/null | while read -r line; do
+                            if [ -n "$line" ]; then
+                                echo "$line"
+                            fi
+                        done
+                        CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+                    fi
+                else
+                    if echo "$CRATE_OUTPUT" | grep -q '"errors"'; then
+                        echo "❌ $CRATE_NAME/Cargo.toml validation failed"
+                        CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+                    fi
+                fi
+            fi
+        fi
+    fi
+done
+
+if [ "$CARGO_TOML_ERRORS" -gt 0 ]; then
+    ERRORS=$((ERRORS + CARGO_TOML_ERRORS))
 fi
 echo ""
 

@@ -28,6 +28,11 @@ COPY crates/api/Cargo.toml crates/api/
 COPY crates/core/Cargo.toml crates/core/
 COPY crates/utils/Cargo.toml crates/utils/
 
+# Copy bench files (required for Cargo manifest validation)
+# Cargo validates all declared benches during manifest parsing (cargo fetch/build)
+# Only copy if benches directory exists (some crates may not have benches)
+COPY crates/core/benches/ crates/core/benches/ 2>/dev/null || mkdir -p crates/core/benches
+
 # Fetch dependencies (cached layer)
 RUN cargo fetch --locked
 
