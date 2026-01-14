@@ -988,8 +988,11 @@ impl PingTreeRouter {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn select_winner_for_test(
+// Make available to both tests and benchmarks
+// Benchmarks are compiled as separate binaries, so need pub visibility
+// This is a test helper and not part of the public API
+#[doc(hidden)]
+pub fn select_winner_for_test(
     responses: Vec<(&BuyerResponse, Uuid, Option<i32>)>,
 ) -> (BuyerResponse, Uuid, Option<i32>) {
     // Convert to owned values and create references for select_winner
