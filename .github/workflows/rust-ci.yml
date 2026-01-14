@@ -119,18 +119,26 @@ jobs:
               ["utils"]="leadsnebula-utils"
             )
             
-            # Build package filter arguments
+            # Build package filter arguments, filtering out binary-only packages for --lib tests
+            # leadsnebula-api is binary-only (no lib.rs), so skip it for --lib tests
             PACKAGES=""
+            LIB_PACKAGES=""
             for dir in $CHANGED_CRATES; do
               pkg_dir="${dir#crates/}"  # Remove "crates/" prefix
               pkg_name="${PKG_MAP[$pkg_dir]:-$pkg_dir}"  # Map or fallback to directory name
               PACKAGES="$PACKAGES -p $pkg_name"
+              # Skip binary-only packages for --lib tests
+              if [ "$pkg_name" != "leadsnebula-api" ]; then
+                LIB_PACKAGES="$LIB_PACKAGES -p $pkg_name"
+              fi
             done
             
             echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+            echo "lib_packages=$LIB_PACKAGES" >> $GITHUB_OUTPUT
             echo "run_all=false" >> $GITHUB_OUTPUT
             echo "Changed crates: $CHANGED_CRATES"
             echo "Package filter: $PACKAGES"
+            echo "Library package filter: $LIB_PACKAGES"
           fi
 
       - name: Run unit tests with nextest
@@ -142,12 +150,19 @@ jobs:
             cargo nextest run --lib --locked --all-features \
               --retries 2
           else
-            echo "Running tests for changed crates: ${{ steps.changed-crates.outputs.packages }}"
-            cargo nextest run --lib ${{ steps.changed-crates.outputs.packages }} --locked --all-features \
-              --retries 2 || \
-            # Fallback: if filtered tests fail, run all tests to ensure nothing broke
-            (echo "⚠️ Filtered tests had issues, running full test suite..." && \
-             cargo nextest run --lib --locked --all-features --retries 2)
+            # Use lib_packages which excludes binary-only crates
+            LIB_PACKAGES="${{ steps.changed-crates.outputs.lib_packages }}"
+            if [ -n "$LIB_PACKAGES" ]; then
+              echo "Running tests for changed library crates: $LIB_PACKAGES"
+              cargo nextest run --lib $LIB_PACKAGES --locked --all-features \
+                --retries 2 || \
+              # Fallback: if filtered tests fail, run all tests to ensure nothing broke
+              (echo "⚠️ Filtered tests had issues, running full test suite..." && \
+               cargo nextest run --lib --locked --all-features --retries 2)
+            else
+              echo "Only binary-only crates changed (no library tests to run)"
+              echo "Skipping --lib tests (binary crates don't have library tests)"
+            fi
           fi
 
   test-integration:

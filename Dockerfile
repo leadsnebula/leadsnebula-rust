@@ -51,7 +51,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     CARGO_BUILD_JOBS=4 \
     CARGO_INCREMENTAL=1 \
-    RUSTFLAGS="-C target-cpu=native" \
     cargo build --release --locked --bin leadsnebula-api --bin run-migrations --bin create-user --bin update-password --bin test-redis-connection && \
     mkdir -p /app/binaries && \
     cp /app/target/release/leadsnebula-api /app/binaries/ && \
