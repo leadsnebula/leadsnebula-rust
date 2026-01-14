@@ -38,6 +38,20 @@ use leadsnebula_core::auth::{hash_password, verify_password, JwtService};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+// Smoke test to verify database connection works
+// This will fail loudly if DATABASE_URL is wrong or connection fails
+#[sqlx::test]
+async fn test_db_connection(pool: PgPool) {
+    // Force connection check - this will fail loudly if connection is bad
+    let result = sqlx::query("SELECT 1 as test_value")
+        .fetch_one(&pool)
+        .await
+        .expect("Database connection failed - check DATABASE_URL");
+
+    let value: i32 = sqlx::Row::get(&result, 0);
+    assert_eq!(value, 1, "Database query returned unexpected value");
+}
+
 // Load .env.local automatically before tests run
 // Note: Each test that needs env vars should load them, or we can use a test setup function
 fn load_test_env() {

@@ -18,15 +18,37 @@ pub async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
 
+    // Validate DATABASE_URL format - ensure it doesn't use 'root' user
+    if database_url.contains("://root@") || database_url.contains("://root:") {
+        panic!(
+            "DATABASE_URL must not use 'root' user. Use 'postgres' user instead. \
+             Current DATABASE_URL: {}",
+            database_url
+        );
+    }
+
     // Create pool with connection timeout
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&database_url)
-        .await?;
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to connect to database with URL: {} (error: {})",
+                database_url.replace(
+                    &std::env::var("POSTGRES_PASSWORD").unwrap_or_default(),
+                    "***"
+                ),
+                e
+            )
+        })?;
 
     // Test the connection works before trying migrations
-    sqlx::query("SELECT 1").execute(&pool).await?;
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Database connection test failed: {}", e))?;
 
     // Find migrations directory - try multiple locations
     // If we can't find it, that's okay - tests might work without migrations

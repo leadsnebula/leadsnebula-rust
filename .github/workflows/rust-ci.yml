@@ -159,6 +159,7 @@ jobs:
       postgres:
         image: postgres:15
         env:
+          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: test_db
         options: >-
@@ -168,7 +169,7 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
-
+    
     steps:
       - uses: actions/checkout@v4
 
@@ -191,19 +192,46 @@ jobs:
             cargo install cargo-nextest --locked
           fi
 
+      - name: Wait for database
+        run: |
+          echo "Waiting for PostgreSQL to be ready..."
+          # Install postgresql-client if not available (for pg_isready)
+          sudo apt-get update -qq && sudo apt-get install -y postgresql-client || true
+          until pg_isready -h localhost -p 5432 -U postgres; do
+            echo "Database not ready, waiting..."
+            sleep 2
+          done
+          echo "✅ Database is ready"
+          
+          # Verify connection with correct credentials
+          PGPASSWORD=postgres psql -h localhost -U postgres -d test_db -c "SELECT 1" || {
+            echo "❌ Failed to connect to database with postgres user"
+            exit 1
+          }
+          echo "✅ Database connection verified"
+
       - name: Run integration tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/test_db
         run: |
-          # Run integration tests with nextest for faster execution
+          # Verify DATABASE_URL is set correctly
+          echo "DATABASE_URL is set to: ${DATABASE_URL}"
+          
           # Run health endpoint tests
           cargo nextest run --test integration_health --locked --all-features \
             --retries 2 || \
           cargo test --test integration_health --locked --all-features
+          
           # Run authentication integration tests
           # Note: sqlx::test handles database isolation automatically, so parallel execution is safe
           # If you encounter database conflicts locally, test with: cargo test --test integration_auth -- --test-threads=4
           cargo test --test integration_auth --locked --all-features
+          
+          # Run publisher CRUD tests
+          cargo test --test integration_publisher_crud --locked --all-features
+          
+          # Run E2E tests
+          cargo test --test integration_carina_e2e --locked --all-features
 
   build:
     name: Build Release
@@ -237,6 +265,7 @@ jobs:
       postgres:
         image: postgres:15
         env:
+          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: test_db
         options: >-
@@ -276,7 +305,7 @@ jobs:
 
       - name: Generate coverage report
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/test_db
           RUST_TEST_THREADS: 1
         run: |
           # Clean old coverage artifacts (optional but recommended)
