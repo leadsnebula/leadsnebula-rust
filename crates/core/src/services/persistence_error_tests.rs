@@ -9,20 +9,7 @@ mod persistence_error_tests {
     use uuid::Uuid;
 
     async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
-        let database_url = std::env::var("DATABASE_URL")
-            .ok()
-            .ok_or_else(|| "DATABASE_URL not set".to_string())?;
-
-        use sqlx::postgres::PgPoolOptions;
-        use tokio::time::Duration;
-
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&database_url)
-            .await?;
-
-        Ok(pool)
+        crate::test_helpers::create_test_pool().await
     }
 
     fn sample_lead() -> Lead {

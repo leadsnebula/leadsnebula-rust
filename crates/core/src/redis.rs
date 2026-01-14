@@ -243,7 +243,13 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires Redis URL in environment
     async fn test_redis_tls_connection() {
-        let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL must be set for this test");
+        let redis_url = match std::env::var("REDIS_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("Skipping test - REDIS_URL not set");
+                return;
+            }
+        };
 
         // Test that we can create a client and connection manager
         let client = Client::open(redis_url.as_str()).expect("Failed to create Redis client");

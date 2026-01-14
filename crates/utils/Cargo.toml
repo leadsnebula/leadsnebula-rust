@@ -81,6 +81,10 @@ path = "src/bin/verify-email-index.rs"
 name = "validate-config"
 path = "src/bin/validate-config.rs"
 
+[[bin]]
+name = "cleanup-instance-data"
+path = "src/bin/cleanup-instance-data.rs"
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
@@ -88,7 +92,7 @@ sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "
 redis = { workspace = true }
 leadsnebula_core = { path = "../core" }
 anyhow = { workspace = true }
-dotenv = { workspace = true }
+dotenvy = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 chrono = { workspace = true }
 tracing = { workspace = true }

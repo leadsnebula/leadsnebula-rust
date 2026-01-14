@@ -54,7 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 base64 = "0.22"  # Updated to match transitive dependencies (was 0.21)
 hex = "0.4"
-dotenv = "0.15"
+dotenvy = "0.15"  # Maintained fork of unmaintained dotenv
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 reqwest = { version = "0.12", features = ["json"] }
 futures = "0.3"

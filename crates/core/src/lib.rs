@@ -25,6 +25,9 @@ pub mod rls;
 pub mod services;
 pub mod ssm;
 
+// Shared test helpers used by multiple crates in the workspace
+pub mod test_helpers;
+
 #[cfg(test)]
 mod encryption_compatibility_tests;
 

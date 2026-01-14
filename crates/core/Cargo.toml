@@ -34,6 +34,7 @@ hex = { workspace = true }
 rust_decimal = { workspace = true }
 reqwest = { workspace = true }
 once_cell = "1.19"
+dotenvy = "0.15"
 futures = { workspace = true }
 
 # Optional features

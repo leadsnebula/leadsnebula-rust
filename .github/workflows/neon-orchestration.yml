@@ -1,0 +1,39 @@
+name: 'Neon Orchestration (manual)'
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  run-orchestration:
+    name: Run Neon orchestration test (manual)
+    runs-on: ubuntu-latest
+    env:
+      NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neon CLI (if missing)
+        run: |
+          if ! command -v neonctl >/dev/null 2>&1; then
+            echo "neonctl not found, installing via npm..."
+            sudo npm install -g @neondatabase/neonctl || true
+          fi
+          neonctl --version || true
+
+      - name: Run Neon orchestration test (opt-in)
+        env:
+          TEST_EPHEMERAL_NEON_TESTS: "true"
+          TEST_RUN_ID: "gh-${{ github.run_id }}"
+        run: |
+          set -e
+          echo "Running Neon orchestration test (this will create & delete an ephemeral branch)"
+          cargo test -p leadsnebula_core --test neon_orchestration_tests -- --nocapture
+
+      - name: Cleanup Neon branch (best-effort)
+        if: always()
+        run: |
+          set -e
+          BRANCH_NAME="ci-local-gh-${{ github.run_id }}"
+          echo "Deleting branch $BRANCH_NAME"
+          neonctl branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true

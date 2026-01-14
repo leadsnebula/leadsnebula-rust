@@ -22,7 +22,11 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, String, String) {
+// Helper function that works with both PgPool and Transaction
+async fn setup_test_data<'e, E>(executor: &mut E) -> (Uuid, Uuid, String, String)
+where
+    for<'c> &'c mut E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
     // Create instance_user
     let instance_user_id = Uuid::new_v4();
     let unique_email = format!("test_user_{}@test.invalid", Uuid::new_v4());
@@ -37,7 +41,7 @@ async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, String, String) {
         .bind(instance_user_id)
         .bind(&unique_email)
         .bind("hashed_password")
-        .execute(pool)
+        .execute(&mut *executor)
         .await
         .unwrap();
 
@@ -45,15 +49,15 @@ async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, String, String) {
     let instance_id = Uuid::new_v4();
     sqlx::query(
         r#"
-            INSERT INTO instances (id, instance_user_id, name, status, created_at, updated_at)
-            VALUES ($1, $2, $3, 'active', NOW(), NOW())
+                INSERT INTO instances (id, instance_user_id, name, payment_status, created_at, updated_at)
+                    VALUES ($1, $2, $3, 'active', NOW(), NOW())
             ON CONFLICT DO NOTHING
             "#,
     )
     .bind(instance_id)
     .bind(instance_user_id)
     .bind("Test Instance")
-    .execute(pool)
+    .execute(&mut *executor)
     .await
     .unwrap();
 
@@ -70,7 +74,7 @@ async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, String, String) {
     .bind(vertical_id)
     .bind(&vertical_slug)
     .bind("Test Vertical")
-    .execute(pool)
+    .execute(&mut *executor)
     .await
     .unwrap();
 
@@ -78,10 +82,18 @@ async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, String, String) {
     let publisher_id = Uuid::new_v4();
     let publisher_email = format!("publisher_{}@test.invalid", Uuid::new_v4());
     let api_key_hash = format!("api_key_{}", Uuid::new_v4());
+    // Create a test encryption key and encrypted API key value to satisfy NOT NULL constraints
+    let test_key = vec![0u8; 32];
+    let encryption_service = leadsnebula_core::encryption::EncryptionService::new(&test_key)
+        .expect("Failed to create encryption service");
+    let test_api_key = format!("pk_test_{}", Uuid::new_v4());
+    let encrypted_key = encryption_service
+        .encrypt(&test_api_key)
+        .expect("Failed to encrypt API key");
     sqlx::query(
             r#"
-            INSERT INTO publishers (id, instance_id, name, email, api_key_hash, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, 'active', NOW(), NOW())
+            INSERT INTO publishers (id, instance_id, name, email, api_key_prefix, api_key_hash, api_key_encrypted, status, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NOW(), NOW())
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -89,8 +101,10 @@ async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, String, String) {
         .bind(instance_id)
         .bind("Test Publisher")
         .bind(&publisher_email)
+        .bind("pk_test_")
         .bind(&api_key_hash)
-        .execute(pool)
+        .bind(&encrypted_key)
+        .execute(&mut *executor)
         .await
         .unwrap();
 
@@ -108,7 +122,8 @@ async fn create_test_app_state() -> (Router, PgPool) {
 #[ignore] // Requires database setup
 async fn test_e2e_ping_request_flow() {
     let (_app, pool) = create_test_app_state().await;
-    let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&mut *tx).await;
 
     // Create buyer and campaign
     let buyer_id = Uuid::new_v4();
@@ -121,7 +136,7 @@ async fn test_e2e_ping_request_flow() {
     )
     .bind(buyer_id)
     .bind("Test Buyer")
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .unwrap();
 
@@ -138,7 +153,7 @@ async fn test_e2e_ping_request_flow() {
         .bind(publisher_id)
         .bind(&vertical_slug)
         .bind(format!("token_{}", Uuid::new_v4()))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -146,15 +161,16 @@ async fn test_e2e_ping_request_flow() {
     let ping_tree_id = Uuid::new_v4();
     sqlx::query(
             r#"
-            INSERT INTO ping_trees (id, publisher_id, vertical_id, status, strategy, created_at, updated_at)
-            VALUES ($1, $2, $3, 'active', 'ping_post', NOW(), NOW())
+            INSERT INTO ping_trees (id, publisher_id, instance_id, name, vertical, status, strategy, created_at, updated_at)
+            VALUES ($1, $2, (SELECT id FROM instances LIMIT 1), $3, $4, 'active', 'ping_post', NOW(), NOW())
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(ping_tree_id)
         .bind(publisher_id)
-        .bind(vertical_id)
-        .execute(&pool)
+        .bind("Test Ping Tree")
+        .bind(&vertical_slug)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -168,7 +184,7 @@ async fn test_e2e_ping_request_flow() {
         )
         .bind(ping_tree_id)
         .bind(campaign_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -248,7 +264,7 @@ async fn test_e2e_ping_request_flow() {
     let updated_lead: Option<Lead> =
         sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
             .bind(lead.uuid)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await
             .unwrap();
 
@@ -260,11 +276,14 @@ async fn test_e2e_ping_request_flow() {
     let response_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM buyer_responses WHERE lead_id = $1")
             .bind(lead.uuid)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await
             .unwrap();
 
     assert!(response_count >= 0); // At least attempted to persist
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -273,10 +292,14 @@ async fn test_e2e_fullpost_request_flow() {
     // Similar to ping test but for fullpost
     // This verifies the complete ping -> post flow
     let (_app, pool) = create_test_app_state().await;
-    let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&mut *tx).await;
 
     // Setup similar to ping test...
     // Test fullpost routing and verify both ping and post payloads are persisted
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -287,4 +310,11 @@ async fn test_e2e_error_handling() {
     // - No campaigns
     // - Invalid vertical
     // - Database errors
+    let (_app, pool) = create_test_app_state().await;
+    let tx = pool.begin().await.unwrap();
+
+    // Test error scenarios here...
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await.unwrap();
 }

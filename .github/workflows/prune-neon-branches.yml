@@ -1,0 +1,28 @@
+name: 'Prune Neon branches'
+
+# Run daily to remove stale ephemeral branches created by local/CI runs
+on:
+  schedule:
+    - cron: '0 1 * * *' # every day at 01:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  prune:
+    name: Prune orphaned Neon branches
+    runs-on: ubuntu-latest
+    env:
+      NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neon CLI
+        run: |
+          if ! command -v neonctl >/dev/null 2>&1; then
+            sudo npm install -g @neondatabase/neonctl || true
+          fi
+          neonctl --version || true
+
+      - name: Prune branches (24h)
+        run: |
+          ./scripts/clean-orphan-neon-branches.sh --project "$NEON_PROJECT_ID" --older-than 24h

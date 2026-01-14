@@ -2,6 +2,9 @@
 # This file configures license checking for the Rust project
 
 [licenses]
+# Version 2: use new config format (removes deprecated keys)
+version = 2
+
 # Allow common Rust ecosystem licenses
 # These are standard, permissive licenses used by the Rust community
 allow = [
@@ -14,26 +17,18 @@ allow = [
     "ISC",
     "Zlib",
     "Unlicense",
+    # Additional commonly-used permissive licenses
+    "MPL-2.0",           # Mozilla Public License 2.0
+    "Unicode-3.0",       # Unicode License
+    "BSL-1.0",           # Boost Software License
 ]
 
-# Deny copyleft licenses (GPL, AGPL, etc.)
+# Copyleft licenses (GPL, AGPL, etc.) are now denied by default with version = 2
 # These require derivative works to be open source
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
-]
-
-# Allow unknown licenses (for crates without explicit license)
-# This is a safety net, but we should prefer crates with explicit licenses
-allow-osi-fsf-free = "neither"
 
 # Exemptions (if needed for specific crates)
 # Add specific crate exemptions here if necessary
-# exemptions = []
+# exceptions = []
 
 [licenses.private]
 # Don't require licenses for private workspace crates

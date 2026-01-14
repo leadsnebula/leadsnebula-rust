@@ -8,9 +8,9 @@ use std::sync::Arc;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    let env_loaded = dotenvy::from_filename(".env.local").is_ok();
     if !env_loaded {
-        let _ = dotenv::dotenv();
+        let _ = dotenvy::dotenv();
     }
 
     let environment = std::env::var("ENVIRONMENT")

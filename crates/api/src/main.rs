@@ -107,12 +107,12 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(_e) => {
                 // .env.local exists but couldn't be read, try .env as fallback
-                let _ = dotenv::dotenv();
+                let _ = dotenvy::dotenv();
             }
         }
     } else {
         // .env.local doesn't exist or not in dev, try .env as fallback
-        let _ = dotenv::dotenv();
+        let _ = dotenvy::dotenv();
     }
 
     // Initialize tracing

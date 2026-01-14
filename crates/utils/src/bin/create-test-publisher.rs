@@ -7,8 +7,8 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env.local
-    let _ = dotenv::from_filename(".env.local");
-    let _ = dotenv::dotenv();
+    let _ = dotenvy::from_filename(".env.local");
+    let _ = dotenvy::dotenv();
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 

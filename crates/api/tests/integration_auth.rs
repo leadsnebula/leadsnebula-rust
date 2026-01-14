@@ -35,34 +35,41 @@ mod common;
 
 use common::create_test_pool;
 use leadsnebula_core::auth::{hash_password, verify_password, JwtService};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 // Smoke test to verify database connection works
 // This will fail loudly if DATABASE_URL is wrong or connection fails
-#[sqlx::test]
-async fn test_db_connection(pool: PgPool) {
-    // Force connection check - this will fail loudly if connection is bad
-    let result = sqlx::query("SELECT 1 as test_value")
-        .fetch_one(&pool)
-        .await
-        .expect("Database connection failed - check DATABASE_URL");
+#[tokio::test]
+async fn test_db_connection() {
+    // Load env and read DATABASE_URL directly to avoid test helper generics
+    let _ = dotenvy::from_filename(".env.local");
+    let _ = dotenvy::dotenv();
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for smoke test");
 
-    let value: i32 = sqlx::Row::get(&result, 0);
-    assert_eq!(value, 1, "Database query returned unexpected value");
+    // Connect directly to the database (simple smoke check)
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("Failed to connect to DATABASE_URL");
+    sqlx::query("SELECT 1").fetch_one(&pool).await.unwrap();
+    println!("DB smoke test: connection OK");
 }
 
 // Load .env.local automatically before tests run
 // Note: Each test that needs env vars should load them, or we can use a test setup function
 fn load_test_env() {
     // Try .env.local first (for local development)
-    let _ = dotenv::from_filename(".env.local");
+    let _ = dotenvy::from_filename(".env.local");
     // Fallback to .env if .env.local doesn't exist
-    let _ = dotenv::dotenv();
+    let _ = dotenvy::dotenv();
 }
 
 // Helper function to create a test user with a unique email
-async fn create_test_user(pool: &PgPool, email: &str) -> Uuid {
+// Works with both PgPool and Transaction (via sqlx::Executor trait)
+async fn create_test_user<'e, E>(executor: E, email: &str) -> Uuid
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let user_id = Uuid::new_v4();
     let password_hash = hash_password("TestPassword123!").unwrap();
 
@@ -86,7 +93,7 @@ async fn create_test_user(pool: &PgPool, email: &str) -> Uuid {
     .bind(user_id)
     .bind(&unique_email)
     .bind(password_hash)
-    .execute(pool)
+    .execute(executor)
     .await
     .unwrap();
 
@@ -157,7 +164,8 @@ async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "otp_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "otp_test@example.com").await;
 
     // Create OTP setting
     let secret = "JBSWY3DPEHPK3PXP"; // Base32 encoded test secret
@@ -175,20 +183,22 @@ async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
     .bind(user_id)
     .bind(secret)
     .bind(backup_codes_json)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify OTP setting was created
     let otp_secret: Option<String> =
         sqlx::query_scalar("SELECT secret FROM user_otp_settings WHERE platform_user_id = $1")
             .bind(user_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
 
     assert!(otp_secret.is_some());
     assert_eq!(otp_secret.unwrap(), secret);
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -197,7 +207,8 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "otp_enable_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "otp_enable_test@example.com").await;
 
     // Create OTP setting (disabled)
     let secret = "JBSWY3DPEHPK3PXP";
@@ -211,14 +222,14 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
     )
     .bind(user_id)
     .bind(secret)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify OTP is disabled
     let enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1")
             .bind(user_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
 
@@ -229,14 +240,14 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
         "UPDATE user_otp_settings SET enabled = true, updated_at = NOW() WHERE platform_user_id = $1",
     )
     .bind(user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify OTP is enabled
     let enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1")
             .bind(user_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
 
@@ -247,19 +258,21 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
         "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE platform_user_id = $1",
     )
     .bind(user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify OTP is disabled again
     let enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1")
             .bind(user_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
 
     assert_eq!(enabled, Some(false));
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -268,7 +281,8 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "otp_backup_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "otp_backup_test@example.com").await;
 
     // Create OTP setting with backup codes
     let secret = "JBSWY3DPEHPK3PXP";
@@ -286,7 +300,7 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
     .bind(user_id)
     .bind(secret)
     .bind(backup_codes_json)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Retrieve backup codes
@@ -294,7 +308,7 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
         "SELECT backup_codes FROM user_otp_settings WHERE platform_user_id = $1",
     )
     .bind(user_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await?
     .flatten();
 
@@ -303,6 +317,8 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
     assert_eq!(stored_codes.len(), 3);
     assert!(stored_codes.contains(&"12345678".to_string()));
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -311,7 +327,8 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "passkey_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "passkey_test@example.com").await;
 
     // Create a test passkey credential
     let passkey_id = Uuid::new_v4();
@@ -337,7 +354,7 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     .bind(sign_count)
     .bind(name)
     .bind(passkey_type)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify passkey was stored
@@ -346,7 +363,7 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     )
     .bind(user_id)
     .bind(&external_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await?
     .flatten();
 
@@ -356,11 +373,13 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM webauthn_credentials WHERE platform_user_id = $1")
             .bind(user_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     assert_eq!(count, 1);
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -369,7 +388,8 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "passkey_limit_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "passkey_limit_test@example.com").await;
 
     // Create 3 passkeys (max limit)
     for i in 0..3 {
@@ -391,7 +411,7 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
         .bind(external_id)
         .bind(public_key)
         .bind(format!("Passkey {}", i + 1))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -399,11 +419,13 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM webauthn_credentials WHERE platform_user_id = $1")
             .bind(user_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     assert_eq!(count, 3);
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -412,13 +434,14 @@ async fn test_user_password_verification() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "password_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "password_test@example.com").await;
 
     // Retrieve stored password hash
     let stored_hash: String =
         sqlx::query_scalar("SELECT encrypted_password FROM instance_users WHERE id = $1")
             .bind(user_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     // Verify password matches
@@ -427,6 +450,8 @@ async fn test_user_password_verification() -> sqlx::Result<()> {
     // Verify wrong password doesn't match
     assert!(!verify_password("WrongPassword123!", &stored_hash).unwrap());
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -435,13 +460,14 @@ async fn test_user_status_affects_authentication() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let user_id = create_test_user(&pool, "status_test@example.com").await;
+    let mut tx = pool.begin().await?;
+    let user_id = create_test_user(&mut *tx, "status_test@example.com").await;
 
     // Verify user is active
     let status: String =
         sqlx::query_scalar("SELECT status::text FROM instance_users WHERE id = $1")
             .bind(user_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     assert_eq!(status, "active");
@@ -449,18 +475,20 @@ async fn test_user_status_affects_authentication() -> sqlx::Result<()> {
     // Suspend user
     sqlx::query("UPDATE instance_users SET status = 'suspended'::instance_user_status_enum, updated_at = NOW() WHERE id = $1")
         .bind(user_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
 
     // Verify user is suspended
     let status: String =
         sqlx::query_scalar("SELECT status::text FROM instance_users WHERE id = $1")
             .bind(user_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     assert_eq!(status, "suspended");
 
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 

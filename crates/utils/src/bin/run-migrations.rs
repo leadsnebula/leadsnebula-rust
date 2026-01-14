@@ -13,9 +13,9 @@ async fn main() -> Result<()> {
 
     // Load .env.local first for local development (highest priority)
     // This ensures local development doesn't interfere with production
-    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    let env_loaded = dotenvy::from_filename(".env.local").is_ok();
     if !env_loaded {
-        let _ = dotenv::dotenv();
+        let _ = dotenvy::dotenv();
     }
 
     if env_loaded {

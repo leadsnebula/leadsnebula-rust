@@ -16,7 +16,11 @@ use leadsnebula_core::auth::hash_password;
 use uuid::Uuid;
 
 // Helper function to create a test instance_user
-async fn create_test_instance_user(pool: &sqlx::PgPool) -> Uuid {
+// Works with both PgPool and Transaction (via sqlx::Executor trait)
+async fn create_test_instance_user<'e, E>(executor: E) -> Uuid
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let user_id = Uuid::new_v4();
     let unique_email = format!(
         "test_user_{}_{}@test.invalid",
@@ -37,7 +41,7 @@ async fn create_test_instance_user(pool: &sqlx::PgPool) -> Uuid {
     .bind(user_id)
     .bind(&unique_email)
     .bind(password_hash)
-    .execute(pool)
+    .execute(executor)
     .await
     .unwrap();
 
@@ -50,9 +54,9 @@ async fn create_test_instance_user(pool: &sqlx::PgPool) -> Uuid {
 #[ctor::ctor]
 fn init() {
     // Try .env.local first (for local development)
-    let _ = dotenv::from_filename(".env.local");
+    let _ = dotenvy::from_filename(".env.local");
     // Fallback to .env if .env.local doesn't exist
-    let _ = dotenv::dotenv();
+    let _ = dotenvy::dotenv();
 }
 
 #[tokio::test]
@@ -60,8 +64,9 @@ async fn test_create_publisher() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
+    let mut tx = pool.begin().await?;
     // Test creating a publisher with all required fields
-    let instance_user_id = create_test_instance_user(&pool).await;
+    let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();
     let publisher_name = format!("Test Publisher {}", Uuid::new_v4());
     let publisher_email = format!("test{}@example.com", Uuid::new_v4());
@@ -73,7 +78,7 @@ async fn test_create_publisher() -> sqlx::Result<()> {
     )
     .bind(instance_id)
     .bind(instance_user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Create publisher
@@ -106,16 +111,19 @@ async fn test_create_publisher() -> sqlx::Result<()> {
     .bind(api_key_prefix)
     .bind(&api_key_hash)
     .bind(&encrypted_key)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify publisher was created
     let result = sqlx::query_scalar::<_, String>("SELECT name FROM publishers WHERE id = $1")
         .bind(publisher_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *tx)
         .await?;
 
     assert_eq!(result, publisher_name);
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -124,8 +132,9 @@ async fn test_list_publishers() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
+    let mut tx = pool.begin().await?;
     // Test listing publishers
-    let instance_user_id = create_test_instance_user(&pool).await;
+    let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();
 
     // Create instance
@@ -135,7 +144,7 @@ async fn test_list_publishers() -> sqlx::Result<()> {
     )
     .bind(instance_id)
     .bind(instance_user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Create multiple publishers
@@ -167,7 +176,7 @@ async fn test_list_publishers() -> sqlx::Result<()> {
         .bind(&unique_email)
         .bind(&api_key_hash)
         .bind(&encrypted_key)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -176,10 +185,13 @@ async fn test_list_publishers() -> sqlx::Result<()> {
         "SELECT COUNT(*) FROM publishers WHERE instance_id = $1 AND deleted_at IS NULL",
     )
     .bind(instance_id)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     assert_eq!(count, 3);
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -188,8 +200,9 @@ async fn test_update_publisher() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
+    let mut tx = pool.begin().await?;
     // Test updating a publisher
-    let instance_user_id = create_test_instance_user(&pool).await;
+    let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();
     let publisher_id = Uuid::new_v4();
 
@@ -200,7 +213,7 @@ async fn test_update_publisher() -> sqlx::Result<()> {
     )
     .bind(instance_id)
     .bind(instance_user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Create publisher
@@ -227,23 +240,26 @@ async fn test_update_publisher() -> sqlx::Result<()> {
     .bind(&unique_email)
     .bind(&api_key_hash)
     .bind(&encrypted_key)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Update publisher
     sqlx::query("UPDATE publishers SET name = $1, updated_at = NOW() WHERE id = $2")
         .bind("Updated Name")
         .bind(publisher_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
 
     // Verify update
     let name: String = sqlx::query_scalar("SELECT name FROM publishers WHERE id = $1")
         .bind(publisher_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut *tx)
         .await?;
 
     assert_eq!(name, "Updated Name");
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -252,8 +268,9 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
+    let mut tx = pool.begin().await?;
     // Test that active publishers cannot have duplicate emails
-    let instance_user_id = create_test_instance_user(&pool).await;
+    let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();
     let email = format!("unique{}@example.com", Uuid::new_v4());
 
@@ -264,7 +281,7 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
     )
     .bind(instance_id)
     .bind(instance_user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Create first publisher
@@ -291,7 +308,7 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
     .bind(&email)
     .bind(&api_key_hash1)
     .bind(&encrypted_key1)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Try to create second publisher with same email (should fail)
@@ -315,11 +332,14 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
     .bind(&email)
     .bind(&api_key_hash2)
     .bind(&encrypted_key2)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await;
 
     // Should fail due to unique constraint
     assert!(result.is_err());
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }
 
@@ -328,8 +348,9 @@ async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
+    let mut tx = pool.begin().await?;
     // Test that deleted publishers' emails can be reused
-    let instance_user_id = create_test_instance_user(&pool).await;
+    let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();
     let email = format!("reusable{}@example.com", Uuid::new_v4());
 
@@ -340,7 +361,7 @@ async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
     )
     .bind(instance_id)
     .bind(instance_user_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Create and delete first publisher
@@ -368,13 +389,13 @@ async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
     .bind(&email)
     .bind(&api_key_hash1)
     .bind(&encrypted_key1)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Delete publisher
     sqlx::query("UPDATE publishers SET deleted_at = NOW() WHERE id = $1")
         .bind(publisher_id1)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
 
     // Create new publisher with same email (should succeed)
@@ -399,7 +420,7 @@ async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
     .bind(&email)
     .bind(&api_key_hash2)
     .bind(&encrypted_key2)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await?;
 
     // Verify second publisher was created
@@ -407,9 +428,12 @@ async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
         "SELECT COUNT(*) FROM publishers WHERE email = $1 AND deleted_at IS NULL",
     )
     .bind(&email)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     assert_eq!(count, 1); // Only the new one should be active
+
+    // Rollback transaction to prevent test data from persisting
+    tx.rollback().await?;
     Ok(())
 }

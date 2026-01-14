@@ -8,9 +8,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Load .env.local first for local development (highest priority)
-    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    let env_loaded = dotenvy::from_filename(".env.local").is_ok();
     if !env_loaded {
-        let _ = dotenv::dotenv();
+        let _ = dotenvy::dotenv();
     }
 
     if env_loaded {

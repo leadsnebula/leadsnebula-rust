@@ -9,20 +9,7 @@ mod duplicate_post_concurrency_tests {
     use uuid::Uuid;
 
     async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
-        let database_url = std::env::var("DATABASE_URL")
-            .ok()
-            .ok_or_else(|| "DATABASE_URL not set".to_string())?;
-
-        use sqlx::postgres::PgPoolOptions;
-        use tokio::time::Duration;
-
-        let pool = PgPoolOptions::new()
-            .max_connections(10) // More connections for concurrency test
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&database_url)
-            .await?;
-
-        Ok(pool)
+        crate::test_helpers::create_test_pool().await
     }
 
     async fn setup_test_lead(pool: &PgPool) -> (Uuid, String) {
@@ -60,14 +47,19 @@ mod duplicate_post_concurrency_tests {
 
         // Create publisher
         let publisher_id = Uuid::new_v4();
+        let api_key_hash = format!("hash_{}", Uuid::new_v4());
+        let api_key_prefix = format!("pk_{}", &api_key_hash[..8]);
         sqlx::query(
-            "INSERT INTO publishers (id, instance_id, name, email, status, created_at, updated_at)
-             VALUES ($1, $2, 'Test Publisher', $3, 'active', NOW(), NOW())
+            "INSERT INTO publishers (id, instance_id, name, email, api_key_hash, api_key_prefix, api_key_encrypted, status, created_at, updated_at)
+             VALUES ($1, $2, 'Test Publisher', $3, $4, $5, $6, 'active', NOW(), NOW())
              ON CONFLICT DO NOTHING",
         )
         .bind(publisher_id)
         .bind(instance_id)
         .bind(&format!("publisher_{}@test.invalid", Uuid::new_v4()))
+        .bind(&api_key_hash)
+        .bind(&api_key_prefix)
+        .bind("")
         .execute(pool)
         .await
         .unwrap();
@@ -76,9 +68,10 @@ mod duplicate_post_concurrency_tests {
         let vertical_id = Uuid::new_v4();
         let vertical_slug = format!("test-vertical-{}", Uuid::new_v4());
         sqlx::query(
-            "INSERT INTO verticals (id, slug, name, status, created_at, updated_at)
-             VALUES ($1, $2, 'Test Vertical', 'active', NOW(), NOW())
-             ON CONFLICT DO NOTHING",
+            "INSERT INTO verticals (id, slug, name, is_active, created_at, updated_at)
+             VALUES ($1, $2, 'Test Vertical', true, NOW(), NOW())
+             ON CONFLICT DO NOTHING
+            ",
         )
         .bind(vertical_id)
         .bind(&vertical_slug)
@@ -86,14 +79,53 @@ mod duplicate_post_concurrency_tests {
         .await
         .unwrap();
 
-        // Create lead with promise_id
-        let lead_uuid = Uuid::new_v4();
-        let promise_id = format!("PROMISE_{}", Uuid::new_v4());
-
+        // Create buyer first (required for campaign and lead)
+        let buyer_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, promise_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, 'ping', 'default', 'ping_accepted', $5, NOW(), NOW())
+            INSERT INTO buyers (id, instance_id, name, status, created_at, updated_at)
+            VALUES ($1, $2, 'Test Buyer', 'active', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(buyer_id)
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Create campaign (required for lead foreign key)
+        let campaign_id = Uuid::new_v4();
+        let vertical_slug = format!("test-vertical-{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO campaigns (id, buyer_id, publisher_id, instance_id, vertical, campaign_token, status, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(campaign_id)
+        .bind(buyer_id)
+        .bind(publisher_id)
+        .bind(instance_id)
+        .bind(&vertical_slug)
+        .bind(format!("token_{}", Uuid::new_v4()))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Create lead with promise_id but WITHOUT post_id (for atomic claim tests)
+        let lead_uuid = Uuid::new_v4();
+        let promise_id = format!("PROMISE_{}", Uuid::new_v4());
+        let session_id = format!("sess_{}", Uuid::new_v4());
+        // post_id should be empty string for atomic claim tests (schema requires NOT NULL)
+        let post_id = String::new();
+
+        let strategy_val = "pingPost".to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, promise_id, tcpa_consent, tcpa_language, submitted_at, buyer_id, campaign_id, post_id, session_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, 'ping', $6, 'ping_accepted', $5, false, '', NOW(), $7, $8, $9, $10, NOW(), NOW())
             "#,
         )
         .bind(lead_uuid)
@@ -101,6 +133,11 @@ mod duplicate_post_concurrency_tests {
         .bind(publisher_id)
         .bind(vertical_id)
         .bind(&promise_id)
+        .bind(&strategy_val)
+        .bind(buyer_id)
+        .bind(campaign_id)
+        .bind(post_id)
+        .bind(&session_id)
         .execute(pool)
         .await
         .unwrap();

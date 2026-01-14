@@ -49,13 +49,18 @@ mod ping_tree_router_integration_tests {
 
         // Create publisher
         let publisher_id = Uuid::new_v4();
+        let api_key_hash = format!("hash_{}", Uuid::new_v4());
+        let api_key_prefix = format!("pk_{}", &api_key_hash[..8]);
         sqlx::query(
-            "INSERT INTO publishers (id, instance_id, name, email, status, created_at, updated_at)
-             VALUES ($1, $2, 'Test Publisher', $3, 'active', NOW(), NOW())",
+            "INSERT INTO publishers (id, instance_id, name, email, api_key_hash, api_key_prefix, api_key_encrypted, status, created_at, updated_at)
+             VALUES ($1, $2, 'Test Publisher', $3, $4, $5, $6, 'active', NOW(), NOW())",
         )
         .bind(publisher_id)
         .bind(instance_id)
         .bind(&format!("publisher_{}@test.invalid", Uuid::new_v4()))
+        .bind(&api_key_hash)
+        .bind(&api_key_prefix)
+        .bind("")
         .execute(pool)
         .await
         .unwrap();
@@ -64,8 +69,8 @@ mod ping_tree_router_integration_tests {
         let vertical_id = Uuid::new_v4();
         let vertical_slug = format!("test-vertical-{}", Uuid::new_v4());
         sqlx::query(
-            "INSERT INTO verticals (id, slug, name, status, created_at, updated_at)
-             VALUES ($1, $2, 'Test Vertical', 'active', NOW(), NOW())",
+            "INSERT INTO verticals (id, slug, name, is_active, created_at, updated_at)
+             VALUES ($1, $2, 'Test Vertical', true, NOW(), NOW())",
         )
         .bind(vertical_id)
         .bind(&vertical_slug)
@@ -80,20 +85,43 @@ mod ping_tree_router_integration_tests {
         pool: &PgPool,
         publisher_id: Uuid,
         vertical_id: Uuid,
+        instance_id: Uuid,
         request_type: &str,
     ) -> Lead {
         let lead_uuid = Uuid::new_v4();
+        // Ensure buyer and campaign exist to satisfy FK constraints
+        let buyer_id = create_buyer(pool, instance_id).await;
+        let campaign =
+            create_campaign(pool, buyer_id, publisher_id, instance_id, "test-vertical").await;
+        let session_id = format!("sess_{}", Uuid::new_v4());
+        let post_id = format!("post_{}", Uuid::new_v4());
+        // Sanitize request_type for DB constraints: DB only allows 'ping', 'post', 'fullpost'
+        let db_request_type = match request_type {
+            "ping" | "post" | "fullpost" => request_type.to_string(),
+            _ => "post".to_string(),
+        };
+        let strategy_val = if db_request_type == "ping" {
+            "pingPost".to_string()
+        } else {
+            "fullPost".to_string()
+        };
+
         sqlx::query(
             r#"
-            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, 'default', 'processing', NOW(), NOW())
+            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, tcpa_consent, tcpa_language, submitted_at, buyer_id, campaign_id, post_id, session_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'processing', false, '', NOW(), $7, $8, $9, $10, NOW(), NOW())
             "#,
         )
         .bind(lead_uuid)
         .bind(format!("evt_{}", Uuid::new_v4()))
         .bind(publisher_id)
         .bind(vertical_id)
-        .bind(request_type)
+        .bind(&db_request_type)
+        .bind(&strategy_val)
+        .bind(buyer_id)
+        .bind(campaign.id)
+        .bind(&post_id)
+        .bind(&session_id)
         .execute(pool)
         .await
         .unwrap();
@@ -108,17 +136,19 @@ mod ping_tree_router_integration_tests {
     async fn create_ping_tree(
         pool: &PgPool,
         publisher_id: Uuid,
+        instance_id: Uuid,
         vertical: &str,
         status: &str,
     ) -> Uuid {
         let ping_tree_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO ping_trees (id, publisher_id, name, vertical, strategy, status, created_at, updated_at)
-            VALUES ($1, $2, 'Test Ping Tree', $3, 'ping_post', $4, NOW(), NOW())
+            INSERT INTO ping_trees (id, instance_id, publisher_id, name, vertical, strategy, status, created_at, updated_at)
+            VALUES ($1, $2, $3, 'Test Ping Tree', $4, 'ping_post', $5, NOW(), NOW())
             "#,
         )
         .bind(ping_tree_id)
+        .bind(instance_id)
         .bind(publisher_id)
         .bind(vertical)
         .bind(status)
@@ -203,8 +233,8 @@ mod ping_tree_router_integration_tests {
             Ok(p) => p,
             Err(_) => return, // Skip if DB not available
         };
-        let (publisher_id, _, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "ping").await;
+        let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
+        let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
         let pool_arc = Arc::new(pool.clone());
@@ -231,11 +261,10 @@ mod ping_tree_router_integration_tests {
             }
         };
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let _ = instance_id; // Suppress unused warning
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "ping").await;
+        let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
         // Create inactive ping tree
-        create_ping_tree(&pool, publisher_id, &vertical_slug, "paused").await;
+        create_ping_tree(&pool, publisher_id, instance_id, &vertical_slug, "paused").await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
         let pool_arc = Arc::new(pool.clone());
@@ -258,11 +287,11 @@ mod ping_tree_router_integration_tests {
             Ok(p) => p,
             Err(_) => return, // Skip if DB not available
         };
-        let (publisher_id, _, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "ping").await;
+        let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
+        let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
         // Create active ping tree but no campaigns
-        create_ping_tree(&pool, publisher_id, &vertical_slug, "active").await;
+        create_ping_tree(&pool, publisher_id, instance_id, &vertical_slug, "active").await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string());
         let pool_arc = Arc::new(pool.clone());
@@ -286,12 +315,13 @@ mod ping_tree_router_integration_tests {
             Err(_) => return, // Skip if DB not available
         };
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "unknown").await;
+        let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "unknown").await;
 
         let buyer_id = create_buyer(&pool, instance_id).await;
         let campaign =
             create_campaign(&pool, buyer_id, publisher_id, instance_id, &vertical_slug).await;
-        let ping_tree_id = create_ping_tree(&pool, publisher_id, &vertical_slug, "active").await;
+        let ping_tree_id =
+            create_ping_tree(&pool, publisher_id, instance_id, &vertical_slug, "active").await;
         add_campaign_to_ping_tree(&pool, ping_tree_id, campaign.id, Some(1)).await;
 
         let router = PingTreeRouter::new(lead, publisher_id, vertical_slug, "unknown".to_string());
@@ -308,12 +338,8 @@ mod ping_tree_router_integration_tests {
         assert!(result.error.unwrap().contains("Unknown request_type"));
     }
 
-    // Helper function to create test pool
-    // Note: For now, integration tests are disabled until we can properly set up test infrastructure
-    // These tests require DATABASE_URL and proper migrations
+    // Use unified test helper
     async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
-        // TODO: Use common test helper from crates/api/tests/common/mod.rs
-        // For now, return error to indicate tests need proper setup
-        Err("Integration tests require proper database setup. See crates/api/tests/common/mod.rs for helper".into())
+        crate::test_helpers::create_test_pool().await
     }
 }

@@ -9,9 +9,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Load .env.local first for local development
-    let env_loaded = dotenv::from_filename(".env.local").is_ok();
+    let env_loaded = dotenvy::from_filename(".env.local").is_ok();
     if !env_loaded {
-        let _ = dotenv::dotenv();
+        let _ = dotenvy::dotenv();
     }
 
     // Load DATABASE_URL from SSM or env var

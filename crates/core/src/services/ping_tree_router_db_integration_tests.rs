@@ -9,23 +9,12 @@ mod ping_tree_router_db_integration_tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    // Use common test helper from api crate
+    // Use unified test helper from `leadsnebula_core` for consistent behavior
     async fn create_test_pool() -> Result<PgPool, Box<dyn std::error::Error>> {
-        // Try to use the common helper, but if not available, create our own
-        let database_url = std::env::var("DATABASE_URL")
-            .ok()
-            .ok_or_else(|| "DATABASE_URL not set - skipping integration tests".to_string())?;
-
-        use sqlx::postgres::PgPoolOptions;
-        use tokio::time::Duration;
-
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&database_url)
-            .await?;
-
-        Ok(pool)
+        match crate::test_helpers::create_test_pool().await {
+            Ok(p) => Ok(p),
+            Err(e) => Err(e),
+        }
     }
 
     async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, Uuid, String) {
@@ -63,14 +52,19 @@ mod ping_tree_router_db_integration_tests {
 
         // Create publisher
         let publisher_id = Uuid::new_v4();
+        let api_key_hash = format!("hash_{}", Uuid::new_v4());
+        let api_key_prefix = format!("pk_{}", &api_key_hash[..8]);
         sqlx::query(
-            "INSERT INTO publishers (id, instance_id, name, email, status, created_at, updated_at)
-             VALUES ($1, $2, 'Test Publisher', $3, 'active', NOW(), NOW())
+            "INSERT INTO publishers (id, instance_id, name, email, api_key_hash, api_key_prefix, api_key_encrypted, status, created_at, updated_at)
+             VALUES ($1, $2, 'Test Publisher', $3, $4, $5, $6, 'active', NOW(), NOW())
              ON CONFLICT DO NOTHING",
         )
         .bind(publisher_id)
         .bind(instance_id)
         .bind(&format!("publisher_{}@test.invalid", Uuid::new_v4()))
+        .bind(&api_key_hash)
+        .bind(&api_key_prefix)
+        .bind("")
         .execute(pool)
         .await
         .unwrap();
@@ -79,8 +73,8 @@ mod ping_tree_router_db_integration_tests {
         let vertical_id = Uuid::new_v4();
         let vertical_slug = format!("test-vertical-{}", Uuid::new_v4());
         sqlx::query(
-            "INSERT INTO verticals (id, slug, name, status, created_at, updated_at)
-             VALUES ($1, $2, 'Test Vertical', 'active', NOW(), NOW())
+            "INSERT INTO verticals (id, slug, name, is_active, created_at, updated_at)
+             VALUES ($1, $2, 'Test Vertical', true, NOW(), NOW())
              ON CONFLICT DO NOTHING",
         )
         .bind(vertical_id)
@@ -96,13 +90,26 @@ mod ping_tree_router_db_integration_tests {
         pool: &PgPool,
         publisher_id: Uuid,
         vertical_id: Uuid,
+        instance_id: Uuid,
+        buyer_id: Uuid,
+        campaign_id: Uuid,
         request_type: &str,
     ) -> Lead {
+        // Create lead with buyer_id and campaign_id (required by schema NOT NULL constraints)
+        // The router may update these during routing, but we need valid IDs for initial insert
         let lead_uuid = Uuid::new_v4();
+        let session_id = format!("sess_{}", Uuid::new_v4());
+        // post_id should be empty string initially so router can set it (schema requires NOT NULL)
+        let post_id = String::new();
+        let strategy_val = if request_type == "ping" {
+            "pingPost".to_string()
+        } else {
+            "fullPost".to_string()
+        };
         sqlx::query(
             r#"
-            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, 'default', 'processing', NOW(), NOW())
+            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, tcpa_consent, tcpa_language, submitted_at, buyer_id, campaign_id, post_id, session_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'processing', false, '', NOW(), $7, $8, $9, $10, NOW(), NOW())
             "#,
         )
         .bind(lead_uuid)
@@ -110,6 +117,11 @@ mod ping_tree_router_db_integration_tests {
         .bind(publisher_id)
         .bind(vertical_id)
         .bind(request_type)
+        .bind(&strategy_val)
+        .bind(buyer_id)
+        .bind(campaign_id)
+        .bind(post_id)
+        .bind(&session_id)
         .execute(pool)
         .await
         .unwrap();
@@ -124,6 +136,7 @@ mod ping_tree_router_db_integration_tests {
     async fn create_ping_tree(
         pool: &PgPool,
         publisher_id: Uuid,
+        instance_id: Uuid,
         vertical: &str,
         status: &str,
         strategy: &str,
@@ -131,11 +144,12 @@ mod ping_tree_router_db_integration_tests {
         let ping_tree_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO ping_trees (id, publisher_id, name, vertical, strategy, status, created_at, updated_at)
-            VALUES ($1, $2, 'Test Ping Tree', $3, $4, $5, NOW(), NOW())
+            INSERT INTO ping_trees (id, instance_id, publisher_id, name, vertical, strategy, status, created_at, updated_at)
+            VALUES ($1, $2, $3, 'Test Ping Tree', $4, $5, $6, NOW(), NOW())
             "#,
         )
         .bind(ping_tree_id)
+        .bind(instance_id)
         .bind(publisher_id)
         .bind(vertical)
         .bind(strategy)
@@ -227,14 +241,30 @@ mod ping_tree_router_db_integration_tests {
         };
 
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "ping").await;
 
         let buyer_id = create_buyer(&pool, instance_id).await;
         let campaign =
             create_campaign(&pool, buyer_id, publisher_id, instance_id, &vertical_slug).await;
-        let ping_tree_id =
-            create_ping_tree(&pool, publisher_id, &vertical_slug, "active", "ping_post").await;
+        let ping_tree_id = create_ping_tree(
+            &pool,
+            publisher_id,
+            instance_id,
+            &vertical_slug,
+            "active",
+            "ping_post",
+        )
+        .await;
         add_campaign_to_ping_tree(&pool, ping_tree_id, campaign.id, Some(1)).await;
+        let lead = create_test_lead(
+            &pool,
+            publisher_id,
+            vertical_id,
+            instance_id,
+            buyer_id,
+            campaign.id,
+            "ping",
+        )
+        .await;
 
         let router = PingTreeRouter::new(
             lead.clone(),
@@ -277,14 +307,30 @@ mod ping_tree_router_db_integration_tests {
         };
 
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "ping").await;
 
         let buyer_id = create_buyer(&pool, instance_id).await;
         let campaign =
             create_campaign(&pool, buyer_id, publisher_id, instance_id, &vertical_slug).await;
-        let ping_tree_id =
-            create_ping_tree(&pool, publisher_id, &vertical_slug, "active", "ping_post").await;
+        let ping_tree_id = create_ping_tree(
+            &pool,
+            publisher_id,
+            instance_id,
+            &vertical_slug,
+            "active",
+            "ping_post",
+        )
+        .await;
         add_campaign_to_ping_tree(&pool, ping_tree_id, campaign.id, Some(1)).await;
+        let lead = create_test_lead(
+            &pool,
+            publisher_id,
+            vertical_id,
+            instance_id,
+            buyer_id,
+            campaign.id,
+            "ping",
+        )
+        .await;
 
         let router = PingTreeRouter::new(
             lead.clone(),
@@ -298,6 +344,9 @@ mod ping_tree_router_db_integration_tests {
             .route(pool_arc, encryption_key)
             .await
             .expect("Route should complete");
+
+        // Give async persistence tasks time to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Verify buyer_responses were persisted
         let count: i64 =
@@ -322,13 +371,29 @@ mod ping_tree_router_db_integration_tests {
         };
 
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
-        let lead = create_test_lead(&pool, publisher_id, vertical_id, "fullpost").await;
 
         let buyer_id = create_buyer(&pool, instance_id).await;
         let campaign =
             create_campaign(&pool, buyer_id, publisher_id, instance_id, &vertical_slug).await;
-        let ping_tree_id =
-            create_ping_tree(&pool, publisher_id, &vertical_slug, "active", "ping_post").await;
+        let lead = create_test_lead(
+            &pool,
+            publisher_id,
+            vertical_id,
+            instance_id,
+            buyer_id,
+            campaign.id,
+            "fullpost",
+        )
+        .await;
+        let ping_tree_id = create_ping_tree(
+            &pool,
+            publisher_id,
+            instance_id,
+            &vertical_slug,
+            "active",
+            "ping_post",
+        )
+        .await;
         add_campaign_to_ping_tree(&pool, ping_tree_id, campaign.id, Some(1)).await;
 
         let router = PingTreeRouter::new(

@@ -40,6 +40,20 @@ cargo run --bin run-migrations
 cargo run --bin leadsnebula-api
 ```
 
+### Testing with Neon (ephemeral branches) ⚠️
+
+To run DB-backed tests in an isolated, ephemeral Postgres environment that mirrors CI, use Neon ephemeral branches. See `docs/TESTING_WITH_NEON.md` for details and a safe helper script.
+
+Example:
+
+```bash
+# create ephemeral branch, run workspace tests, then cleanup
+TEST_EPHEMERAL_NEON=true NEON_API_KEY=... NEON_PROJECT_ID=... ./scripts/test-neon-ephemeral.sh -- cargo test --workspace
+```
+
+Be cautious: setting `TEST_USE_DEV=true` requires `TEST_RUN_ID` to avoid accidental tests against shared dev resources.
+
+
 ### Pre-commit Validation
 
 Before committing code, run the validation script to ensure CI will pass:

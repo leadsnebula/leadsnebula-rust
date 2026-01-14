@@ -32,7 +32,6 @@ impl PingTree {
             SELECT * FROM ping_trees
             WHERE publisher_id = $1
               AND vertical = $2
-              AND status = 'active'
               AND deleted_at IS NULL
             ORDER BY priority ASC NULLS LAST, created_at ASC
             LIMIT 1

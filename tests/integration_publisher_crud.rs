@@ -21,9 +21,9 @@ use common::create_test_pool;
 #[ctor::ctor]
 fn init() {
     // Try .env.local first (for local development)
-    let _ = dotenv::from_filename(".env.local");
+    let _ = dotenvy::from_filename(".env.local");
     // Fallback to .env if .env.local doesn't exist
-    let _ = dotenv::dotenv();
+    let _ = dotenvy::dotenv();
 }
 
 #[tokio::test]
