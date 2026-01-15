@@ -68,13 +68,18 @@ jobs:
       - name: Install Neon CLI (neonctl)
         run: |
           npm install -g @neondatabase/api-client
-          # Add npm global bin to PATH for subsequent steps
-          echo "/usr/local/bin" >> $GITHUB_PATH
+          # Find where npm actually installed neonctl
+          NPM_BIN=$(npm bin -g)
+          echo "npm global bin: $NPM_BIN"
+          echo "$NPM_BIN" >> $GITHUB_PATH
+          # Verify installation
+          "$NPM_BIN/neonctl" --version || echo "neonctl not found at $NPM_BIN/neonctl"
+          echo "NEONCTL_PATH=$NPM_BIN/neonctl" >> $GITHUB_ENV
 
       - name: Verify neonctl installed
         run: |
           which neonctl || echo "neonctl not in PATH"
-          /usr/local/bin/neonctl --version || echo "neonctl not found at /usr/local/bin/neonctl"
+          "$NEONCTL_PATH" --version || echo "neonctl not found at $NEONCTL_PATH"
 
       - name: Authenticate Neon CLI
         env:
@@ -83,7 +88,7 @@ jobs:
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
-          /usr/local/bin/neonctl auth --api-key "$NEON_API_KEY"
+          "$NEONCTL_PATH" auth --api-key "$NEON_API_KEY"
 
       - name: Create ephemeral Neon branch
         id: neon_create
@@ -94,7 +99,7 @@ jobs:
           set -euo pipefail
           BRANCH_NAME=ci-${GITHUB_RUN_ID}
           echo "Creating Neon branch: $BRANCH_NAME"
-          if ! /usr/local/bin/neonctl branches create "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
+          if ! "$NEONCTL_PATH" branches create "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
             echo "Failed to create Neon branch $BRANCH_NAME" >&2
             exit 1
           fi
@@ -107,7 +112,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Waiting for Neon branch: $BRANCH_NAME"
-          /usr/local/bin/neonctl branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID"
+          "$NEONCTL_PATH" branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID"
 
       - name: Export DATABASE_URL from Neon branch
         env:
@@ -115,7 +120,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
-          CONNECTION=$(/usr/local/bin/neonctl connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          CONNECTION=$("$NEONCTL_PATH" connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
       - name: Run integration tests
@@ -146,7 +151,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Cleaning up Neon branch: $BRANCH_NAME"
-          /usr/local/bin/neonctl branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true
+          "$NEONCTL_PATH" branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true
 
   test-unit:
     name: Unit Tests
@@ -309,13 +314,18 @@ jobs:
       - name: Install Neon CLI (neonctl)
         run: |
           npm install -g @neondatabase/api-client
-          # Add npm global bin to PATH for subsequent steps
-          echo "/usr/local/bin" >> $GITHUB_PATH
+          # Find where npm actually installed neonctl
+          NPM_BIN=$(npm bin -g)
+          echo "npm global bin: $NPM_BIN"
+          echo "$NPM_BIN" >> $GITHUB_PATH
+          # Verify installation
+          "$NPM_BIN/neonctl" --version || echo "neonctl not found at $NPM_BIN/neonctl"
+          echo "NEONCTL_PATH=$NPM_BIN/neonctl" >> $GITHUB_ENV
 
       - name: Verify neonctl installed
         run: |
           which neonctl || echo "neonctl not in PATH"
-          /usr/local/bin/neonctl --version || echo "neonctl not found at /usr/local/bin/neonctl"
+          "$NEONCTL_PATH" --version || echo "neonctl not found at $NEONCTL_PATH"
 
       - name: Authenticate Neon CLI
         env:
@@ -324,7 +334,7 @@ jobs:
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
-          /usr/local/bin/neonctl auth --api-key "$NEON_API_KEY"
+          "$NEONCTL_PATH" auth --api-key "$NEON_API_KEY"
 
       - name: Create ephemeral Neon branch for coverage
         env:
@@ -334,7 +344,7 @@ jobs:
           set -euo pipefail
           BRANCH_NAME=ci-${GITHUB_RUN_ID}-coverage
           echo "Creating Neon branch: $BRANCH_NAME"
-          if ! /usr/local/bin/neonctl branches create "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
+          if ! "$NEONCTL_PATH" branches create "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
             echo "Failed to create Neon branch $BRANCH_NAME" >&2
             exit 1
           fi
@@ -346,7 +356,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Waiting for Neon branch: $BRANCH_NAME"
-          /usr/local/bin/neonctl branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID"
+          "$NEONCTL_PATH" branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID"
 
       - name: Export DATABASE_URL from Neon branch
         env:
@@ -354,7 +364,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
-          CONNECTION=$(/usr/local/bin/neonctl connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          CONNECTION=$("$NEONCTL_PATH" connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
       - name: Generate coverage report
@@ -395,7 +405,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Cleaning up Neon branch: $BRANCH_NAME"
-          /usr/local/bin/neonctl branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true
+          "$NEONCTL_PATH" branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true
 
   benchmark:
     name: Performance Benchmarks
