@@ -68,11 +68,11 @@ jobs:
       - name: Install Neon CLI (neonctl)
         run: |
           # Use npx to run neonctl (no global install needed)
-          # @neondatabase/api-client provides the CLI via npx
+          # The correct package is 'neonctl', not '@neondatabase/api-client'
           echo "Setting up Neon CLI via npx..."
-          echo "NEONCTL_CMD=npx --yes @neondatabase/api-client" >> $GITHUB_ENV
+          echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
           # Verify it works
-          npx --yes @neondatabase/api-client --version || (echo "❌ Failed to verify neonctl" && exit 1)
+          npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
           echo "✅ neonctl ready via npx"
 
       - name: Verify neonctl installed
@@ -313,11 +313,11 @@ jobs:
       - name: Install Neon CLI (neonctl)
         run: |
           # Use npx to run neonctl (no global install needed)
-          # @neondatabase/api-client provides the CLI via npx
+          # The correct package is 'neonctl', not '@neondatabase/api-client'
           echo "Setting up Neon CLI via npx..."
-          echo "NEONCTL_CMD=npx --yes @neondatabase/api-client" >> $GITHUB_ENV
+          echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
           # Verify it works
-          npx --yes @neondatabase/api-client --version || (echo "❌ Failed to verify neonctl" && exit 1)
+          npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
           echo "✅ neonctl ready via npx"
 
       - name: Verify neonctl installed
