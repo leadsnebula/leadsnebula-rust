@@ -59,6 +59,10 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 reqwest = { version = "0.12", features = ["json"] }
 futures = "0.3"
 
+# Windows dependencies (pinned to latest to reduce duplicates)
+windows-targets = "0.53"
+windows-sys = "0.61"
+
 # Testing dependencies
 proptest = "1.4"
 mockall = "0.13"
