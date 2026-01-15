@@ -17,9 +17,18 @@ jobs:
         run: |
           if ! command -v neonctl >/dev/null 2>&1; then
             echo "neonctl not found, installing via npm..."
-            sudo npm install -g @neondatabase/neonctl || true
+            npm install -g @neondatabase/api-client
           fi
           neonctl --version || true
+
+      - name: Authenticate Neon CLI
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: |
+          if [ -z "$NEON_API_KEY" ]; then
+            echo "NEON_API_KEY secret is missing" && exit 1
+          fi
+          neonctl auth --api-key "$NEON_API_KEY"
 
       - name: Run Neon orchestration test (opt-in)
         env:
