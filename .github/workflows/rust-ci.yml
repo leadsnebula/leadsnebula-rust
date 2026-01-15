@@ -69,17 +69,51 @@ jobs:
         run: |
           npm install -g @neondatabase/api-client
           # Find where npm actually installed neonctl
-          NPM_BIN=$(npm bin -g)
-          echo "npm global bin: $NPM_BIN"
-          echo "$NPM_BIN" >> $GITHUB_PATH
-          # Verify installation
-          "$NPM_BIN/neonctl" --version || echo "neonctl not found at $NPM_BIN/neonctl"
-          echo "NEONCTL_PATH=$NPM_BIN/neonctl" >> $GITHUB_ENV
+          # Try multiple methods to find the binary location
+          if command -v npm &> /dev/null; then
+            # Method 1: npm prefix (most reliable)
+            NPM_PREFIX=$(npm config get prefix)
+            NPM_BIN="$NPM_PREFIX/bin"
+            echo "npm prefix: $NPM_PREFIX"
+            echo "npm bin: $NPM_BIN"
+            
+            # Method 2: npm root -g (fallback)
+            if [ ! -f "$NPM_BIN/neonctl" ]; then
+              NPM_ROOT=$(npm root -g)
+              NPM_BIN="$NPM_ROOT/../bin"
+              echo "npm root: $NPM_ROOT"
+              echo "trying npm bin: $NPM_BIN"
+            fi
+            
+            # Method 3: which neonctl (if in PATH)
+            if [ ! -f "$NPM_BIN/neonctl" ]; then
+              if WHICH_PATH=$(which neonctl 2>/dev/null); then
+                NPM_BIN=$(dirname "$WHICH_PATH")
+                echo "found via which: $NPM_BIN"
+              fi
+            fi
+            
+            # Verify we found it
+            if [ -f "$NPM_BIN/neonctl" ]; then
+              echo "✅ Found neonctl at: $NPM_BIN/neonctl"
+              echo "$NPM_BIN" >> $GITHUB_PATH
+              "$NPM_BIN/neonctl" --version
+              echo "NEONCTL_PATH=$NPM_BIN/neonctl" >> $GITHUB_ENV
+            else
+              echo "❌ neonctl not found. Searching..."
+              find /usr -name neonctl 2>/dev/null | head -5 || echo "Search failed"
+              exit 1
+            fi
+          else
+            echo "❌ npm not found"
+            exit 1
+          fi
 
       - name: Verify neonctl installed
         run: |
-          which neonctl || echo "neonctl not in PATH"
-          "$NEONCTL_PATH" --version || echo "neonctl not found at $NEONCTL_PATH"
+          echo "NEONCTL_PATH is: $NEONCTL_PATH"
+          which neonctl || echo "neonctl not in PATH (using NEONCTL_PATH)"
+          "$NEONCTL_PATH" --version || (echo "neonctl verification failed" && exit 1)
 
       - name: Authenticate Neon CLI
         env:
@@ -315,17 +349,51 @@ jobs:
         run: |
           npm install -g @neondatabase/api-client
           # Find where npm actually installed neonctl
-          NPM_BIN=$(npm bin -g)
-          echo "npm global bin: $NPM_BIN"
-          echo "$NPM_BIN" >> $GITHUB_PATH
-          # Verify installation
-          "$NPM_BIN/neonctl" --version || echo "neonctl not found at $NPM_BIN/neonctl"
-          echo "NEONCTL_PATH=$NPM_BIN/neonctl" >> $GITHUB_ENV
+          # Try multiple methods to find the binary location
+          if command -v npm &> /dev/null; then
+            # Method 1: npm prefix (most reliable)
+            NPM_PREFIX=$(npm config get prefix)
+            NPM_BIN="$NPM_PREFIX/bin"
+            echo "npm prefix: $NPM_PREFIX"
+            echo "npm bin: $NPM_BIN"
+            
+            # Method 2: npm root -g (fallback)
+            if [ ! -f "$NPM_BIN/neonctl" ]; then
+              NPM_ROOT=$(npm root -g)
+              NPM_BIN="$NPM_ROOT/../bin"
+              echo "npm root: $NPM_ROOT"
+              echo "trying npm bin: $NPM_BIN"
+            fi
+            
+            # Method 3: which neonctl (if in PATH)
+            if [ ! -f "$NPM_BIN/neonctl" ]; then
+              if WHICH_PATH=$(which neonctl 2>/dev/null); then
+                NPM_BIN=$(dirname "$WHICH_PATH")
+                echo "found via which: $NPM_BIN"
+              fi
+            fi
+            
+            # Verify we found it
+            if [ -f "$NPM_BIN/neonctl" ]; then
+              echo "✅ Found neonctl at: $NPM_BIN/neonctl"
+              echo "$NPM_BIN" >> $GITHUB_PATH
+              "$NPM_BIN/neonctl" --version
+              echo "NEONCTL_PATH=$NPM_BIN/neonctl" >> $GITHUB_ENV
+            else
+              echo "❌ neonctl not found. Searching..."
+              find /usr -name neonctl 2>/dev/null | head -5 || echo "Search failed"
+              exit 1
+            fi
+          else
+            echo "❌ npm not found"
+            exit 1
+          fi
 
       - name: Verify neonctl installed
         run: |
-          which neonctl || echo "neonctl not in PATH"
-          "$NEONCTL_PATH" --version || echo "neonctl not found at $NEONCTL_PATH"
+          echo "NEONCTL_PATH is: $NEONCTL_PATH"
+          which neonctl || echo "neonctl not in PATH (using NEONCTL_PATH)"
+          "$NEONCTL_PATH" --version || (echo "neonctl verification failed" && exit 1)
 
       - name: Authenticate Neon CLI
         env:
