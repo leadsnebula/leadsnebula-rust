@@ -44,7 +44,7 @@ jobs:
     # The previous Postgres service container is intentionally omitted.
 
     env:
-      NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
       NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
 
     steps:
@@ -86,18 +86,18 @@ jobs:
 
       - name: Authenticate Neon CLI
         run: |
-          if [ -z "$NEONCTL_API_KEY" ]; then
-            echo "NEONCTL_API_KEY secret is missing" && exit 1
+          if [ -z "$NEON_API_KEY" ]; then
+            echo "NEON_API_KEY secret is missing" && exit 1
           fi
           if [ -z "$NEON_PROJECT_ID" ]; then
             echo "NEON_PROJECT_ID secret is missing" && exit 1
           fi
-          # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
-          # Set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
-          echo "NEONCTL_API_KEY=$NEONCTL_API_KEY" >> $GITHUB_ENV
+          # neonctl uses NEON_API_KEY environment variable for non-interactive auth
+          # Also set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
+          echo "NEON_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
           # Try to verify authentication (works with personal keys, may fail with restricted org keys)
           # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
-          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" --output json > /dev/null 2>&1; then
             echo "✅ Authenticated with Neon (verified via branches list)"
           else
             echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
@@ -112,8 +112,8 @@ jobs:
           set -euo pipefail
           BRANCH_NAME=ci-${GITHUB_RUN_ID}
           echo "Creating Neon branch: $BRANCH_NAME"
-          echo "Executing: $NEONCTL_CMD branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID"
-          if ! $NEONCTL_CMD branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
+          echo "Executing: $NEONCTL_CMD branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID --api-key ***"
+          if ! $NEONCTL_CMD branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"; then
             echo "Failed to create Neon branch $BRANCH_NAME" >&2
             exit 1
           fi
@@ -124,13 +124,13 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Waiting for Neon branch: $BRANCH_NAME"
-          $NEONCTL_CMD branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID"
+          $NEONCTL_CMD branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"
 
       - name: Export DATABASE_URL from Neon branch
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
-          CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
       - name: Run integration tests
@@ -159,7 +159,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Cleaning up Neon branch: $BRANCH_NAME"
-          $NEONCTL_CMD branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true
+          $NEONCTL_CMD branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" || true
 
   test-unit:
     name: Unit Tests
@@ -304,7 +304,7 @@ jobs:
     continue-on-error: true
 
     env:
-      NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
       NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
     
     steps:
@@ -340,18 +340,18 @@ jobs:
 
       - name: Authenticate Neon CLI
         run: |
-          if [ -z "$NEONCTL_API_KEY" ]; then
-            echo "NEONCTL_API_KEY secret is missing" && exit 1
+          if [ -z "$NEON_API_KEY" ]; then
+            echo "NEON_API_KEY secret is missing" && exit 1
           fi
           if [ -z "$NEON_PROJECT_ID" ]; then
             echo "NEON_PROJECT_ID secret is missing" && exit 1
           fi
-          # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
-          # Set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
-          echo "NEONCTL_API_KEY=$NEONCTL_API_KEY" >> $GITHUB_ENV
+          # neonctl uses NEON_API_KEY environment variable for non-interactive auth
+          # Also set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
+          echo "NEON_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
           # Try to verify authentication (works with personal keys, may fail with restricted org keys)
           # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
-          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" --output json > /dev/null 2>&1; then
             echo "✅ Authenticated with Neon (verified via branches list)"
           else
             echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
@@ -365,8 +365,8 @@ jobs:
           set -euo pipefail
           BRANCH_NAME=ci-${GITHUB_RUN_ID}-coverage
           echo "Creating Neon branch: $BRANCH_NAME"
-          echo "Executing: $NEONCTL_CMD branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID"
-          if ! $NEONCTL_CMD branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
+          echo "Executing: $NEONCTL_CMD branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID --api-key ***"
+          if ! $NEONCTL_CMD branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"; then
             echo "Failed to create Neon branch $BRANCH_NAME" >&2
             exit 1
           fi
@@ -376,13 +376,13 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Waiting for Neon branch: $BRANCH_NAME"
-          $NEONCTL_CMD branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID"
+          $NEONCTL_CMD branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"
 
       - name: Export DATABASE_URL from Neon branch
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
-          CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
       - name: Generate coverage report
@@ -421,7 +421,7 @@ jobs:
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Cleaning up Neon branch: $BRANCH_NAME"
-          $NEONCTL_CMD branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" || true
+          $NEONCTL_CMD branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" || true
 
   benchmark:
     name: Performance Benchmarks
