@@ -135,6 +135,8 @@ jobs:
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
       - name: Run integration tests
+        env:
+          CI: "true"  # Signal to test_helpers to use larger pool limits
         run: |
           echo "DATABASE_URL is set to: $DATABASE_URL"
 
@@ -151,6 +153,8 @@ jobs:
           cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1
 
       - name: Run database-backed library tests (ignored)
+        env:
+          CI: "true"  # Signal to test_helpers to use larger pool limits
         run: |
           echo "Running ignored library tests that require DATABASE_URL..."
           cargo test --lib --all-features --locked -- --ignored --test-threads=1

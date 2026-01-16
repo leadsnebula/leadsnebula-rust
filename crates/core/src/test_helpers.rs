@@ -44,14 +44,30 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     // Increase default pool size for tests to handle concurrent test execution
     // Tests run with --test-threads=1, but transactions can hold connections longer
     // In CI, Neon can be slow, so we need more headroom and longer timeouts
-    let max_conns: u32 = std::env::var("TEST_POOL_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20); // Increased from 10 to 20 for CI headroom
+    // Concurrency tests (duplicate_post, ping_tree_router) need even more connections
+    let is_ci = std::env::var("CI").is_ok();
+    let max_conns: u32 = if is_ci {
+        // In CI, use larger pool for concurrency tests (duplicate_post spawns 10 concurrent tasks)
+        std::env::var("TEST_POOL_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30) // Increased to 30 for CI concurrency tests
+    } else {
+        std::env::var("TEST_POOL_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20) // 20 for local development
+    };
+
+    let acquire_timeout_secs = if is_ci {
+        60 // Give Neon more time in CI (free-tier can be slow)
+    } else {
+        30 // 30s for local
+    };
 
     let pool = PgPoolOptions::new()
         .max_connections(max_conns)
-        .acquire_timeout(std::time::Duration::from_secs(30)) // Increased from 10s to 30s for Neon CI slowness
+        .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
         .connect(&database_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;

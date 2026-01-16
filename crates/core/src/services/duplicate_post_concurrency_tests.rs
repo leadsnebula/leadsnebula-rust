@@ -30,7 +30,11 @@ mod duplicate_post_concurrency_tests {
         .bind(password_hash)
         .execute(pool)
         .await
-        .unwrap();
+        .map_err(|e| {
+            eprintln!("Pool acquire failed in setup_test_lead (instance_user): {}", e);
+            e
+        })
+        .expect("Failed to create instance_user - PoolTimedOut likely indicates Neon slowness in CI");
 
         // Create instance
         let instance_id = Uuid::new_v4();
