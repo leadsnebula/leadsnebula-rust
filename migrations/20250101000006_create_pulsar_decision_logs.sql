@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS pulsar_decision_logs (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_pulsar_decision_logs_lead_id ON pulsar_decision_logs(lead_id);
-CREATE INDEX idx_pulsar_decision_logs_buyer_id ON pulsar_decision_logs(buyer_id);
-CREATE INDEX idx_pulsar_decision_logs_evaluated_at ON pulsar_decision_logs(evaluated_at);
+CREATE INDEX IF NOT EXISTS idx_pulsar_decision_logs_lead_id ON pulsar_decision_logs(lead_id);
+CREATE INDEX IF NOT EXISTS idx_pulsar_decision_logs_buyer_id ON pulsar_decision_logs(buyer_id);
+CREATE INDEX IF NOT EXISTS idx_pulsar_decision_logs_evaluated_at ON pulsar_decision_logs(evaluated_at);
 

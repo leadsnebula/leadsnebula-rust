@@ -832,14 +832,14 @@ async fn main() -> Result<()> {
 
                 // Delete foreign key dependencies before deleting instance_users
                 // Delete webauthn_credentials first (has FK to instance_users)
-                let _ = sqlx::query("DELETE FROM webauthn_credentials WHERE platform_user_id = ANY($1) OR instance_user_id = ANY($1)")
+                let _ = sqlx::query("DELETE FROM webauthn_credentials WHERE instance_user_id = ANY($1) OR instance_user_id = ANY($1)")
                     .bind(&test_users)
                     .execute(&mut *test_tx)
                     .await?;
 
                 // Delete user_otp_settings (has FK to instance_users)
                 let _ =
-                    sqlx::query("DELETE FROM user_otp_settings WHERE platform_user_id = ANY($1)")
+                    sqlx::query("DELETE FROM user_otp_settings WHERE instance_user_id = ANY($1)")
                         .bind(&test_users)
                         .execute(&mut *test_tx)
                         .await?;

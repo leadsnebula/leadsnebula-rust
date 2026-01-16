@@ -989,6 +989,47 @@ echo ""
     fi
     echo ""
 
+    # 19. Optional Neon CLI validation (if NEON_API_KEY and NEON_PROJECT_ID are set)
+    echo "1️⃣9️⃣  Optional Neon CLI validation (if NEON_API_KEY set)"
+    if [ -f ".env.local" ]; then
+        # Load NEON_API_KEY and NEON_PROJECT_ID from .env.local if not already set
+        if [ -z "${NEON_API_KEY:-}" ]; then
+            export $(grep "^NEON_API_KEY=" .env.local 2>/dev/null | xargs) 2>/dev/null || true
+        fi
+        if [ -z "${NEON_PROJECT_ID:-}" ]; then
+            export $(grep "^NEON_PROJECT_ID=" .env.local 2>/dev/null | xargs) 2>/dev/null || true
+        fi
+    fi
+    
+    if [ -n "${NEON_API_KEY:-}" ] && [ -n "${NEON_PROJECT_ID:-}" ]; then
+        echo "   Testing Neon CLI authentication and access..."
+        export NEONCTL_API_KEY="$NEON_API_KEY"
+        
+        # Check if neonctl is available (via npx)
+        if command -v npx > /dev/null 2>&1; then
+            # Test neonctl version
+            if npx --yes neonctl --version > /dev/null 2>&1; then
+                echo "   ✅ neonctl available via npx"
+                
+                # Test authentication by listing branches
+                if npx --yes neonctl branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
+                    echo "   ✅ Neon CLI authentication OK (can list branches)"
+                else
+                    echo "   ⚠️  Neon CLI authentication failed or key lacks permissions"
+                    echo "      (This may be OK if using a restricted org key - create/delete should still work)"
+                fi
+            else
+                echo "   ⚠️  neonctl not available via npx (install: npm install -g neonctl or use npx)"
+            fi
+        else
+            echo "   ⚠️  npx not available - cannot test neonctl (install: npm install -g npm)"
+        fi
+    else
+        echo "   Skipping Neon CLI validation (NEON_API_KEY or NEON_PROJECT_ID not set)"
+        echo "      Set in .env.local or environment to test Neon CLI before CI runs"
+    fi
+    echo ""
+
 # Summary
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 

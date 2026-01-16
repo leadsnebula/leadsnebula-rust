@@ -14,9 +14,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_audit_logs_action_type ON audit_logs(action_type);
-CREATE INDEX idx_audit_logs_resource_type_id ON audit_logs(resource_type, resource_id);
-CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
-CREATE INDEX idx_audit_logs_instance_id ON audit_logs(instance_id);
-CREATE INDEX idx_audit_logs_instance_user_id ON audit_logs(instance_user_id);
-CREATE INDEX idx_audit_logs_affected_resources ON audit_logs USING GIN(affected_resources);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action_type ON audit_logs(action_type);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource_type_id ON audit_logs(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_instance_id ON audit_logs(instance_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_instance_user_id ON audit_logs(instance_user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_affected_resources ON audit_logs USING GIN(affected_resources);

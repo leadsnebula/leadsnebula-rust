@@ -161,7 +161,7 @@ async fn login(
 
     // Check if OTP is enabled
     let otp_enabled: Option<bool> = sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -321,7 +321,7 @@ async fn verify_otp_login(
 
     // Verify OTP is enabled
     let otp_enabled: Option<bool> = sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -347,7 +347,7 @@ async fn verify_otp_login(
     // Get OTP secret and backup codes
     use sqlx::Row;
     let otp_row = sqlx::query(
-        "SELECT secret, backup_codes FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT secret_encrypted, backup_codes_encrypted FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -391,7 +391,7 @@ async fn verify_otp_login(
 
                 // Update database
                 sqlx::query(
-                    "UPDATE user_otp_settings SET backup_codes = $1, updated_at = NOW() WHERE platform_user_id = $2",
+                    "UPDATE user_otp_settings SET backup_codes_encrypted = $1, updated_at = NOW() WHERE instance_user_id = $2",
                 )
                 .bind(&updated_codes_json)
                 .bind(user.id)

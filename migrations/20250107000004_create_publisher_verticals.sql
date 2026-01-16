@@ -7,5 +7,5 @@ CREATE TABLE IF NOT EXISTS publisher_verticals (
     UNIQUE(publisher_id, vertical_id)
 );
 
-CREATE INDEX idx_publisher_verticals_publisher_id ON publisher_verticals(publisher_id);
-CREATE INDEX idx_publisher_verticals_vertical_id ON publisher_verticals(vertical_id);
+CREATE INDEX IF NOT EXISTS idx_publisher_verticals_publisher_id ON publisher_verticals(publisher_id);
+CREATE INDEX IF NOT EXISTS idx_publisher_verticals_vertical_id ON publisher_verticals(vertical_id);

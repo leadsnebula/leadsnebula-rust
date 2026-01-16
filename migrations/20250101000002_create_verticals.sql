@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS verticals (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_verticals_slug ON verticals(slug);
-CREATE INDEX idx_verticals_is_active ON verticals(is_active);
+CREATE INDEX IF NOT EXISTS idx_verticals_slug ON verticals(slug);
+CREATE INDEX IF NOT EXISTS idx_verticals_is_active ON verticals(is_active);
 
 -- Insert default solar vertical
 INSERT INTO verticals (name, slug, is_active) VALUES ('Solar', 'solar', true) ON CONFLICT (slug) DO NOTHING;

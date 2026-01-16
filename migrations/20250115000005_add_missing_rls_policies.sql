@@ -22,56 +22,72 @@
 -- Note: instance_users doesn't have instance_id column - it's a global user table
 ALTER TABLE instance_users ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY instance_users_admin_system_only ON instance_users
-    FOR ALL
-    USING (
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-    );
+DO $$ BEGIN
+    CREATE POLICY instance_users_admin_system_only ON instance_users
+        FOR ALL
+        USING (
+            (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+        );
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- Instances table - admin/system only (instances are top-level, users access via instance_id)
 -- RLS audit shows: instances table needs RLS enabled
 ALTER TABLE instances ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY instances_admin_system_only ON instances
-    FOR ALL
-    USING (
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-        OR
-        id = (SELECT current_setting('app.current_instance_id', true))::uuid
-    );
+DO $$ BEGIN
+    CREATE POLICY instances_admin_system_only ON instances
+        FOR ALL
+        USING (
+            (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+            OR
+            id = (SELECT current_setting('app.current_instance_id', true))::uuid
+        );
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- Buyer zip lists table instance isolation
 -- RLS audit shows: buyer_zip_lists table needs RLS enabled and instance isolation
 ALTER TABLE buyer_zip_lists ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY buyer_zip_lists_instance_isolation ON buyer_zip_lists
-    FOR ALL
-    USING (
-        EXISTS (
-            SELECT 1 FROM buyers
-            WHERE buyers.id = buyer_zip_lists.buyer_id
-            AND buyers.instance_id = (SELECT current_setting('app.current_instance_id', true))::uuid
-        )
-        OR
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-    );
+DO $$ BEGIN
+    CREATE POLICY buyer_zip_lists_instance_isolation ON buyer_zip_lists
+        FOR ALL
+        USING (
+            EXISTS (
+                SELECT 1 FROM buyers
+                WHERE buyers.id = buyer_zip_lists.buyer_id
+                AND buyers.instance_id = (SELECT current_setting('app.current_instance_id', true))::uuid
+            )
+            OR
+            (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+        );
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- Buyer zip codes table instance isolation (via buyer_zip_lists)
 -- RLS audit shows: buyer_zip_codes table needs RLS enabled and instance isolation
 ALTER TABLE buyer_zip_codes ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY buyer_zip_codes_instance_isolation ON buyer_zip_codes
-    FOR ALL
-    USING (
-        EXISTS (
-            SELECT 1 FROM buyer_zip_lists bzl
-            INNER JOIN buyers b ON b.id = bzl.buyer_id
-            WHERE bzl.id = buyer_zip_codes.buyer_zip_list_id
-            AND b.instance_id = (SELECT current_setting('app.current_instance_id', true))::uuid
-        )
-        OR
-        (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
-    );
+DO $$ BEGIN
+    CREATE POLICY buyer_zip_codes_instance_isolation ON buyer_zip_codes
+        FOR ALL
+        USING (
+            EXISTS (
+                SELECT 1 FROM buyer_zip_lists bzl
+                INNER JOIN buyers b ON b.id = bzl.buyer_id
+                WHERE bzl.id = buyer_zip_codes.buyer_zip_list_id
+                AND b.instance_id = (SELECT current_setting('app.current_instance_id', true))::uuid
+            )
+            OR
+            (SELECT current_setting('app.user_role', true)) IN ('admin', 'system')
+        );
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- Example: Buyers table instance isolation
 -- Uncomment if audit shows buyers table needs instance isolation

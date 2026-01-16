@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS instances (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_instances_deleted_at ON instances(deleted_at);
-CREATE INDEX idx_instances_instance_user_id ON instances(instance_user_id);
-CREATE INDEX idx_instances_payment_status ON instances(payment_status);
+CREATE INDEX IF NOT EXISTS idx_instances_deleted_at ON instances(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_instances_instance_user_id ON instances(instance_user_id);
+CREATE INDEX IF NOT EXISTS idx_instances_payment_status ON instances(payment_status);
 

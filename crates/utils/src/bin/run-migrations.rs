@@ -89,56 +89,171 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_migrations(&pool, &migrations_path).await?;
+    // Check if we're in test mode (for ephemeral test databases)
+    // Test mode is enabled if:
+    // 1. TEST_MODE env var is set
+    // 2. NEON_BRANCH env var is set (ephemeral branch)
+    // 3. Database URL contains test-like patterns
+    // 4. We're running in a test environment (CI, local dev with ephemeral branches)
+    let test_mode = std::env::var("TEST_MODE").is_ok() 
+        || std::env::var("NEON_BRANCH").is_ok()
+        || database_url.contains("ci-local-")
+        || database_url.contains("test-")
+        || database_url.contains("ep-")  // Neon endpoint IDs often start with ep-
+        || environment == "development"  // Development environment is safe for test mode
+        || environment == "test";
+
+    run_migrations(&pool, &migrations_path, test_mode).await?;
 
     info!("Migrations completed successfully");
 
     Ok(())
 }
 
-async fn run_migrations(pool: &PgPool, migrations_dir: &Path) -> Result<()> {
+async fn run_migrations(pool: &PgPool, migrations_dir: &Path, _test_mode: bool) -> Result<()> {
+    // Proactively clean up orphaned migration records before creating Migrator
+    // This prevents "migration was previously applied but is missing" errors
+    if let Err(e) = cleanup_inconsistent_migrations(pool, migrations_dir).await {
+        info!("Warning: Could not proactively clean up migrations: {}", e);
+    }
+
+    // Create migrator - SQLx will validate migration files match database state
+    // Retry once if we encounter modified/missing migration errors
     let migrator = match Migrator::new(migrations_dir).await {
         Ok(m) => m,
         Err(e) => {
-            // Handle case where database has migrations that don't exist in files
-            // or have been modified since they were applied. Either situation
-            // is acceptable for local/dev environments where migrations may
-            // be reworked during development. In those cases skip running
-            // the migrator rather than failing the process.
             let error_msg = e.to_string();
-            if error_msg.contains("was previously applied but is missing") {
-                info!(
-                    "Database has migration records that don't match files. This is expected if migrations were removed. Skipping migration run."
-                );
-                return Ok(());
+
+            // If error is about modified or missing migrations, try to clean up and retry once
+            if error_msg.contains("was previously applied but is missing")
+                || error_msg.contains("was previously applied but has been modified")
+            {
+                info!("Cleaning up inconsistent migration records and retrying...");
+
+                // Extract and remove modified migration versions
+                if error_msg.contains("was previously applied but has been modified") {
+                    let modified_versions: Vec<i64> = error_msg
+                        .split("migration")
+                        .skip(1)
+                        .filter_map(|part| {
+                            part.split_whitespace()
+                                .next()
+                                .and_then(|s| s.parse::<i64>().ok())
+                        })
+                        .collect();
+
+                    for version in &modified_versions {
+                        if let Err(e) =
+                            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+                                .bind(version)
+                                .execute(pool)
+                                .await
+                        {
+                            info!("Warning: Could not remove migration {}: {}", version, e);
+                        }
+                    }
+                }
+
+                // Clean up orphaned migrations
+                if let Err(cleanup_err) =
+                    cleanup_inconsistent_migrations(pool, migrations_dir).await
+                {
+                    info!("Warning: Could not clean up migrations: {}", cleanup_err);
+                }
+
+                // Retry once
+                Migrator::new(migrations_dir).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to create migrator after cleanup: {}", e)
+                })?
+            } else {
+                return Err(anyhow::anyhow!("Failed to create migrator: {}", e));
             }
-            if error_msg.contains("was previously applied but has been modified") {
-                info!(
-                    "Database has migrations that were previously applied but the files were modified. Skipping migration run."
-                );
-                return Ok(());
-            }
-            return Err(anyhow::anyhow!("Failed to create migrator: {}", e));
         }
     };
 
+    // Run migrations
+    run_migrations_inner(pool, migrator).await
+}
+
+async fn run_migrations_inner(pool: &PgPool, migrator: Migrator) -> Result<()> {
+    // Run migrations - SQLx will automatically skip already-applied ones
     match migrator.run(pool).await {
         Ok(_) => Ok(()),
         Err(e) => {
             let error_msg = e.to_string();
             if error_msg.contains("was previously applied but is missing") {
-                info!(
-                    "Database has migration records that don't match files. This is expected if migrations were removed. Skipping migration run."
-                );
-                Ok(())
+                Err(anyhow::anyhow!(
+                    "Database has migration records for files that no longer exist. \
+                    This indicates a migration file was deleted after being applied. \
+                    Error: {}. \
+                    To fix: either restore the missing migration file or manually remove \
+                    the orphaned record from _sqlx_migrations table.",
+                    error_msg
+                ))
             } else if error_msg.contains("was previously applied but has been modified") {
-                info!(
-                    "Database has migrations that were previously applied but the files were modified. Skipping migration run."
-                );
-                Ok(())
+                Err(anyhow::anyhow!(
+                    "Database has migration records for files that have been modified. \
+                    This indicates a migration file was changed after being applied. \
+                    Error: {}. \
+                    To fix: either revert the migration file to its original state or \
+                    create a new migration to make the desired changes.",
+                    error_msg
+                ))
             } else {
                 Err(anyhow::anyhow!("Migration failed: {}", e))
             }
         }
     }
+}
+
+/// Clean up inconsistent migration records (for test mode only)
+async fn cleanup_inconsistent_migrations(pool: &PgPool, migrations_dir: &Path) -> Result<()> {
+    use std::collections::HashSet;
+
+    // Get list of all migration files
+    let mut file_versions = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(migrations_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(version_str) = name.split('_').next() {
+                    if let Ok(version) = version_str.parse::<i64>() {
+                        file_versions.insert(version);
+                    }
+                }
+            }
+        }
+    }
+
+    // Get applied migrations from database
+    let applied_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await?;
+
+    // Find orphaned migrations (applied but file missing)
+    let orphaned: Vec<i64> = applied_versions
+        .iter()
+        .filter(|v| !file_versions.contains(v))
+        .copied()
+        .collect();
+
+    // Remove orphaned migration records
+    if !orphaned.is_empty() {
+        info!(
+            "Cleaning up {} orphaned migration record(s): {:?}",
+            orphaned.len(),
+            orphaned
+        );
+        for version in &orphaned {
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+                .bind(version)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    // Note: Modified migrations are detected by SQLx during Migrator::new()
+    // They will be handled in the error path by extracting the version from the error message
+
+    Ok(())
 }

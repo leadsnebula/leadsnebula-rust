@@ -1,5 +1,5 @@
 -- Create buyer_responses table to persist every buyer reply for audit
--- Migration: 20260113000002_create_buyer_responses.sql
+-- Migration: 20260113000004_create_buyer_responses.sql
 
 CREATE TABLE IF NOT EXISTS buyer_responses (
   id BIGSERIAL PRIMARY KEY,

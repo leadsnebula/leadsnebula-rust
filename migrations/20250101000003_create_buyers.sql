@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS buyers (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_buyers_instance_id ON buyers(instance_id);
-CREATE INDEX idx_buyers_vertical_id ON buyers(vertical_id);
-CREATE INDEX idx_buyers_status ON buyers(status);
-CREATE INDEX idx_buyers_deleted_at ON buyers(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_buyers_instance_id ON buyers(instance_id);
+CREATE INDEX IF NOT EXISTS idx_buyers_vertical_id ON buyers(vertical_id);
+CREATE INDEX IF NOT EXISTS idx_buyers_status ON buyers(status);
+CREATE INDEX IF NOT EXISTS idx_buyers_deleted_at ON buyers(deleted_at);
 

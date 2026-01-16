@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS ping_tree_campaigns (
     CONSTRAINT unique_ping_tree_campaign UNIQUE (ping_tree_id, campaign_id)
 );
 
-CREATE INDEX idx_ping_tree_campaigns_ping_tree_id ON ping_tree_campaigns(ping_tree_id);
-CREATE INDEX idx_ping_tree_campaigns_campaign_id ON ping_tree_campaigns(campaign_id);
-CREATE INDEX idx_ping_tree_campaigns_routing ON ping_tree_campaigns(ping_tree_id, enabled, priority) WHERE enabled = true;
-CREATE INDEX idx_ping_tree_campaigns_ordering ON ping_tree_campaigns(ping_tree_id, priority);
+CREATE INDEX IF NOT EXISTS idx_ping_tree_campaigns_ping_tree_id ON ping_tree_campaigns(ping_tree_id);
+CREATE INDEX IF NOT EXISTS idx_ping_tree_campaigns_campaign_id ON ping_tree_campaigns(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_ping_tree_campaigns_routing ON ping_tree_campaigns(ping_tree_id, enabled, priority) WHERE enabled = true;
+CREATE INDEX IF NOT EXISTS idx_ping_tree_campaigns_ordering ON ping_tree_campaigns(ping_tree_id, priority);
 

@@ -174,10 +174,10 @@ async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
 
     sqlx::query(
         r#"
-        INSERT INTO user_otp_settings (platform_user_id, secret, backup_codes, enabled, created_at, updated_at)
+        INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, backup_codes_encrypted, enabled, created_at, updated_at)
         VALUES ($1, $2, $3, false, NOW(), NOW())
-        ON CONFLICT (platform_user_id) DO UPDATE
-        SET secret = EXCLUDED.secret, backup_codes = EXCLUDED.backup_codes, updated_at = NOW()
+        ON CONFLICT (instance_user_id) DO UPDATE
+        SET secret_encrypted = EXCLUDED.secret_encrypted, backup_codes_encrypted = EXCLUDED.backup_codes_encrypted, updated_at = NOW()
         "#,
     )
     .bind(user_id)
@@ -187,12 +187,13 @@ async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
     .await?;
 
     // Verify OTP setting was created
-    let otp_secret: Option<String> =
-        sqlx::query_scalar("SELECT secret FROM user_otp_settings WHERE platform_user_id = $1")
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten();
+    let otp_secret: Option<String> = sqlx::query_scalar(
+        "SELECT secret_encrypted FROM user_otp_settings WHERE instance_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
 
     assert!(otp_secret.is_some());
     assert_eq!(otp_secret.unwrap(), secret);
@@ -204,20 +205,38 @@ async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
 
 #[tokio::test]
 async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
+    // Retry pool acquisition to handle transient pool exhaustion
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+
+    // Retry transaction begin with exponential backoff
+    let mut tx = {
+        let mut retries = 0;
+        let max_retries = 3;
+        loop {
+            match pool.begin().await {
+                Ok(tx) => break Ok(tx),
+                Err(sqlx::Error::PoolTimedOut) if retries < max_retries => {
+                    retries += 1;
+                    let delay_ms = 100 * (1 << retries); // 200ms, 400ms, 800ms
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    }?;
     let user_id = create_test_user(&mut *tx, "otp_enable_test@example.com").await;
 
     // Create OTP setting (disabled)
     let secret = "JBSWY3DPEHPK3PXP";
     sqlx::query(
         r#"
-        INSERT INTO user_otp_settings (platform_user_id, secret, enabled, created_at, updated_at)
+        INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, enabled, created_at, updated_at)
         VALUES ($1, $2, false, NOW(), NOW())
-        ON CONFLICT (platform_user_id) DO UPDATE
-        SET secret = EXCLUDED.secret, updated_at = NOW()
+        ON CONFLICT (instance_user_id) DO UPDATE
+        SET secret_encrypted = EXCLUDED.secret_encrypted, updated_at = NOW()
         "#,
     )
     .bind(user_id)
@@ -227,7 +246,7 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
 
     // Verify OTP is disabled
     let enabled: Option<bool> =
-        sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1")
+        sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -237,7 +256,7 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
 
     // Enable OTP
     sqlx::query(
-        "UPDATE user_otp_settings SET enabled = true, updated_at = NOW() WHERE platform_user_id = $1",
+        "UPDATE user_otp_settings SET enabled = true, updated_at = NOW() WHERE instance_user_id = $1",
     )
     .bind(user_id)
     .execute(&mut *tx)
@@ -245,7 +264,7 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
 
     // Verify OTP is enabled
     let enabled: Option<bool> =
-        sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1")
+        sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -255,7 +274,7 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
 
     // Disable OTP
     sqlx::query(
-        "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE platform_user_id = $1",
+        "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE instance_user_id = $1",
     )
     .bind(user_id)
     .execute(&mut *tx)
@@ -263,7 +282,7 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
 
     // Verify OTP is disabled again
     let enabled: Option<bool> =
-        sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1")
+        sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -291,10 +310,10 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
 
     sqlx::query(
         r#"
-        INSERT INTO user_otp_settings (platform_user_id, secret, backup_codes, enabled, created_at, updated_at)
+        INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, backup_codes_encrypted, enabled, created_at, updated_at)
         VALUES ($1, $2, $3, false, NOW(), NOW())
-        ON CONFLICT (platform_user_id) DO UPDATE
-        SET secret = EXCLUDED.secret, backup_codes = EXCLUDED.backup_codes, updated_at = NOW()
+        ON CONFLICT (instance_user_id) DO UPDATE
+        SET secret_encrypted = EXCLUDED.secret_encrypted, backup_codes_encrypted = EXCLUDED.backup_codes_encrypted, updated_at = NOW()
         "#,
     )
     .bind(user_id)
@@ -305,7 +324,7 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
 
     // Retrieve backup codes
     let stored_codes_json: Option<String> = sqlx::query_scalar(
-        "SELECT backup_codes FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT backup_codes_encrypted FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&mut *tx)
@@ -341,13 +360,12 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO webauthn_credentials (
-            id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
+            id, instance_user_id, external_id, public_key, sign_count,
             name, passkey_type, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
         "#,
     )
     .bind(passkey_id)
-    .bind(user_id)
     .bind(user_id)
     .bind(&external_id)
     .bind(public_key)
@@ -359,7 +377,7 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
 
     // Verify passkey was stored
     let stored_name: Option<String> = sqlx::query_scalar(
-        "SELECT name FROM webauthn_credentials WHERE platform_user_id = $1 AND external_id = $2",
+        "SELECT name FROM webauthn_credentials WHERE instance_user_id = $1 AND external_id = $2",
     )
     .bind(user_id)
     .bind(&external_id)
@@ -371,7 +389,7 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
 
     // Verify passkey count
     let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webauthn_credentials WHERE platform_user_id = $1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM webauthn_credentials WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -400,13 +418,12 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO webauthn_credentials (
-                id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
+                id, instance_user_id, external_id, public_key, sign_count,
                 name, passkey_type, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, 0, $6, 'soft', NOW(), NOW())
+            ) VALUES ($1, $2, $3, $4, 0, $5, 'soft', NOW(), NOW())
             "#,
         )
         .bind(passkey_id)
-        .bind(user_id)
         .bind(user_id)
         .bind(external_id)
         .bind(public_key)
@@ -417,7 +434,7 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
 
     // Verify we have 3 passkeys
     let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webauthn_credentials WHERE platform_user_id = $1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM webauthn_credentials WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await?;

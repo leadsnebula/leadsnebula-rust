@@ -1,7 +1,7 @@
 use anyhow;
 use once_cell::sync::Lazy;
 use sqlx::migrate::Migrator;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
@@ -41,10 +41,12 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
         }
     }
 
+    // Increase default pool size for tests to handle concurrent test execution
+    // Tests run with --test-threads=1, but transactions can hold connections longer
     let max_conns: u32 = std::env::var("TEST_POOL_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(10);
 
     let pool = PgPoolOptions::new()
         .max_connections(max_conns)
@@ -84,48 +86,136 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     mc.insert(database_url.clone());
                 } // Release lock before async operations
 
-                // Only run migrations if needed (check _sqlx_migrations)
-                let migration_result = match should_run_migrations(&pool).await {
-                    Ok(true) => {
-                        // Run migrations with a timeout and fail fast on errors
-                        let migrator = Migrator::new(migrations_path.as_path()).await?;
-                        tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                            migrator.run(&pool).await
-                        })
-                        .await
-                    }
-                    Ok(false) => {
-                        // Migrations not needed - return success
-                        Ok(Ok(()))
-                    }
-                    Err(e) => {
-                        // If we can't determine migration state, err on the side of caution and run migrations
-                        eprintln!("Could not check migration status: {}", e);
-                        let migrator = Migrator::new(migrations_path.as_path()).await?;
-                        tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                            migrator.run(&pool).await
-                        })
-                        .await
-                    }
-                };
+                // Simple, clean migration logic for test mode
+                // In test mode (ephemeral Neon branches), always drop and recreate _sqlx_migrations
+                // This ensures a clean slate and prevents checksum mismatches from copied state
+                let is_test_mode = database_url.contains("ci-local-")
+                    || database_url.contains("test-")
+                    || database_url.contains("ep-")
+                    || std::env::var("TEST_MODE").is_ok()
+                    || std::env::var("NEON_BRANCH").is_ok();
 
-                match migration_result {
-                    Ok(Ok(_)) => {
-                        // Success - migration cache already updated
+                if is_test_mode {
+                    // Drop and recreate _sqlx_migrations table to ensure clean state
+                    // This prevents checksum mismatches from copied branch state
+                    sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations CASCADE")
+                        .execute(&pool)
+                        .await
+                        .ok();
+
+                    // Recreate table with exact SQLx schema
+                    sqlx::query(
+                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                            version BIGINT PRIMARY KEY,
+                            description TEXT NOT NULL,
+                            installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            success BOOLEAN NOT NULL,
+                            checksum BYTEA NOT NULL,
+                            execution_time BIGINT NOT NULL
+                        )",
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to create _sqlx_migrations table: {}", e)
+                    })?;
+
+                    // Clean up partially applied migrations - fix inconsistent database state
+                    // This handles cases where tables exist but are missing required columns
+                    // (e.g., from partial migrations in copied Neon branches)
+
+                    // Fix user_otp_settings table - drop if missing instance_user_id column
+                    let user_otp_fix = sqlx::query(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables 
+                            WHERE table_name = 'user_otp_settings'
+                        ) AND NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'user_otp_settings' AND column_name = 'instance_user_id'
+                        )"
+                    )
+                    .fetch_one(&pool)
+                    .await;
+
+                    if let Ok(row) = user_otp_fix {
+                        let needs_fix: bool = row.get(0);
+                        if needs_fix {
+                            sqlx::query("DROP TABLE IF EXISTS user_otp_settings CASCADE")
+                                .execute(&pool)
+                                .await
+                                .ok();
+                        }
                     }
-                    Ok(Err(e)) => {
-                        // Migration failed - remove from cache so it can be retried
-                        let mut mc = MIGRATION_CACHE.lock().unwrap();
-                        mc.remove(&database_url);
-                        return Err(anyhow::anyhow!("Migrations failed: {}", e));
+
+                    // Fix webauthn_credentials table - drop if missing instance_user_id column
+                    let webauthn_fix = sqlx::query(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables 
+                            WHERE table_name = 'webauthn_credentials'
+                        ) AND NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
+                        )"
+                    )
+                    .fetch_one(&pool)
+                    .await;
+
+                    if let Ok(row) = webauthn_fix {
+                        let needs_fix: bool = row.get(0);
+                        if needs_fix {
+                            sqlx::query("DROP TABLE IF EXISTS webauthn_credentials CASCADE")
+                                .execute(&pool)
+                                .await
+                                .ok();
+                        }
                     }
-                    Err(_) => {
-                        // Timeout - remove from cache so it can be retried
-                        let mut mc = MIGRATION_CACHE.lock().unwrap();
-                        mc.remove(&database_url);
-                        return Err(anyhow::anyhow!("Migrations timed out after 60s"));
-                    }
+
+                    // Fix any tables with invalid foreign key constraints
+                    sqlx::query(
+                        "DO $$ 
+                        DECLARE
+                            r RECORD;
+                        BEGIN
+                            FOR r IN 
+                                SELECT conname, conrelid::regclass::text as table_name
+                                FROM pg_constraint
+                                WHERE contype = 'f'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM pg_attribute a
+                                    JOIN pg_constraint c ON a.attrelid = c.conrelid
+                                    WHERE c.oid = pg_constraint.oid
+                                    AND a.attnum = ANY(pg_constraint.conkey)
+                                )
+                            LOOP
+                                EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I CASCADE', r.table_name, r.conname);
+                            END LOOP;
+                        END $$;"
+                    )
+                    .execute(&pool)
+                    .await
+                    .ok();
                 }
+
+                // Run migrations - simple and clean, no retries needed after reset
+                let migrator = Migrator::new(migrations_path.as_path())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create migrator: {}", e))?;
+
+                migrator.run(&pool).await.map_err(|e| {
+                    let error_msg = e.to_string();
+                    // In test mode, provide helpful error message for "already exists" errors
+                    if is_test_mode && (error_msg.contains("already exists") || error_msg.contains("duplicate key")) {
+                        anyhow::anyhow!(
+                            "Migration failed: {}. This happens when database objects already exist from copied branch state. \
+                            Consider using 'IF NOT EXISTS' clauses in migration SQL files for test environments.",
+                            error_msg
+                        )
+                    } else {
+                        anyhow::anyhow!("Migration failed: {}", e)
+                    }
+                })?;
+
+                // Migration succeeded - cache already updated above
             }
         }
     }
@@ -137,26 +227,6 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     }
 
     Ok(pool)
-}
-
-async fn should_run_migrations(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    // Check if the _sqlx_migrations table exists
-    let table_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_sqlx_migrations'",
-    )
-    .fetch_one(pool)
-    .await?;
-
-    if table_count == 0 {
-        // No table -> migrations should run
-        return Ok(true);
-    }
-
-    // If the table exists, check if there are any applied migrations
-    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
-        .fetch_one(pool)
-        .await?;
-    Ok(applied == 0)
 }
 
 fn find_migrations_dir() -> anyhow::Result<std::path::PathBuf> {

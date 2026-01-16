@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS ping_trees (
     CONSTRAINT unique_ping_tree_name UNIQUE (publisher_id, vertical, name)
 );
 
-CREATE INDEX idx_ping_trees_deleted_at ON ping_trees(deleted_at);
-CREATE INDEX idx_ping_trees_instance_id ON ping_trees(instance_id);
-CREATE INDEX idx_ping_trees_publisher_id ON ping_trees(publisher_id);
-CREATE INDEX idx_ping_trees_routing ON ping_trees(publisher_id, vertical, status) WHERE deleted_at IS NULL;
-CREATE INDEX idx_ping_trees_publisher_vertical ON ping_trees(publisher_id, vertical);
+CREATE INDEX IF NOT EXISTS idx_ping_trees_deleted_at ON ping_trees(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_ping_trees_instance_id ON ping_trees(instance_id);
+CREATE INDEX IF NOT EXISTS idx_ping_trees_publisher_id ON ping_trees(publisher_id);
+CREATE INDEX IF NOT EXISTS idx_ping_trees_routing ON ping_trees(publisher_id, vertical, status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ping_trees_publisher_vertical ON ping_trees(publisher_id, vertical);
 

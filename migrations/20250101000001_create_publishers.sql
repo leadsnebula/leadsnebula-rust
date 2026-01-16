@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS publishers (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_publishers_api_key_hash ON publishers(api_key_hash);
-CREATE INDEX idx_publishers_status ON publishers(status);
-CREATE INDEX idx_publishers_deleted_at ON publishers(deleted_at);
-CREATE INDEX idx_publishers_instance_id ON publishers(instance_id);
+CREATE INDEX IF NOT EXISTS idx_publishers_api_key_hash ON publishers(api_key_hash);
+CREATE INDEX IF NOT EXISTS idx_publishers_status ON publishers(status);
+CREATE INDEX IF NOT EXISTS idx_publishers_deleted_at ON publishers(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_publishers_instance_id ON publishers(instance_id);
 

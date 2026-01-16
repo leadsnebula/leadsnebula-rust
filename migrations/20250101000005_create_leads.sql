@@ -66,17 +66,17 @@ CREATE TABLE IF NOT EXISTS leads (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_leads_event_id ON leads(event_id);
-CREATE INDEX idx_leads_lead_id ON leads(lead_id);
-CREATE INDEX idx_leads_publisher_id ON leads(publisher_id);
-CREATE INDEX idx_leads_vertical_id ON leads(vertical_id);
-CREATE INDEX idx_leads_campaign_id ON leads(campaign_id);
-CREATE INDEX idx_leads_buyer_id ON leads(buyer_id);
-CREATE INDEX idx_leads_status ON leads(status);
-CREATE INDEX idx_leads_request_type ON leads(request_type);
-CREATE INDEX idx_leads_promise_id ON leads(promise_id) WHERE promise_id IS NOT NULL;
-CREATE INDEX idx_leads_email_sha256 ON leads(email_sha256);
-CREATE INDEX idx_leads_phone_sha256 ON leads(phone_sha256);
-CREATE INDEX idx_leads_created_at ON leads(created_at);
-CREATE INDEX idx_leads_is_test ON leads(is_test);
+CREATE INDEX IF NOT EXISTS idx_leads_event_id ON leads(event_id);
+CREATE INDEX IF NOT EXISTS idx_leads_lead_id ON leads(lead_id);
+CREATE INDEX IF NOT EXISTS idx_leads_publisher_id ON leads(publisher_id);
+CREATE INDEX IF NOT EXISTS idx_leads_vertical_id ON leads(vertical_id);
+CREATE INDEX IF NOT EXISTS idx_leads_campaign_id ON leads(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_leads_buyer_id ON leads(buyer_id);
+CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
+CREATE INDEX IF NOT EXISTS idx_leads_request_type ON leads(request_type);
+CREATE INDEX IF NOT EXISTS idx_leads_promise_id ON leads(promise_id) WHERE promise_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_leads_email_sha256 ON leads(email_sha256);
+CREATE INDEX IF NOT EXISTS idx_leads_phone_sha256 ON leads(phone_sha256);
+CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
+CREATE INDEX IF NOT EXISTS idx_leads_is_test ON leads(is_test);
 

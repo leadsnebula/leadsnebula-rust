@@ -122,8 +122,8 @@ pub fn dashboard_routes() -> Router<AppState> {
             get(get_publisher_api_key),
         )
         .route(
-            "/api/v1/dashboard/publishers/:id/generate-hmac-secret",
-            post(generate_publisher_hmac_secret),
+            "/api/v1/dashboard/publishers/:id/generate-hmac-secret_encrypted",
+            post(generate_publisher_hmac_secret_encrypted),
         )
         .route("/api/v1/dashboard/buyers", get(list_buyers))
         .route("/api/v1/dashboard/buyers", post(create_buyer))
@@ -224,7 +224,7 @@ async fn get_security_status(
 
     // Check OTP status
     let otp_enabled: Option<bool> = sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -277,7 +277,7 @@ async fn setup_otp(
 
     // Check if OTP is already enabled
     let existing_otp = sqlx::query_scalar::<_, bool>(
-        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -294,44 +294,47 @@ async fn setup_otp(
         })));
     }
 
-    // Generate a new secret (base32 encoded)
+    // Generate a new secret_encrypted (base32 encoded)
     use rand::rngs::OsRng;
     use rand::RngCore;
     let mut rng = OsRng;
-    let mut secret_bytes = [0u8; 20];
-    rng.fill_bytes(&mut secret_bytes);
-    let secret = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &secret_bytes);
+    let mut secret_encrypted_bytes = [0u8; 20];
+    rng.fill_bytes(&mut secret_encrypted_bytes);
+    let secret_encrypted = base32::encode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        &secret_encrypted_bytes,
+    );
 
     // Create or update OTP setting (but don't enable it yet - wait for verification)
     sqlx::query(
         r#"
-        INSERT INTO user_otp_settings (platform_user_id, secret, enabled, created_at, updated_at)
+        INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, enabled, created_at, updated_at)
         VALUES ($1, $2, false, NOW(), NOW())
-        ON CONFLICT (platform_user_id) 
-        DO UPDATE SET secret = $2, enabled = false, updated_at = NOW()
+        ON CONFLICT (instance_user_id) 
+        DO UPDATE SET secret_encrypted = $2, enabled = false, updated_at = NOW()
         "#,
     )
     .bind(user.id)
-    .bind(&secret)
+    .bind(&secret_encrypted)
     .execute(state.db_pool.as_ref())
     .await
     .map_err(|e| {
-        error!("Database error saving OTP secret: {}", e);
+        error!("Database error saving OTP secret_encrypted: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     // Generate provisioning URI
     let provisioning_uri = format!(
-        "otpauth://totp/LeadsNebula:{}?secret={}&issuer=LeadsNebula",
+        "otpauth://totp/LeadsNebula:{}?secret_encrypted={}&issuer=LeadsNebula",
         urlencoding::encode(&user.email),
-        secret
+        secret_encrypted
     );
 
-    // Return the secret and provisioning URI
+    // Return the secret_encrypted and provisioning URI
     // Frontend can generate QR code client-side
     Ok(Json(serde_json::json!({
         "success": true,
-        "secret": secret,
+        "secret_encrypted": secret_encrypted,
         "provisioning_uri": provisioning_uri
     })))
 }
@@ -339,7 +342,7 @@ async fn setup_otp(
 #[derive(Deserialize)]
 struct VerifyOtpRequest {
     code: String,
-    secret: Option<String>, // Optional for now, but we'll get it from DB
+    secret_encrypted: Option<String>, // Optional for now, but we'll get it from DB
 }
 
 async fn verify_otp(
@@ -377,27 +380,27 @@ async fn verify_otp(
     })?
     .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    // Get OTP secret from database (prefer DB over request payload for security)
+    // Get OTP secret_encrypted from database (prefer DB over request payload for security)
     // fetch_optional on query_scalar returns Option<Option<String>> (row found? and value is Some?)
-    let db_secret: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT secret FROM user_otp_settings WHERE platform_user_id = $1",
+    let db_secret_encrypted: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT secret_encrypted FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
     .await
     .map_err(|e| {
-        error!("Database error loading OTP secret: {}", e);
+        error!("Database error loading OTP secret_encrypted: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?
     .flatten(); // Flatten Option<Option<String>> to Option<String>
 
-    // Use DB secret if available, otherwise fallback to payload secret (during setup flow)
-    let otp_secret = db_secret.or(payload.secret);
+    // Use DB secret_encrypted if available, otherwise fallback to payload secret_encrypted (during setup flow)
+    let otp_secret_encrypted = db_secret_encrypted.or(payload.secret_encrypted);
 
-    let secret = otp_secret.ok_or(StatusCode::BAD_REQUEST)?;
+    let secret_encrypted = otp_secret_encrypted.ok_or(StatusCode::BAD_REQUEST)?;
 
     // Verify OTP code
-    let otp_service = OtpService::new(&secret).map_err(|e| {
+    let otp_service = OtpService::new(&secret_encrypted).map_err(|e| {
         error!("Failed to create OtpService: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -415,7 +418,7 @@ async fn verify_otp(
     use rand::rngs::OsRng;
     use rand::RngCore;
     let mut rng = OsRng;
-    let mut backup_codes = Vec::new();
+    let mut backup_codes_encrypted = Vec::new();
     let chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // Exclude ambiguous chars
     for _ in 0..8 {
         let code: String = (0..8)
@@ -425,20 +428,20 @@ async fn verify_otp(
                 chars.chars().nth((buf[0] as usize) % chars.len()).unwrap()
             })
             .collect();
-        backup_codes.push(code);
+        backup_codes_encrypted.push(code);
     }
-    let backup_codes_json =
-        serde_json::to_string(&backup_codes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let backup_codes_encrypted_json = serde_json::to_string(&backup_codes_encrypted)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Enable OTP and save backup codes
     sqlx::query(
         r#"
         UPDATE user_otp_settings
-        SET enabled = true, backup_codes = $1, last_verified_at = NOW(), updated_at = NOW()
-        WHERE platform_user_id = $2
+        SET enabled = true, backup_codes_encrypted = $1, last_verified_at = NOW(), updated_at = NOW()
+        WHERE instance_user_id = $2
         "#,
     )
-    .bind(&backup_codes_json)
+    .bind(&backup_codes_encrypted_json)
     .bind(user.id)
     .execute(state.db_pool.as_ref())
     .await
@@ -449,7 +452,7 @@ async fn verify_otp(
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "backup_codes": backup_codes
+        "backup_codes_encrypted": backup_codes_encrypted
     })))
 }
 
@@ -488,7 +491,7 @@ async fn disable_otp(
 
     // Check if OTP is enabled
     let otp_enabled: Option<bool> = sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -508,7 +511,7 @@ async fn disable_otp(
 
     // Disable OTP (set enabled to false)
     sqlx::query(
-        "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE platform_user_id = $1",
+        "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .execute(state.db_pool.as_ref())
@@ -578,7 +581,7 @@ async fn passkey_registration_options(
 
     // Check if user can add passkey (max 3)
     let passkey_count: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM webauthn_credentials WHERE platform_user_id = $1",
+        "SELECT COUNT(*) FROM webauthn_credentials WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_one(state.db_pool.as_ref())
@@ -953,7 +956,7 @@ async fn register_passkey(
         sqlx::query(
             r#"
             INSERT INTO webauthn_credentials (
-                id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
+                id, instance_user_id, instance_user_id, external_id, public_key, sign_count,
                 name, passkey_type, created_at, updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
             "#,
@@ -1055,7 +1058,7 @@ async fn _setup_otp_with_user(
 
     // Check if OTP is already enabled
     let existing_otp = sqlx::query_scalar::<_, bool>(
-        "SELECT enabled FROM user_otp_settings WHERE platform_user_id = $1",
+        "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
     )
     .bind(user.id)
     .fetch_optional(state.db_pool.as_ref())
@@ -1118,13 +1121,16 @@ async fn _setup_otp_with_user(
         })));
     }
 
-    // Generate a new secret (base32 encoded)
+    // Generate a new secret_encrypted (base32 encoded)
     use rand::rngs::OsRng;
     use rand::RngCore;
     let mut rng = OsRng;
-    let mut secret_bytes = [0u8; 20];
-    rng.fill_bytes(&mut secret_bytes);
-    let secret = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &secret_bytes);
+    let mut secret_encrypted_bytes = [0u8; 20];
+    rng.fill_bytes(&mut secret_encrypted_bytes);
+    let secret_encrypted = base32::encode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        &secret_encrypted_bytes,
+    );
 
     // #region agent log
     let log_data = serde_json::json!({
@@ -1133,7 +1139,7 @@ async fn _setup_otp_with_user(
         "hypothesisId": "A",
         "location": "dashboard.rs:285",
         "message": "Secret generated, saving to database",
-        "data": {"user_id": user.id.to_string(), "secret_length": secret.len()},
+        "data": {"user_id": user.id.to_string(), "secret_encrypted_length": secret_encrypted.len()},
         "timestamp": chrono::Utc::now().timestamp_millis()
     });
     let _ = std::fs::OpenOptions::new()
@@ -1153,14 +1159,14 @@ async fn _setup_otp_with_user(
     // Create or update OTP setting (but don't enable it yet - wait for verification)
     sqlx::query(
         r#"
-        INSERT INTO user_otp_settings (platform_user_id, secret, enabled, created_at, updated_at)
+        INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, enabled, created_at, updated_at)
         VALUES ($1, $2, false, NOW(), NOW())
-        ON CONFLICT (platform_user_id) 
-        DO UPDATE SET secret = $2, enabled = false, updated_at = NOW()
+        ON CONFLICT (instance_user_id) 
+        DO UPDATE SET secret_encrypted = $2, enabled = false, updated_at = NOW()
         "#,
     )
     .bind(user.id)
-    .bind(&secret)
+    .bind(&secret_encrypted)
     .execute(state.db_pool.as_ref())
     .await
     .map_err(|e| {
@@ -1170,7 +1176,7 @@ async fn _setup_otp_with_user(
             "runId": "run1",
             "hypothesisId": "E",
             "location": "dashboard.rs:305",
-            "message": "Database error saving OTP secret",
+            "message": "Database error saving OTP secret_encrypted",
             "data": {"error": e.to_string()},
             "timestamp": chrono::Utc::now().timestamp_millis()
         });
@@ -1187,15 +1193,15 @@ async fn _setup_otp_with_user(
                 )
             });
         // #endregion
-        error!("Database error saving OTP secret: {}", e);
+        error!("Database error saving OTP secret_encrypted: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     // Generate provisioning URI
     let provisioning_uri = format!(
-        "otpauth://totp/LeadsNebula:{}?secret={}&issuer=LeadsNebula",
+        "otpauth://totp/LeadsNebula:{}?secret_encrypted={}&issuer=LeadsNebula",
         urlencoding::encode(&user.email),
-        secret
+        secret_encrypted
     );
 
     // #region agent log
@@ -1222,11 +1228,11 @@ async fn _setup_otp_with_user(
         });
     // #endregion
 
-    // Return the secret and provisioning URI
+    // Return the secret_encrypted and provisioning URI
     // Frontend can generate QR code client-side
     Ok(Json(serde_json::json!({
         "success": true,
-        "secret": secret,
+        "secret_encrypted": secret_encrypted,
         "provisioning_uri": provisioning_uri
     })))
 }
@@ -1518,8 +1524,8 @@ async fn get_publisher(
             "status": publisher.status,
             "api_key_prefix": publisher.api_key_prefix,
             "hmac_required": publisher.hmac_required,
-            "hmac_secret_prefix": publisher.hmac_secret_prefix,
-            "hmac_secret_generated": publisher.hmac_secret_hash.is_some(),
+            "hmac_secret_encrypted_prefix": publisher.hmac_secret_prefix.clone(),
+            "hmac_secret_encrypted_generated": publisher.hmac_secret_hash.is_some(),
             "total_requests": publisher.total_requests,
             "last_request_at": publisher.last_request_at.map(|dt| dt.to_rfc3339()),
             "representative_first_name": publisher.representative_first_name,
@@ -1793,7 +1799,7 @@ async fn get_publisher_api_key(
     })))
 }
 
-async fn generate_publisher_hmac_secret(
+async fn generate_publisher_hmac_secret_encrypted(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1814,36 +1820,36 @@ async fn generate_publisher_hmac_secret(
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Generate new HMAC secret (128 hex characters = 64 bytes)
-    let hmac_secret = {
+    // Generate new HMAC secret_encrypted (128 hex characters = 64 bytes)
+    let hmac_secret_encrypted = {
         let mut rng = rand::thread_rng();
         let bytes: Vec<u8> = (0..64).map(|_| rng.gen_range(0..=255)).collect();
         hex::encode(bytes)
     };
 
     let mut hasher = Sha256::new();
-    hasher.update(hmac_secret.as_bytes());
-    let hmac_secret_hash = hex::encode(hasher.finalize());
-    let hmac_secret_prefix = hmac_secret.chars().take(20).collect::<String>();
+    hasher.update(hmac_secret_encrypted.as_bytes());
+    let hmac_secret_encrypted_hash = hex::encode(hasher.finalize());
+    let hmac_secret_encrypted_prefix = hmac_secret_encrypted.chars().take(20).collect::<String>();
 
-    // Update publisher with new HMAC secret
+    // Update publisher with new HMAC secret_encrypted
     sqlx::query(
         "UPDATE publishers SET hmac_secret_hash = $1, hmac_secret_prefix = $2, updated_at = NOW() WHERE id = $3 AND deleted_at IS NULL"
     )
-    .bind(&hmac_secret_hash)
-    .bind(&hmac_secret_prefix)
+    .bind(&hmac_secret_encrypted_hash)
+    .bind(&hmac_secret_encrypted_prefix)
     .bind(id)
     .execute(state.db_pool.as_ref())
     .await
     .map_err(|e| {
-        error!("Database error updating HMAC secret: {}", e);
+        error!("Database error updating HMAC secret_encrypted: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "hmac_secret": hmac_secret,
-        "message": "HMAC secret generated successfully"
+        "hmac_secret_encrypted": hmac_secret_encrypted,
+        "message": "HMAC secret_encrypted generated successfully"
     })))
 }
 
