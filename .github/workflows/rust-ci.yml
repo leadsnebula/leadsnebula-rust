@@ -108,6 +108,7 @@ jobs:
         id: neon_create
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -124,6 +125,7 @@ jobs:
       - name: Wait for Neon branch ready
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Waiting for Neon branch: $BRANCH_NAME"
@@ -132,6 +134,7 @@ jobs:
       - name: Export DATABASE_URL from Neon branch
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
@@ -163,6 +166,7 @@ jobs:
         if: always()
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Cleaning up Neon branch: $BRANCH_NAME"
@@ -368,6 +372,7 @@ jobs:
       - name: Create ephemeral Neon branch for coverage
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -383,6 +388,7 @@ jobs:
       - name: Wait for Neon branch ready
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Waiting for Neon branch: $BRANCH_NAME"
@@ -391,6 +397,7 @@ jobs:
       - name: Export DATABASE_URL from Neon branch
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
@@ -432,6 +439,7 @@ jobs:
         if: always()
         env:
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEONCTL_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Cleaning up Neon branch: $BRANCH_NAME"
