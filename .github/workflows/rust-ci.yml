@@ -83,16 +83,20 @@ jobs:
       - name: Authenticate Neon CLI
         env:
           NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
         run: |
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
+          if [ -z "$NEON_PROJECT_ID" ]; then
+            echo "NEON_PROJECT_ID secret is missing" && exit 1
+          fi
           # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
           # This matches the pattern used in scripts/test_neon_ephemeral.sh
           echo "NEONCTL_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
-          # Verify authentication works (neonctl me shows current user)
+          # Verify authentication works with org API key (me command doesn't work for org keys)
           export NEONCTL_API_KEY="$NEON_API_KEY"
-          $NEONCTL_CMD me || (echo "❌ Failed to authenticate with Neon" && exit 1)
+          $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null || (echo "❌ Failed to verify Neon access" && exit 1)
           echo "✅ Authenticated with Neon"
 
       - name: Create ephemeral Neon branch
@@ -334,16 +338,20 @@ jobs:
       - name: Authenticate Neon CLI
         env:
           NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
         run: |
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
+          if [ -z "$NEON_PROJECT_ID" ]; then
+            echo "NEON_PROJECT_ID secret is missing" && exit 1
+          fi
           # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
           # This matches the pattern used in scripts/test_neon_ephemeral.sh
           echo "NEONCTL_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
-          # Verify authentication works (neonctl me shows current user)
+          # Verify authentication works with org API key (me command doesn't work for org keys)
           export NEONCTL_API_KEY="$NEON_API_KEY"
-          $NEONCTL_CMD me || (echo "❌ Failed to authenticate with Neon" && exit 1)
+          $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null || (echo "❌ Failed to verify Neon access" && exit 1)
           echo "✅ Authenticated with Neon"
 
       - name: Create ephemeral Neon branch for coverage
