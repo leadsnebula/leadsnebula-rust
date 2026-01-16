@@ -87,7 +87,11 @@ jobs:
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
-          $NEONCTL_CMD auth --api-key "$NEON_API_KEY"
+          # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
+          echo "NEONCTL_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
+          # Verify authentication works
+          $NEONCTL_CMD whoami || (echo "❌ Failed to authenticate with Neon" && exit 1)
+          echo "✅ Authenticated with Neon"
 
       - name: Create ephemeral Neon branch
         id: neon_create
@@ -332,7 +336,11 @@ jobs:
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
-          $NEONCTL_CMD auth --api-key "$NEON_API_KEY"
+          # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
+          echo "NEONCTL_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
+          # Verify authentication works
+          $NEONCTL_CMD whoami || (echo "❌ Failed to authenticate with Neon" && exit 1)
+          echo "✅ Authenticated with Neon"
 
       - name: Create ephemeral Neon branch for coverage
         env:
