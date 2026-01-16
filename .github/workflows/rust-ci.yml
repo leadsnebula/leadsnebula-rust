@@ -139,21 +139,21 @@ jobs:
           echo "DATABASE_URL is set to: $DATABASE_URL"
 
           # smoke / health test (verify connection before running heavy tests)
-          cargo test --test integration_health --locked --all-features || true
+          cargo test --test integration_health --locked --all-features -- --test-threads=1 || true
 
-          # Run authentication integration tests
-          cargo test --test integration_auth --locked --all-features
+          # Run authentication integration tests (sequential to avoid pool exhaustion)
+          cargo test --test integration_auth --locked --all-features -- --test-threads=1
 
           # Run publisher CRUD tests
-          cargo test --test integration_publisher_crud --locked --all-features
+          cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1
 
           # Run E2E tests
-          cargo test --test integration_carina_e2e --locked --all-features
+          cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1
 
       - name: Run database-backed library tests (ignored)
         run: |
           echo "Running ignored library tests that require DATABASE_URL..."
-          cargo test --lib --all-features --locked -- --ignored
+          cargo test --lib --all-features --locked -- --ignored --test-threads=1
 
       - name: Cleanup ephemeral Neon branch
         if: always()
