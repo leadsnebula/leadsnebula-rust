@@ -348,7 +348,25 @@ async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+
+    // Retry transaction begin with exponential backoff to handle pool exhaustion
+    // This matches the pattern used in test_otp_enable_and_disable
+    let mut tx = {
+        let mut retries = 0;
+        let max_retries = 3;
+        loop {
+            match pool.begin().await {
+                Ok(tx) => break Ok(tx),
+                Err(sqlx::Error::PoolTimedOut) if retries < max_retries => {
+                    retries += 1;
+                    let delay_ms = 100 * (1 << retries); // 200ms, 400ms, 800ms
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    }?;
     // Test that deleted publishers' emails can be reused
     let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();

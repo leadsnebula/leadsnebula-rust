@@ -43,14 +43,15 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
 
     // Increase default pool size for tests to handle concurrent test execution
     // Tests run with --test-threads=1, but transactions can hold connections longer
+    // In CI, Neon can be slow, so we need more headroom and longer timeouts
     let max_conns: u32 = std::env::var("TEST_POOL_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(20); // Increased from 10 to 20 for CI headroom
 
     let pool = PgPoolOptions::new()
         .max_connections(max_conns)
-        .acquire_timeout(std::time::Duration::from_secs(10))
+        .acquire_timeout(std::time::Duration::from_secs(30)) // Increased from 10s to 30s for Neon CI slowness
         .connect(&database_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
