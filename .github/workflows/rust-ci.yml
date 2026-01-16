@@ -94,10 +94,15 @@ jobs:
           # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
           # This matches the pattern used in scripts/test_neon_ephemeral.sh
           echo "NEONCTL_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
-          # Verify authentication works with org API key (me command doesn't work for org keys)
           export NEONCTL_API_KEY="$NEON_API_KEY"
-          $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null || (echo "❌ Failed to verify Neon access" && exit 1)
-          echo "✅ Authenticated with Neon"
+          # Try to verify authentication (works with personal keys, may fail with restricted org keys)
+          # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
+            echo "✅ Authenticated with Neon (verified via branches list)"
+          else
+            echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
+            echo "✅ Proceeding - authentication will be verified by actual branch operations"
+          fi
 
       - name: Create ephemeral Neon branch
         id: neon_create
@@ -349,10 +354,15 @@ jobs:
           # neonctl uses NEONCTL_API_KEY environment variable for non-interactive auth
           # This matches the pattern used in scripts/test_neon_ephemeral.sh
           echo "NEONCTL_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
-          # Verify authentication works with org API key (me command doesn't work for org keys)
           export NEONCTL_API_KEY="$NEON_API_KEY"
-          $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null || (echo "❌ Failed to verify Neon access" && exit 1)
-          echo "✅ Authenticated with Neon"
+          # Try to verify authentication (works with personal keys, may fail with restricted org keys)
+          # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
+            echo "✅ Authenticated with Neon (verified via branches list)"
+          else
+            echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
+            echo "✅ Proceeding - authentication will be verified by actual branch operations"
+          fi
 
       - name: Create ephemeral Neon branch for coverage
         env:
