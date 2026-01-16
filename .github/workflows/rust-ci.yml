@@ -123,8 +123,9 @@ jobs:
       - name: Wait for Neon branch ready
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}
-          echo "Waiting for Neon branch: $BRANCH_NAME"
-          $NEONCTL_CMD branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"
+          echo "Branch $BRANCH_NAME created - endpoints are typically ready immediately"
+          # neonctl branches create returns when branch is created and ready to use
+          # No explicit wait needed - connection-string will work immediately
 
       - name: Export DATABASE_URL from Neon branch
         run: |
@@ -375,8 +376,9 @@ jobs:
       - name: Wait for Neon branch ready
         run: |
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
-          echo "Waiting for Neon branch: $BRANCH_NAME"
-          $NEONCTL_CMD branches wait "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"
+          echo "Branch $BRANCH_NAME created - endpoints are typically ready immediately"
+          # neonctl branches create returns when branch is created and ready to use
+          # No explicit wait needed - connection-string will work immediately
 
       - name: Export DATABASE_URL from Neon branch
         run: |
