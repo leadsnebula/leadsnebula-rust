@@ -14,8 +14,23 @@ mod duplicate_post_concurrency_tests {
 
     async fn setup_test_lead(pool: &PgPool) -> (Uuid, String) {
         // Use a single transaction for all setup (1 connection instead of 7)
-        let mut tx = pool.begin().await
-            .expect("Failed to begin transaction for setup");
+        // Retry transaction begin with exponential backoff to handle PoolTimedOut
+        let mut tx = {
+            let mut retries = 0;
+            let max_retries = 3;
+            loop {
+                match pool.begin().await {
+                    Ok(tx) => break tx,
+                    Err(sqlx::Error::PoolTimedOut) if retries < max_retries => {
+                        retries += 1;
+                        let delay_ms = 100 * (1 << retries); // 200ms, 400ms, 800ms
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    Err(e) => panic!("Failed to begin transaction for setup: {}", e),
+                }
+            }
+        };
 
         // Create instance_user
         let instance_user_id = Uuid::new_v4();

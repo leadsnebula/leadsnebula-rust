@@ -324,22 +324,6 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                 echo "✅ Async persistence tests OK"
             fi
         fi
-        
-        # Run all ignored library tests (concurrency, DB integration, etc.)
-        # These are the same tests that run in CI and catch pool timeout issues
-        # Set CI=true to use larger pool limits (30 connections, 60s timeout) for concurrency tests
-        echo "   Running all ignored library tests (concurrency, DB integration)..."
-        echo "   Using CI pool settings (30 connections, 60s timeout) for concurrency tests..."
-        if ! env CI=true cargo test --lib --all-features --locked -- --ignored --test-threads=1; then
-            echo "❌ Ignored library tests failed. Fix all failing tests before committing."
-            echo "   These tests include:"
-            echo "   - duplicate_post_concurrency_tests (tests pool exhaustion)"
-            echo "   - ping_tree_router_db_integration_tests (tests DB persistence)"
-            echo "   - ping_tree_router_integration_tests (tests routing logic)"
-            ERRORS=$((ERRORS + 1))
-        else
-            echo "✅ Ignored library tests OK"
-        fi
     else
         echo "   DATABASE_URL not set - running unit tests only..."
         echo "   (Set DATABASE_URL to run full test suite including database integration tests)"

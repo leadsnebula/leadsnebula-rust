@@ -105,9 +105,9 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 // Simple, clean migration logic for test mode
                 // In test mode (ephemeral Neon branches), always drop and recreate _sqlx_migrations
                 // This ensures a clean slate and prevents checksum mismatches from copied state
+                // NOTE: "ep-" in URL is Neon endpoint naming, NOT a test indicator - only check for actual test prefixes
                 let is_test_mode = database_url.contains("ci-local-")
                     || database_url.contains("test-")
-                    || database_url.contains("ep-")
                     || std::env::var("TEST_MODE").is_ok()
                     || std::env::var("NEON_BRANCH").is_ok();
 
@@ -212,25 +212,38 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     .ok();
                 }
 
-                // Run migrations - simple and clean, no retries needed after reset
-                let migrator = Migrator::new(migrations_path.as_path())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create migrator: {}", e))?;
+                // Check if migrations are already applied before running (optimization to avoid 45+ second delays)
+                let migrations_check = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
+                    )
+                    .fetch_optional(&pool),
+                )
+                .await;
+                let migrations_already_applied =
+                    matches!(migrations_check, Ok(Ok(Some(count))) if count > 0);
 
-                migrator.run(&pool).await.map_err(|e| {
-                    let error_msg = e.to_string();
-                    // In test mode, provide helpful error message for "already exists" errors
-                    if is_test_mode && (error_msg.contains("already exists") || error_msg.contains("duplicate key")) {
-                        anyhow::anyhow!(
-                            "Migration failed: {}. This happens when database objects already exist from copied branch state. \
-                            Consider using 'IF NOT EXISTS' clauses in migration SQL files for test environments.",
-                            error_msg
-                        )
-                    } else {
-                        anyhow::anyhow!("Migration failed: {}", e)
-                    }
-                })?;
+                if !migrations_already_applied {
+                    // Run migrations - simple and clean, no retries needed after reset
+                    let migrator = Migrator::new(migrations_path.as_path())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to create migrator: {}", e))?;
 
+                    migrator.run(&pool).await.map_err(|e| {
+                        let error_msg = e.to_string();
+                        // In test mode, provide helpful error message for "already exists" errors
+                        if is_test_mode && (error_msg.contains("already exists") || error_msg.contains("duplicate key")) {
+                            anyhow::anyhow!(
+                                "Migration failed: {}. This happens when database objects already exist from copied branch state. \
+                                Consider using 'IF NOT EXISTS' clauses in migration SQL files for test environments.",
+                                error_msg
+                            )
+                        } else {
+                            anyhow::anyhow!("Migration failed: {}", e)
+                        }
+                    })?;
+                }
                 // Migration succeeded - cache already updated above
             }
         }

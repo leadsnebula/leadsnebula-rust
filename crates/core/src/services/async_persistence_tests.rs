@@ -25,8 +25,24 @@ mod async_persistence_tests {
         let encryption_key = Arc::new(vec![0u8; 32]);
 
         // Set up test data in a single transaction (1 connection instead of 9)
-        let mut tx = pool.begin().await.unwrap();
-        
+        // Retry transaction begin with exponential backoff to handle PoolTimedOut
+        let mut tx = {
+            let mut retries = 0;
+            let max_retries = 3;
+            loop {
+                match pool.begin().await {
+                    Ok(tx) => break tx,
+                    Err(sqlx::Error::PoolTimedOut) if retries < max_retries => {
+                        retries += 1;
+                        let delay_ms = 100 * (1 << retries); // 200ms, 400ms, 800ms
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    Err(e) => panic!("Failed to begin transaction for setup: {}", e),
+                }
+            }
+        };
+
         let instance_user_id = Uuid::new_v4();
         let unique_email = format!("test_user_{}@test.invalid", Uuid::new_v4());
         sqlx::query(

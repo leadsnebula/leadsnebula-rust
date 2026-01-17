@@ -600,19 +600,6 @@ async fn passkey_registration_options(
 
     #[cfg(feature = "webauthn")]
     {
-        // #region agent log
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let log_path = "/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log";
-        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
-            writeln!(f, r#"{{"id":"log_reg_opts_env","timestamp":{},"location":"dashboard.rs:587","message":"WebAuthn registration options - environment check","data":{{"environment":"{}","env_var_read":{}}},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}}"#, 
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-                state.config.environment,
-                std::env::var("WEBAUTHN_LOCAL_HTTPS").is_ok()
-            )
-        });
-        // #endregion agent log
-
         // Determine RP ID and origin from environment
         let rp_id: String = if state.config.environment == "development" {
             "localhost".to_string()
@@ -629,17 +616,6 @@ async fn passkey_registration_options(
         } else {
             format!("https://{}", rp_id)
         };
-
-        // #region agent log
-        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
-            writeln!(f, r#"{{"id":"log_reg_opts_values","timestamp":{},"location":"dashboard.rs:603","message":"WebAuthn registration options - origin and rp_id","data":{{"rp_id":"{}","origin":"{}","env_var_value":"{}"}},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}}"#, 
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-                rp_id,
-                origin,
-                std::env::var("WEBAUTHN_LOCAL_HTTPS").unwrap_or_else(|_| "NOT_SET".to_string())
-            )
-        });
-        // #endregion agent log
 
         // Create WebAuthn instance
         let url = url::Url::parse(&origin).map_err(|e| {
@@ -834,19 +810,6 @@ async fn register_passkey(
             })));
         }
 
-        // #region agent log
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let log_path = "/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log";
-        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
-            writeln!(f, r#"{{"id":"log_reg_verify_env","timestamp":{},"location":"dashboard.rs:787","message":"WebAuthn registration verify - environment check","data":{{"environment":"{}","env_var_read":{}}},"sessionId":"debug-session","runId":"run1","hypothesisId":"A"}}"#, 
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-                state.config.environment,
-                std::env::var("WEBAUTHN_LOCAL_HTTPS").is_ok()
-            )
-        });
-        // #endregion agent log
-
         // Determine RP ID and origin
         let rp_id: String = if state.config.environment == "development" {
             "localhost".to_string()
@@ -863,17 +826,6 @@ async fn register_passkey(
         } else {
             format!("https://{}", rp_id)
         };
-
-        // #region agent log
-        let _ = OpenOptions::new().create(true).append(true).open(log_path).and_then(|mut f| {
-            writeln!(f, r#"{{"id":"log_reg_verify_values","timestamp":{},"location":"dashboard.rs:803","message":"WebAuthn registration verify - origin and rp_id","data":{{"rp_id":"{}","origin":"{}","env_var_value":"{}"}},"sessionId":"debug-session","runId":"run1","hypothesisId":"B"}}"#, 
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-                rp_id,
-                origin,
-                std::env::var("WEBAUTHN_LOCAL_HTTPS").unwrap_or_else(|_| "NOT_SET".to_string())
-            )
-        });
-        // #endregion agent log
 
         // Create WebAuthn instance
         let url = url::Url::parse(&origin).map_err(|e| {
@@ -1008,54 +960,6 @@ async fn _setup_otp_with_user(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::error;
 
-    // #region agent log
-    let log_data = serde_json::json!({
-        "sessionId": "debug-session",
-        "runId": "run1",
-        "hypothesisId": "A",
-        "location": "dashboard.rs:207",
-        "message": "setup_otp handler entry",
-        "data": {"user_id": user.id.to_string(), "email": user.email.clone()},
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    });
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(
-                f,
-                "{}",
-                serde_json::to_string(&log_data).unwrap_or_default()
-            )
-        });
-    // #endregion
-
-    // #region agent log
-    let log_data = serde_json::json!({
-        "sessionId": "debug-session",
-        "runId": "run1",
-        "hypothesisId": "A",
-        "location": "dashboard.rs:240",
-        "message": "User loaded, checking OTP status",
-        "data": {"user_id": user.id.to_string(), "email": user.email.clone()},
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    });
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(
-                f,
-                "{}",
-                serde_json::to_string(&log_data).unwrap_or_default()
-            )
-        });
-    // #endregion
-
     // Check if OTP is already enabled
     let existing_otp = sqlx::query_scalar::<_, bool>(
         "SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1",
@@ -1064,57 +968,11 @@ async fn _setup_otp_with_user(
     .fetch_optional(state.db_pool.as_ref())
     .await
     .map_err(|e| {
-        // #region agent log
-        let log_data = serde_json::json!({
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "E",
-            "location": "dashboard.rs:250",
-            "message": "Database error checking OTP status",
-            "data": {"error": e.to_string()},
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(
-                    f,
-                    "{}",
-                    serde_json::to_string(&log_data).unwrap_or_default()
-                )
-            });
-        // #endregion
         error!("Database error checking OTP status: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     if let Some(true) = existing_otp {
-        // #region agent log
-        let log_data = serde_json::json!({
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "C",
-            "location": "dashboard.rs:268",
-            "message": "OTP already enabled",
-            "data": {"user_id": user.id.to_string()},
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(
-                    f,
-                    "{}",
-                    serde_json::to_string(&log_data).unwrap_or_default()
-                )
-            });
-        // #endregion
         return Ok(Json(serde_json::json!({
             "success": false,
             "error": "OTP is already enabled. Please disable it first to set up a new one."
@@ -1132,30 +990,6 @@ async fn _setup_otp_with_user(
         &secret_encrypted_bytes,
     );
 
-    // #region agent log
-    let log_data = serde_json::json!({
-        "sessionId": "debug-session",
-        "runId": "run1",
-        "hypothesisId": "A",
-        "location": "dashboard.rs:285",
-        "message": "Secret generated, saving to database",
-        "data": {"user_id": user.id.to_string(), "secret_encrypted_length": secret_encrypted.len()},
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    });
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(
-                f,
-                "{}",
-                serde_json::to_string(&log_data).unwrap_or_default()
-            )
-        });
-    // #endregion
-
     // Create or update OTP setting (but don't enable it yet - wait for verification)
     sqlx::query(
         r#"
@@ -1170,29 +1004,6 @@ async fn _setup_otp_with_user(
     .execute(state.db_pool.as_ref())
     .await
     .map_err(|e| {
-        // #region agent log
-        let log_data = serde_json::json!({
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "E",
-            "location": "dashboard.rs:305",
-            "message": "Database error saving OTP secret_encrypted",
-            "data": {"error": e.to_string()},
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(
-                    f,
-                    "{}",
-                    serde_json::to_string(&log_data).unwrap_or_default()
-                )
-            });
-        // #endregion
         error!("Database error saving OTP secret_encrypted: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -1203,30 +1014,6 @@ async fn _setup_otp_with_user(
         urlencoding::encode(&user.email),
         secret_encrypted
     );
-
-    // #region agent log
-    let log_data = serde_json::json!({
-        "sessionId": "debug-session",
-        "runId": "run1",
-        "hypothesisId": "A",
-        "location": "dashboard.rs:330",
-        "message": "OTP setup complete, returning response",
-        "data": {"user_id": user.id.to_string(), "has_provisioning_uri": true},
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    });
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/badinoff/projects/leadsNebula/ruby/.cursor/debug.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(
-                f,
-                "{}",
-                serde_json::to_string(&log_data).unwrap_or_default()
-            )
-        });
-    // #endregion
 
     // Return the secret_encrypted and provisioning URI
     // Frontend can generate QR code client-side
