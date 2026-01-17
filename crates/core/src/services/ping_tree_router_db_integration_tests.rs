@@ -249,15 +249,17 @@ mod ping_tree_router_db_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_ping_auction_updates_lead_status() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
 
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
 
@@ -315,15 +317,17 @@ mod ping_tree_router_db_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_ping_auction_persists_buyer_responses() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
 
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
 
@@ -379,15 +383,17 @@ mod ping_tree_router_db_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_fullpost_persists_both_ping_and_post_payloads() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
 
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
 

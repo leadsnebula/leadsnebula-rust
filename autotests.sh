@@ -63,7 +63,6 @@ fi
 
 # Generate unique branch name
 BRANCH_NAME="ci-local-$(date +%s)-$$"
-export NEONCTL_API_KEY="${NEON_API_KEY:-}"
 
 # Cleanup function
 cleanup() {
@@ -71,8 +70,8 @@ cleanup() {
         echo ""
         echo "🧹 Cleaning up Neon branch: $BRANCH_NAME"
         set +e
-        echo "Executing: npx --yes neonctl branches delete $BRANCH_NAME --project $NEON_PROJECT_ID"
-        npx --yes neonctl branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" 2>/dev/null || true
+        echo "Executing: npx --yes neonctl branches delete $BRANCH_NAME --project $NEON_PROJECT_ID --api-key ***"
+        npx --yes neonctl branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "${NEON_API_KEY:-}" 2>/dev/null || true
         set -e
         echo "✅ Cleanup complete"
     fi
@@ -91,8 +90,8 @@ if [ "$USE_NEON" = true ]; then
     
     # Create branch (using --name flag like scripts/test_neon_ephemeral.sh)
     echo "Creating branch..."
-    echo "Executing: npx --yes neonctl branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID"
-    if ! npx --yes neonctl branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID"; then
+    echo "Executing: npx --yes neonctl branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID --api-key ***"
+    if ! npx --yes neonctl branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"; then
         echo "❌ Failed to create Neon branch $BRANCH_NAME" >&2
         exit 1
     fi
@@ -105,7 +104,7 @@ if [ "$USE_NEON" = true ]; then
     CONNECTION=""
     
     while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-        CONNECTION=$(npx --yes neonctl connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" 2>/dev/null) || true
+        CONNECTION=$(npx --yes neonctl connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" 2>/dev/null) || true
         if [ -n "$CONNECTION" ]; then
             break
         fi
@@ -122,7 +121,8 @@ if [ "$USE_NEON" = true ]; then
     fi
     
     export DATABASE_URL="$CONNECTION"
-    echo "✅ DATABASE_URL set"
+    export EPHEMERAL_DB=1
+    echo "✅ DATABASE_URL and EPHEMERAL_DB set (ephemeral branch; no litter in main)"
     
     # Run migrations on the ephemeral branch
     echo "Running database migrations..."

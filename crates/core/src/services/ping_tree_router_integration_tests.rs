@@ -249,12 +249,17 @@ mod ping_tree_router_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database setup
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_route_no_ping_tree() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => return, // Skip if DB not available
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
         let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
@@ -273,15 +278,17 @@ mod ping_tree_router_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database setup
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_route_inactive_ping_tree() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                // Skip test if database not available
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
         let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
@@ -303,12 +310,17 @@ mod ping_tree_router_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database setup
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_route_no_campaigns() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => return, // Skip if DB not available
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
         let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
@@ -330,12 +342,17 @@ mod ping_tree_router_integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database setup
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_route_unknown_request_type() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => return, // Skip if DB not available
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
         let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "unknown").await;
 

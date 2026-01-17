@@ -134,30 +134,21 @@ jobs:
           CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
-      - name: Run integration tests
+      - name: Run integration tests (light DB only; heavy/concurrency run locally)
         env:
-          CI: "true"  # Signal to test_helpers to use larger pool limits
+          CI: "true"
         run: |
-          echo "DATABASE_URL is set to: $DATABASE_URL"
-
-          # smoke / health test (verify connection before running heavy tests)
-          cargo test --test integration_health --locked --all-features -- --test-threads=1 || true
-
-          # Run authentication integration tests (sequential to avoid pool exhaustion)
+          echo "DATABASE_URL is set (ephemeral Neon branch)"
+          # Health
+          cargo test --test integration_health --locked --all-features -- --test-threads=1
+          # Auth (OTP, passkey, user)
           cargo test --test integration_auth --locked --all-features -- --test-threads=1
-
-          # Run publisher CRUD tests
+          # Publisher CRUD
           cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1
-
-          # Run E2E tests
+          # E2E
           cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1
-
-      - name: Run database-backed library tests (ignored)
-        env:
-          CI: "true"  # Signal to test_helpers to use larger pool limits
-        run: |
-          echo "Running ignored library tests that require DATABASE_URL..."
-          cargo test --lib --all-features --locked -- --ignored --test-threads=1
+          # NOTE: --ignored lib tests (duplicate_post, ping_tree_*_db, async_persistence) are
+          # skipped in CI; run locally via ./autotests.sh to avoid Neon load and keep CI <10 min.
 
       - name: Cleanup ephemeral Neon branch
         if: always()
@@ -391,6 +382,15 @@ jobs:
           CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
+      - name: Install cargo-llvm-cov
+        run: |
+          if ! command -v cargo-llvm-cov &> /dev/null; then
+            cargo install cargo-llvm-cov --locked
+          else
+            echo "cargo-llvm-cov already installed"
+          fi
+          cargo llvm-cov --version
+
       - name: Generate coverage report
         env:
           RUST_TEST_THREADS: 1
@@ -432,23 +432,7 @@ jobs:
   benchmark:
     name: Performance Benchmarks
     runs-on: ubuntu-latest
-    # Run on main/dev branches or manual trigger (optional, not blocking)
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.event_name == 'workflow_dispatch'
-    continue-on-error: true
+    if: false  # disabled; run locally: cargo bench --bench ping_auction_bench
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup sccache
-        uses: ./.github/actions/setup-sccache
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-
-      - name: Run Criterion benchmarks
-        run: |
-          cargo bench --bench ping_auction_bench --locked --all-features || echo "⚠️  Benchmarks failed (non-blocking)"
+      - run: cargo bench --bench ping_auction_bench --locked --all-features

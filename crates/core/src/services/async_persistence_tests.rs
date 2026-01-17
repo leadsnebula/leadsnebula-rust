@@ -11,16 +11,17 @@ mod async_persistence_tests {
     use uuid::Uuid;
 
     #[tokio::test]
-    #[ignore] // Requires database setup
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_async_persistence_does_not_block_routing() {
-        // Verify that async persistence tasks don't block the main routing response
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]);
 
@@ -223,8 +224,14 @@ mod async_persistence_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database setup
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_async_persistence_handles_errors_gracefully() {
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
         // Verify that persistence errors don't crash the routing flow
         // This test would need to simulate database errors
         // (e.g., by using a pool with limited connections that are exhausted)

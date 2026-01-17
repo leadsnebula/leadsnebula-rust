@@ -168,15 +168,17 @@ mod duplicate_post_concurrency_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_duplicate_post_atomicity() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
 
         let (lead_uuid, promise_id) = setup_test_lead(&pool).await;
 
@@ -255,15 +257,17 @@ mod duplicate_post_concurrency_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_duplicate_post_with_different_promise_ids() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
 
         let (lead_uuid, promise_id) = setup_test_lead(&pool).await;
         let wrong_promise_id = "WRONG_PROMISE_ID";
@@ -297,15 +301,17 @@ mod duplicate_post_concurrency_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
+    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_duplicate_post_after_already_posted() {
-        let pool = match create_test_pool().await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("Skipping test - DATABASE_URL not set");
-                return;
-            }
-        };
+        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
+            eprintln!(
+                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+            );
+            return;
+        }
+        let pool = create_test_pool()
+            .await
+            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
 
         let (lead_uuid, promise_id) = setup_test_lead(&pool).await;
 
