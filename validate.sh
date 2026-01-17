@@ -197,6 +197,7 @@ fi
 echo "4️⃣  Running tests (with --locked)..."
 # Check if DATABASE_URL is set for database-dependent tests
 HAS_DATABASE_URL=false
+IS_EPHEMERAL_DB=false
 if [ "$FAST_MODE" = false ]; then
     # Only check for DATABASE_URL if not in fast mode
     if [ -n "$DATABASE_URL" ]; then
@@ -206,6 +207,33 @@ if [ "$FAST_MODE" = false ]; then
         export $(grep "^DATABASE_URL=" .env.local | xargs)
         if [ -n "$DATABASE_URL" ]; then
             HAS_DATABASE_URL=true
+        fi
+    fi
+    
+    # Check if we're using an ephemeral DB (required for tests)
+    if [ "$HAS_DATABASE_URL" = true ]; then
+        if [ -n "${EPHEMERAL_DB:-}" ] && [ "$EPHEMERAL_DB" = "1" ]; then
+            IS_EPHEMERAL_DB=true
+        elif echo "$DATABASE_URL" | grep -qE "(ci-|ci-local-)"; then
+            IS_EPHEMERAL_DB=true
+        elif [ -n "${CI:-}" ] && [ "$CI" = "true" ]; then
+            IS_EPHEMERAL_DB=true
+        fi
+        
+        if [ "$IS_EPHEMERAL_DB" = false ]; then
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⚠️  WARNING: DATABASE_URL appears to be main DB (not ephemeral)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "   Tests cannot run against main database to prevent test data pollution."
+            echo "   Database-dependent tests will be SKIPPED."
+            echo ""
+            echo "   To run full test suite with database tests:"
+            echo "   ./autotests.sh"
+            echo ""
+            echo "   Or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL"
+            echo ""
+            HAS_DATABASE_URL=false  # Disable DB tests
         fi
     fi
 fi

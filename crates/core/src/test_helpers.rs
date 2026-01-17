@@ -32,6 +32,28 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
         ));
     }
 
+    // CRITICAL: Refuse connections to main DB - tests must use ephemeral branches only
+    // This prevents test data from polluting the main database
+    let is_ci = std::env::var("CI").is_ok();
+    let is_ephemeral = std::env::var("EPHEMERAL_DB").is_ok();
+    let looks_like_ephemeral = database_url.contains("ci-") || database_url.contains("ci-local-");
+
+    if !is_ci && !is_ephemeral && !looks_like_ephemeral {
+        return Err(anyhow::anyhow!(
+            "❌ REFUSED: Tests cannot run against main database.\n\
+             \n\
+             To run tests:\n\
+             1. Use ephemeral Neon branch: ./autotests.sh\n\
+             2. Or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL\n\
+             3. Or run in CI (CI=1 is set automatically)\n\
+             \n\
+             Current DATABASE_URL appears to be main DB (not ephemeral).\n\
+             This prevents test data from polluting your main database.\n\
+             \n\
+             If you need to run tests locally, use: ./autotests.sh"
+        ));
+    }
+
     // Return cached pool if available
     // Note: PgPool::clone() is cheap (Arc-based), so this is efficient
     {
