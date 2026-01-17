@@ -1,5 +1,7 @@
 // Load tests for concurrent ping auctions
 // These tests simulate high concurrency scenarios
+// NOTE: These are load/stress tests, not functionality tests
+// They are marked as #[ignore] and should be run manually when needed
 
 #[cfg(test)]
 mod load_tests {
@@ -23,6 +25,7 @@ mod load_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Load test - skip in CI, run manually when needed
     async fn test_concurrent_ping_auction_1000_responses() {
         // Simulate 1000 concurrent ping responses
         let num_responses = 1000;
@@ -52,6 +55,7 @@ mod load_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Load test - skip in CI, run manually when needed
     async fn test_concurrent_winner_selection_parallel() {
         // Test concurrent winner selection from multiple threads
         let num_threads = 10;
@@ -107,6 +111,7 @@ mod load_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Load test - skip in CI, run manually when needed
     async fn test_mixed_response_types_high_volume() {
         // Test winner selection with mixed response types at high volume
         let num_responses = 500;
@@ -137,6 +142,7 @@ mod load_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Load test - skip in CI, run manually when needed
     async fn test_all_rejections_high_volume() {
         // Test handling of all rejections at high volume
         let num_responses = 1000;

@@ -24,7 +24,9 @@ mod async_persistence_tests {
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]);
 
-        // Set up test data (instance, publisher, vertical, buyer, campaign, ping tree)
+        // Set up test data in a single transaction (1 connection instead of 9)
+        let mut tx = pool.begin().await.unwrap();
+        
         let instance_user_id = Uuid::new_v4();
         let unique_email = format!("test_user_{}@test.invalid", Uuid::new_v4());
         sqlx::query(
@@ -36,7 +38,7 @@ mod async_persistence_tests {
         )
         .bind(instance_user_id)
         .bind(&unique_email)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -48,7 +50,7 @@ mod async_persistence_tests {
         )
         .bind(instance_id)
         .bind(instance_user_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -65,7 +67,7 @@ mod async_persistence_tests {
         .bind(&api_key_hash)
         .bind(&format!("pk_{}", &api_key_hash[..8]))
         .bind("")
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -78,7 +80,7 @@ mod async_persistence_tests {
         )
         .bind(vertical_id)
         .bind(&vertical_slug)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -91,7 +93,7 @@ mod async_persistence_tests {
         )
         .bind(buyer_id)
         .bind(instance_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -108,7 +110,7 @@ mod async_persistence_tests {
         .bind(instance_id)
         .bind(&vertical_slug)
         .bind(format!("token_{}", Uuid::new_v4()))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -123,7 +125,7 @@ mod async_persistence_tests {
         .bind(instance_id)
         .bind(publisher_id)
         .bind(&vertical_slug)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -138,7 +140,7 @@ mod async_persistence_tests {
         .bind(ping_tree_id)
         .bind(campaign_id)
         .bind(Some(1))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
@@ -160,9 +162,12 @@ mod async_persistence_tests {
         .bind(campaign_id)
         .bind(post_id)
         .bind(&session_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
+
+        // Commit transaction so router can see the data
+        tx.commit().await.unwrap();
 
         let lead = sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
             .bind(lead_uuid)
