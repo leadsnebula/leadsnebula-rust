@@ -17,27 +17,25 @@ mod ping_tree_router_integration_tests {
 
     // Helper to create test data
     async fn setup_test_data(pool: &PgPool) -> (Uuid, Uuid, Uuid, String) {
-        // Create instance_user
+        // Create instance_user with retry logic for PoolTimedOut
         let instance_user_id = Uuid::new_v4();
         let unique_email = format!("test_user_{}@test.invalid", Uuid::new_v4());
-        let password_hash = "hashed_password"; // Simplified for tests
+        let password_hash = "hashed_password".to_string(); // Simplified for tests
 
-        sqlx::query(
-            r#"
-            INSERT INTO instance_users (id, email, encrypted_password, status, confirmed_at, created_at, updated_at)
-            VALUES ($1, $2, $3, 'active', NOW(), NOW(), NOW())
-            "#,
-        )
-        .bind(instance_user_id)
-        .bind(&unique_email)
-        .bind(password_hash)
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            eprintln!("Pool acquire failed in setup_test_data (instance_user): {}", e);
-            e
+        crate::test_helpers::retry_pool_operation(|| {
+            sqlx::query(
+                r#"
+                INSERT INTO instance_users (id, email, encrypted_password, status, confirmed_at, created_at, updated_at)
+                VALUES ($1, $2, $3, 'active', NOW(), NOW(), NOW())
+                "#,
+            )
+            .bind(instance_user_id)
+            .bind(unique_email.clone())
+            .bind(password_hash.clone())
+            .execute(pool)
         })
-        .expect("Failed to create instance_user - PoolTimedOut likely indicates Neon slowness in CI");
+        .await
+        .expect("Failed to create instance_user after retries - PoolTimedOut indicates Neon slowness in CI");
 
         // Create instance
         let instance_id = Uuid::new_v4();

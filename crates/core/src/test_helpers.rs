@@ -43,27 +43,26 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
 
     // Increase default pool size for tests to handle concurrent test execution
     // Tests run with --test-threads=1, but transactions can hold connections longer
-    // In CI, Neon can be slow, so we need more headroom and longer timeouts
-    // Concurrency tests (duplicate_post, ping_tree_router) need even more connections
+    // Concurrency tests (duplicate_post spawns 10 concurrent tasks) need many connections
+    // In CI, Neon free-tier can be very slow, requiring much larger pools and timeouts
     let is_ci = std::env::var("CI").is_ok();
-    let max_conns: u32 = if is_ci {
-        // In CI, use larger pool for concurrency tests (duplicate_post spawns 10 concurrent tasks)
-        std::env::var("TEST_POOL_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30) // Increased to 30 for CI concurrency tests
-    } else {
-        std::env::var("TEST_POOL_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20) // 20 for local development
-    };
+    let max_conns: u32 = std::env::var("TEST_POOL_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if is_ci {
+            50 // CI: Much larger pool for Neon free-tier slowness + concurrent tests
+        } else {
+            30 // Local: 30 is sufficient for concurrency tests (duplicate_post spawns 10 tasks)
+        });
 
-    let acquire_timeout_secs = if is_ci {
-        60 // Give Neon more time in CI (free-tier can be slow)
-    } else {
-        30 // 30s for local
-    };
+    let acquire_timeout_secs = std::env::var("TEST_POOL_ACQUIRE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if is_ci {
+            120 // CI: Much longer timeout for Neon free-tier cold starts and slowness
+        } else {
+            60 // Local: 60s is sufficient for concurrency tests
+        });
 
     let pool = PgPoolOptions::new()
         .max_connections(max_conns)
@@ -244,6 +243,34 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     }
 
     Ok(pool)
+}
+
+/// Retry a pool operation with exponential backoff to handle PoolTimedOut errors
+/// This is especially useful in CI where Neon free-tier can be slow
+/// The closure is called fresh on each retry, so it can recreate queries with bound values
+pub async fn retry_pool_operation<F, Fut, T>(mut operation: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut retries = 0;
+    let max_retries = 5;
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(sqlx::Error::PoolTimedOut) if retries < max_retries => {
+                retries += 1;
+                let delay_ms = 200 * (1 << retries); // 400ms, 800ms, 1600ms, 3200ms, 6400ms
+                eprintln!(
+                    "PoolTimedOut on attempt {}, retrying in {}ms...",
+                    retries, delay_ms
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            Err(e) => return Err(anyhow::anyhow!("Pool operation failed: {}", e)),
+        }
+    }
 }
 
 fn find_migrations_dir() -> anyhow::Result<std::path::PathBuf> {

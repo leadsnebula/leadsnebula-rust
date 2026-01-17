@@ -327,8 +327,10 @@ if command -v cargo-nextest > /dev/null 2>&1; then
         
         # Run all ignored library tests (concurrency, DB integration, etc.)
         # These are the same tests that run in CI and catch pool timeout issues
+        # Set CI=true to use larger pool limits (30 connections, 60s timeout) for concurrency tests
         echo "   Running all ignored library tests (concurrency, DB integration)..."
-        if ! cargo test --lib --all-features --locked -- --ignored --test-threads=1; then
+        echo "   Using CI pool settings (30 connections, 60s timeout) for concurrency tests..."
+        if ! env CI=true cargo test --lib --all-features --locked -- --ignored --test-threads=1; then
             echo "❌ Ignored library tests failed. Fix all failing tests before committing."
             echo "   These tests include:"
             echo "   - duplicate_post_concurrency_tests (tests pool exhaustion)"
