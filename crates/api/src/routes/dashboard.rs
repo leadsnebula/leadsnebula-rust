@@ -1125,7 +1125,12 @@ async fn create_publisher(
             .fetch_optional(state.db_pool.as_ref())
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::BAD_REQUEST)?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "No instances found in database. Cannot create publisher without an instance."
+                );
+                StatusCode::BAD_REQUEST
+            })?
     };
 
     // Generate API key
@@ -2182,8 +2187,14 @@ async fn update_buyer(
     .bind(id)
     .fetch_optional(state.db_pool.as_ref())
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| {
+        tracing::error!(
+            "[INVESTIGATION] Database error fetching buyer {}: {}",
+            id,
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Build update query dynamically like update_publisher
     let mut query_builder = sqlx::QueryBuilder::new("UPDATE buyers SET ");
@@ -2375,20 +2386,36 @@ async fn update_buyer(
             }
         }
     }
-    if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
+    if let Some(status_str) = payload.get("status").and_then(|v| v.as_str()) {
+        // Parse string to BuyerStatus enum for proper type binding
+        use leadsnebula_core::models::enums::BuyerStatus;
+        let status_enum = match status_str {
+            "active" => BuyerStatus::Active,
+            "incomplete" => BuyerStatus::Incomplete,
+            "inactive" => BuyerStatus::Inactive,
+            "suspended" => BuyerStatus::Suspended,
+            _ => {
+                tracing::warn!("Invalid buyer status value: {}", status_str);
+                return Ok(Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Invalid status value: {}. Must be one of: active, incomplete, inactive, suspended", status_str)
+                })));
+            }
+        };
+
         if let Some(ref buyer) = buyer_before {
-            if buyer.status.as_str() != status {
+            if buyer.status.as_str() != status_str {
                 changed_fields.insert(
                     "status".to_string(),
                     serde_json::json!({
                         "before": buyer.status.as_str(),
-                        "after": status
+                        "after": status_str
                     }),
                 );
             }
         }
         query_builder.push("status = ");
-        query_builder.push_bind(status);
+        query_builder.push_bind(status_enum);
         query_builder.push(", ");
         has_updates = true;
     }
@@ -2409,7 +2436,15 @@ async fn update_buyer(
 
     let update_result = query.execute(state.db_pool.as_ref()).await;
 
-    update_result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    update_result.map_err(|e| {
+        tracing::error!(
+            "[INVESTIGATION] Database error updating buyer {}: {}",
+            id,
+            e
+        );
+        tracing::error!("[INVESTIGATION] Error details: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Log audit for buyer update - log even if changed_fields is empty (to track all updates)
     if has_updates {
@@ -2648,7 +2683,7 @@ async fn update_buyer(
             }
         });
 
-        let _ = create_audit_log(
+        let audit_result = create_audit_log(
             state.db_pool.as_ref(),
             instance_id,
             Some(user.id),
@@ -2661,6 +2696,15 @@ async fn update_buyer(
             user_agent.as_deref(),
         )
         .await;
+
+        if let Err(e) = audit_result {
+            tracing::error!(
+                "[INVESTIGATION] Failed to create audit log for buyer {}: {}",
+                id,
+                e
+            );
+            // Don't fail the request if audit log fails, but log it
+        }
     }
 
     Ok(Json(serde_json::json!({

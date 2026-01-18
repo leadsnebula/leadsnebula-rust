@@ -691,12 +691,17 @@ fn validate_github_workflow(path: &PathBuf) -> Result<ValidationResult> {
     }
 
     // Check for invalid cargo llvm-cov options
+    // Only check commands that generate coverage (not clean commands)
     if let Some(jobs) = yaml.get("jobs").and_then(|j| j.as_mapping()) {
         for (job_name, job) in jobs {
             if let Some(steps) = job.get("steps").and_then(|s| s.as_sequence()) {
                 for step in steps {
                     if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                        if run.contains("cargo llvm-cov") {
+                        // Only check commands that generate coverage (not clean/version commands)
+                        if run.contains("cargo llvm-cov")
+                            && !run.contains("llvm-cov clean")
+                            && !run.contains("llvm-cov --version")
+                        {
                             // Check for invalid options
                             if !run.contains("--lcov") || !run.contains("--output-path") {
                                 result.warnings.push(ErrorMessage::with_remediation(

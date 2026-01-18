@@ -283,10 +283,22 @@ impl AppConfig {
                 })?
         };
 
-        // Decode base64 encryption key (SSM stores it as base64)
-        let encryption_key = general_purpose::STANDARD
-            .decode(&encryption_key_str)
-            .map_err(|e| anyhow::anyhow!("Failed to decode encryption key from base64: {}", e))?;
+        // Decode encryption key - support both base64 (SSM format) and hex (local dev format)
+        // Base64: 44 chars = 32 bytes, Hex: 64 chars = 32 bytes
+        let encryption_key = if encryption_key_str.len() == 64
+            && encryption_key_str.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            // Looks like hex (64 hex characters = 32 bytes)
+            hex::decode(&encryption_key_str)
+                .map_err(|e| anyhow::anyhow!("Failed to decode encryption key from hex: {}", e))?
+        } else {
+            // Try base64 (SSM format)
+            general_purpose::STANDARD
+                .decode(&encryption_key_str)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to decode encryption key from base64: {}", e)
+                })?
+        };
 
         if encryption_key.len() != 32 {
             return Err(anyhow::anyhow!(

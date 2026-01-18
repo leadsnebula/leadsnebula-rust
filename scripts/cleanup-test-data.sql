@@ -8,7 +8,46 @@
 
 BEGIN;
 
--- Delete test publishers (those with test-like names or emails)
+-- Delete in order to respect foreign key constraints (children first, then parents)
+
+-- 1. Delete test leads first (references publishers, campaigns, buyers)
+DELETE FROM leads
+WHERE 
+    publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%' OR email LIKE '%@test.%' OR email LIKE '%test%@%' OR email LIKE '%@example.com' OR api_key_prefix LIKE 'pk_test%' OR api_key_hash LIKE 'hash_%')
+    OR event_id LIKE 'evt_%'
+    OR session_id LIKE 'sess_%'
+    OR post_id LIKE 'post_%'
+    OR post_id LIKE 'INPROG_%'
+    OR promise_id LIKE 'PROMISE_%';
+
+-- 2. Delete ping_tree_campaigns (references ping_trees and campaigns)
+DELETE FROM ping_tree_campaigns
+WHERE 
+    ping_tree_id IN (SELECT id FROM ping_trees WHERE name LIKE 'Test%' OR name LIKE 'test%' OR publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%' OR email LIKE '%@test.%' OR email LIKE '%test%@%' OR email LIKE '%@example.com'))
+    OR campaign_id IN (SELECT id FROM campaigns WHERE name LIKE 'Test%' OR name LIKE 'test%');
+
+-- 3. Delete ping trees (references publishers)
+DELETE FROM ping_trees
+WHERE 
+    name LIKE 'Test%'
+    OR name LIKE 'test%'
+    OR publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%' OR email LIKE '%@test.%' OR email LIKE '%test%@%' OR email LIKE '%@example.com' OR api_key_prefix LIKE 'pk_test%' OR api_key_hash LIKE 'hash_%');
+
+-- 4. Delete campaigns (references publishers and buyers)
+DELETE FROM campaigns
+WHERE 
+    name LIKE 'Test%'
+    OR name LIKE 'test%'
+    OR publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%' OR email LIKE '%@test.%' OR email LIKE '%test%@%' OR email LIKE '%@example.com' OR api_key_prefix LIKE 'pk_test%' OR api_key_hash LIKE 'hash_%')
+    OR buyer_id IN (SELECT id FROM buyers WHERE name LIKE 'Test%' OR name LIKE 'test%');
+
+-- 5. Delete buyers (no dependencies)
+DELETE FROM buyers
+WHERE 
+    name LIKE 'Test%'
+    OR name LIKE 'test%';
+
+-- 6. Delete publishers (no dependencies after leads/campaigns/ping_trees are gone)
 DELETE FROM publishers
 WHERE 
     name LIKE 'Test%' 
@@ -19,51 +58,14 @@ WHERE
     OR api_key_prefix LIKE 'pk_test%'
     OR api_key_hash LIKE 'hash_%';
 
--- Delete test buyers (those with test-like names)
-DELETE FROM buyers
-WHERE 
-    name LIKE 'Test%'
-    OR name LIKE 'test%';
-
--- Delete test campaigns (those with test-like names or associated with test publishers/buyers)
-DELETE FROM campaigns
-WHERE 
-    name LIKE 'Test%'
-    OR name LIKE 'test%'
-    OR publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%')
-    OR buyer_id IN (SELECT id FROM buyers WHERE name LIKE 'Test%' OR name LIKE 'test%');
-
--- Delete test ping trees (those with test-like names or associated with test publishers)
-DELETE FROM ping_trees
-WHERE 
-    name LIKE 'Test%'
-    OR name LIKE 'test%'
-    OR publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%');
-
--- Delete test ping tree campaigns (orphaned after deleting ping trees)
-DELETE FROM ping_tree_campaigns
-WHERE 
-    ping_tree_id NOT IN (SELECT id FROM ping_trees)
-    OR campaign_id NOT IN (SELECT id FROM campaigns);
-
--- Delete test leads (those with test-like data or associated with test publishers)
-DELETE FROM leads
-WHERE 
-    publisher_id IN (SELECT id FROM publishers WHERE name LIKE 'Test%' OR name LIKE 'test%')
-    OR event_id LIKE 'evt_%'
-    OR session_id LIKE 'sess_%'
-    OR post_id LIKE 'post_%'
-    OR post_id LIKE 'INPROG_%'
-    OR promise_id LIKE 'PROMISE_%';
-
--- Delete test instance_users (those with test emails)
+-- 7. Delete test instance_users (references instances)
 DELETE FROM instance_users
 WHERE 
     email LIKE '%@test.%'
     OR email LIKE '%test%@%'
     OR email LIKE '%@example.com';
 
--- Delete test instances (orphaned after deleting instance_users)
+-- 8. Delete orphaned instances (after instance_users are deleted)
 DELETE FROM instances
 WHERE 
     instance_user_id NOT IN (SELECT id FROM instance_users);
