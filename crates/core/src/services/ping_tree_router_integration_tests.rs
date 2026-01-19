@@ -165,18 +165,33 @@ mod ping_tree_router_integration_tests {
         let ping_tree_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO ping_trees (id, instance_id, publisher_id, name, vertical, strategy, status, created_at, updated_at)
-            VALUES ($1, $2, $3, 'Test Ping Tree', $4, 'ping_post', $5, NOW(), NOW())
+            INSERT INTO ping_trees (id, instance_id, name, vertical, strategy, status, created_at, updated_at)
+            VALUES ($1, $2, 'Test Ping Tree', $3, 'ping_post', $4, NOW(), NOW())
             "#,
         )
         .bind(ping_tree_id)
         .bind(instance_id)
-        .bind(publisher_id)
         .bind(vertical)
         .bind(status)
         .execute(pool)
         .await
         .unwrap();
+
+        // Link publisher to ping tree via join table
+        sqlx::query(
+            r#"
+            INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, revshare_percentage, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, 80.0, NOW(), NOW())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(ping_tree_id)
+        .bind(publisher_id)
+        .bind(vertical)
+        .execute(pool)
+        .await
+        .unwrap();
+
         ping_tree_id
     }
 
@@ -274,7 +289,10 @@ mod ping_tree_router_integration_tests {
         assert!(!result.success);
         assert_eq!(result.status, "error");
         assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("No active ping tree found"));
+        assert!(result
+            .error
+            .unwrap()
+            .contains("Publisher not assigned to any ping tree"));
     }
 
     #[tokio::test]

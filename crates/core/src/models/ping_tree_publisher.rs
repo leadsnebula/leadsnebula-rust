@@ -1,7 +1,7 @@
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
-use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct PingTreePublisher {
@@ -198,11 +198,13 @@ impl PingTreePublisher {
         ping_tree_id: &Uuid,
         publisher_id: &Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM ping_tree_publishers WHERE ping_tree_id = $1 AND publisher_id = $2")
-            .bind(ping_tree_id)
-            .bind(publisher_id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "DELETE FROM ping_tree_publishers WHERE ping_tree_id = $1 AND publisher_id = $2",
+        )
+        .bind(ping_tree_id)
+        .bind(publisher_id)
+        .execute(pool)
+        .await?;
         Ok(())
     }
 

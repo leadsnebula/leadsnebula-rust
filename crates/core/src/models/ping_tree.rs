@@ -27,7 +27,14 @@ impl PingTree {
         pool: &sqlx::PgPool,
         publisher_id: &Uuid,
         vertical: &str,
-    ) -> Result<Option<(Self, Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>)>, sqlx::Error> {
+    ) -> Result<
+        Option<(
+            Self,
+            Option<rust_decimal::Decimal>,
+            Option<rust_decimal::Decimal>,
+        )>,
+        sqlx::Error,
+    > {
         // Use a custom query to join with ping_tree_publishers
         // We need to manually construct the result since FromRow doesn't handle tuples well
         let row = sqlx::query(
@@ -38,7 +45,6 @@ impl PingTree {
             WHERE ptp.publisher_id = $1
               AND pt.vertical = $2
               AND pt.deleted_at IS NULL
-              AND pt.status = 'active'
             ORDER BY pt.priority ASC NULLS LAST, pt.created_at ASC
             LIMIT 1
             "#,
@@ -62,7 +68,8 @@ impl PingTree {
                 updated_at: row.get("updated_at"),
             };
             let revshare_percentage: Option<rust_decimal::Decimal> = row.get("revshare_percentage");
-            let revshare_flat_amount: Option<rust_decimal::Decimal> = row.get("revshare_flat_amount");
+            let revshare_flat_amount: Option<rust_decimal::Decimal> =
+                row.get("revshare_flat_amount");
             Ok(Some((ping_tree, revshare_percentage, revshare_flat_amount)))
         } else {
             Ok(None)

@@ -38,8 +38,14 @@ fn map_error_to_user(err_text: &str) -> (String, String) {
     if lower.contains("permission denied") || lower.contains("permission") {
         problems.push("Server permission error. Contact the administrator.".to_string());
     }
-    if lower.contains("column") && lower.contains("publisher_id") && lower.contains("does not exist") {
-        problems.push("Server configuration error: database schema mismatch. Contact the administrator.".to_string());
+    if lower.contains("column")
+        && lower.contains("publisher_id")
+        && lower.contains("does not exist")
+    {
+        problems.push(
+            "Server configuration error: database schema mismatch. Contact the administrator."
+                .to_string(),
+        );
     }
     if lower.contains("violates not-null constraint") || lower.contains("null value") {
         // Generic not-null / null detection - add an explanatory line if nothing more specific matched
@@ -285,8 +291,14 @@ async fn create_lead(
                 status: StatusNode {
                     success: false,
                     status: "error".to_string(),
-                    message: Some(format!("Invalid publisher_id format: {}", provided_publisher_id)),
-                    error: Some(format!("Invalid UUID format for publisher_id: {}", provided_publisher_id)),
+                    message: Some(format!(
+                        "Invalid publisher_id format: {}",
+                        provided_publisher_id
+                    )),
+                    error: Some(format!(
+                        "Invalid UUID format for publisher_id: {}",
+                        provided_publisher_id
+                    )),
                 },
                 lead: LeadNode {
                     promise_id: None,
@@ -876,15 +888,17 @@ async fn create_lead(
     match sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT pt.id FROM ping_trees pt 
          INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id 
-         WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL LIMIT 1"
+         WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL LIMIT 1",
     )
-        .bind(publisher.id)
-        .bind(vertical.slug.clone())
-        .fetch_optional(&*state.db_pool)
-        .await
+    .bind(publisher.id)
+    .bind(vertical.slug.clone())
+    .fetch_optional(&*state.db_pool)
+    .await
     {
         Ok(Some(_)) => {}
-        Ok(None) => tracing::info!("No ping tree configured for this publisher/vertical; routing may fail"),
+        Ok(None) => {
+            tracing::info!("No ping tree configured for this publisher/vertical; routing may fail")
+        }
         Err(e) => tracing::debug!("Ping tree check skipped or failed: {}", e),
     }
 

@@ -139,12 +139,11 @@ COMMENT ON COLUMN audit_logs.created_at IS 'Action timestamp';
 COMMENT ON COLUMN audit_logs.updated_at IS 'Record last update timestamp';
 
 -- Ping Trees Table
-COMMENT ON TABLE ping_trees IS 'Ping tree routing configurations defining buyer priority and routing logic per publisher/vertical. RLS enabled with instance-level isolation. Strategy: ping_post (ping then post) or fullpost (direct post).';
+COMMENT ON TABLE ping_trees IS 'Ping tree routing configurations defining buyer priority and routing logic per vertical. RLS enabled with instance-level isolation. Strategy: ping_post (ping then post) or fullpost (direct post). Publishers are linked via ping_tree_publishers join table.';
 
 COMMENT ON COLUMN ping_trees.id IS 'Primary key UUID';
 COMMENT ON COLUMN ping_trees.instance_id IS 'Foreign key to instances table - tenant isolation';
-COMMENT ON COLUMN ping_trees.publisher_id IS 'Foreign key to publishers table';
-COMMENT ON COLUMN ping_trees.name IS 'Ping tree name (unique per publisher/vertical)';
+COMMENT ON COLUMN ping_trees.name IS 'Ping tree name (unique per instance/vertical)';
 COMMENT ON COLUMN ping_trees.vertical IS 'Vertical category (e.g., "solar", "insurance")';
 COMMENT ON COLUMN ping_trees.strategy IS 'Routing strategy - ENUM: ping_post, fullpost';
 COMMENT ON COLUMN ping_trees.status IS 'Ping tree status - ENUM: active, paused';

@@ -134,12 +134,26 @@ mod async_persistence_tests {
         let ping_tree_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO ping_trees (id, instance_id, publisher_id, name, vertical, strategy, status, created_at, updated_at)
-            VALUES ($1, $2, $3, 'Test Ping Tree', $4, 'ping_post', 'active', NOW(), NOW())
+            INSERT INTO ping_trees (id, instance_id, name, vertical, strategy, status, created_at, updated_at)
+            VALUES ($1, $2, 'Test Ping Tree', $3, 'ping_post', 'active', NOW(), NOW())
             "#,
         )
         .bind(ping_tree_id)
         .bind(instance_id)
+        .bind(&vertical_slug)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        // Link publisher to ping tree via join table
+        sqlx::query(
+            r#"
+            INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, revshare_percentage, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, 80.0, NOW(), NOW())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(ping_tree_id)
         .bind(publisher_id)
         .bind(&vertical_slug)
         .execute(&mut *tx)

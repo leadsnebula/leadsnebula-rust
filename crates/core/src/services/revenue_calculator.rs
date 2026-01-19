@@ -13,17 +13,17 @@ pub struct RevenueCalculation {
 }
 
 /// Calculate revenue splits for a sold lead
-/// 
+///
 /// # Arguments
 /// * `lead_value` - The price paid by the buyer (gross sale price)
 /// * `revshare_percentage` - Optional percentage revshare (0-100)
 /// * `revshare_flat_amount` - Optional flat amount revshare
 /// * `publisher_id` - The original publisher who submitted the lead
 /// * `instance_id` - The instance ID to identify the admin/broker
-/// 
+///
 /// # Returns
 /// RevenueCalculation struct with all calculated amounts
-/// 
+///
 /// # Errors
 /// Returns error if calculation fails or if both revshare types are provided
 pub async fn calculate_revenue(
@@ -68,7 +68,7 @@ pub async fn calculate_revenue(
 }
 
 /// Create a lead_revenues record
-/// 
+///
 /// # Arguments
 /// * `pool` - Database connection pool
 /// * `lead_id` - The lead UUID
@@ -78,12 +78,13 @@ pub async fn calculate_revenue(
 /// * `buyer_id` - Buyer who purchased
 /// * `campaign_id` - Campaign that won
 /// * `instance_id` - Instance to identify admin
-/// 
+///
 /// # Returns
 /// UUID of created lead_revenue record
-/// 
+///
 /// # Errors
 /// Returns error if insert fails or if record already exists (idempotency check)
+#[allow(clippy::too_many_arguments)]
 pub async fn create_lead_revenue(
     pool: &PgPool,
     lead_id: Uuid,
@@ -95,15 +96,13 @@ pub async fn create_lead_revenue(
     _instance_id: Uuid,
 ) -> Result<Uuid, sqlx::Error> {
     // Idempotency check: don't create duplicate records
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM lead_revenues WHERE lead_id = $1 LIMIT 1",
-    )
-    .bind(lead_id)
-    .fetch_optional(pool)
-    .await?;
-
-    if existing.is_some() {
-        return Ok(existing.unwrap());
+    if let Some(existing_id) =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM lead_revenues WHERE lead_id = $1 LIMIT 1")
+            .bind(lead_id)
+            .fetch_optional(pool)
+            .await?
+    {
+        return Ok(existing_id);
     }
 
     // Get instance owner's publisher ID (admin_id)

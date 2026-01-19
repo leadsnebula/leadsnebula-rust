@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS ping_tree_publishers (
 );
 
 -- Index for routing queries (critical path)
-CREATE INDEX idx_ptp_routing ON ping_tree_publishers(publisher_id, vertical);
+CREATE INDEX IF NOT EXISTS idx_ptp_routing ON ping_tree_publishers(publisher_id, vertical);
 
 -- Index for ping tree lookups
-CREATE INDEX idx_ptp_ping_tree_id ON ping_tree_publishers(ping_tree_id);
+CREATE INDEX IF NOT EXISTS idx_ptp_ping_tree_id ON ping_tree_publishers(ping_tree_id);

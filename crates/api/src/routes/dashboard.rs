@@ -9,11 +9,11 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::str::FromStr;
 use uuid::Uuid;
-use rust_decimal::Decimal;
 
 use crate::AppState;
 
@@ -3299,13 +3299,12 @@ async fn list_ping_trees(
     // Get publisher counts for each ping tree
     let mut response = Vec::new();
     for pt in &ping_trees {
-        let publisher_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ping_tree_publishers WHERE ping_tree_id = $1",
-        )
-        .bind(pt.id)
-        .fetch_one(state.db_pool.as_ref())
-        .await
-        .unwrap_or(0);
+        let publisher_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ping_tree_publishers WHERE ping_tree_id = $1")
+                .bind(pt.id)
+                .fetch_one(state.db_pool.as_ref())
+                .await
+                .unwrap_or(0);
 
         response.push(serde_json::json!({
             "id": pt.id.to_string(),
@@ -3414,12 +3413,13 @@ async fn get_ping_tree(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get publishers assigned to this ping tree
-    let publishers = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(
-        state.db_pool.as_ref(),
-        &id,
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let publishers =
+        leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(
+            state.db_pool.as_ref(),
+            &id,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3970,15 +3970,16 @@ async fn list_ping_tree_publishers(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let publishers = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(
-        state.db_pool.as_ref(),
-        &id,
-    )
-    .await
-    .map_err(|e| {
-        error!("Database error fetching publishers: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let publishers =
+        leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(
+            state.db_pool.as_ref(),
+            &id,
+        )
+        .await
+        .map_err(|e| {
+            error!("Database error fetching publishers: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Get publisher details
     let mut publisher_details = Vec::new();
@@ -4050,8 +4051,12 @@ async fn add_publisher_to_ping_tree(
     }
 
     // Convert f64 to Decimal for database
-    let revshare_percentage = payload.revshare_percentage.and_then(|v| Decimal::from_str(&v.to_string()).ok());
-    let revshare_flat_amount = payload.revshare_flat_amount.and_then(|v| Decimal::from_str(&v.to_string()).ok());
+    let revshare_percentage = payload
+        .revshare_percentage
+        .and_then(|v| Decimal::from_str(&v.to_string()).ok());
+    let revshare_flat_amount = payload
+        .revshare_flat_amount
+        .and_then(|v| Decimal::from_str(&v.to_string()).ok());
 
     // Create assignment with validation and defaults
     let assignment = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::create(
@@ -4149,21 +4154,26 @@ async fn update_ping_tree_publisher_revshare(
     };
 
     // Convert f64 to Decimal for database
-    let revshare_percentage = payload.revshare_percentage.and_then(|v| Decimal::from_str(&v.to_string()).ok());
-    let revshare_flat_amount = payload.revshare_flat_amount.and_then(|v| Decimal::from_str(&v.to_string()).ok());
+    let revshare_percentage = payload
+        .revshare_percentage
+        .and_then(|v| Decimal::from_str(&v.to_string()).ok());
+    let revshare_flat_amount = payload
+        .revshare_flat_amount
+        .and_then(|v| Decimal::from_str(&v.to_string()).ok());
 
     // Update revshare
-    let updated = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::update_revshare(
-        state.db_pool.as_ref(),
-        &assignment.id,
-        revshare_percentage,
-        revshare_flat_amount,
-    )
-    .await
-    .map_err(|e| {
-        error!("Database error updating revshare: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let updated =
+        leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::update_revshare(
+            state.db_pool.as_ref(),
+            &assignment.id,
+            revshare_percentage,
+            revshare_flat_amount,
+        )
+        .await
+        .map_err(|e| {
+            error!("Database error updating revshare: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // TODO: Invalidate cache "routing:{publisher_id}:{vertical}" (Phase 2)
 
@@ -4202,8 +4212,9 @@ async fn get_publisher_revenue_share(
     }
 
     // Get all assignments for this publisher
-    let assignments = sqlx::query_as::<_, leadsnebula_core::models::ping_tree_publisher::PingTreePublisher>(
-        r#"
+    let assignments =
+        sqlx::query_as::<_, leadsnebula_core::models::ping_tree_publisher::PingTreePublisher>(
+            r#"
         SELECT id, ping_tree_id, publisher_id, vertical, 
                revshare_percentage, revshare_flat_amount,
                created_at, updated_at
@@ -4211,14 +4222,14 @@ async fn get_publisher_revenue_share(
         WHERE publisher_id = $1 
         ORDER BY vertical, created_at
         "#,
-    )
-    .bind(id)
-    .fetch_all(state.db_pool.as_ref())
-    .await
-    .map_err(|e| {
-        error!("Database error fetching assignments: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        )
+        .bind(id)
+        .fetch_all(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error fetching assignments: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Get ping tree details for each assignment
     let mut revenue_share_configs = Vec::new();

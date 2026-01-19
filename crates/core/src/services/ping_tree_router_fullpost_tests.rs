@@ -88,7 +88,6 @@ mod ping_tree_router_fullpost_tests {
         PingTree {
             id: Uuid::new_v4(),
             instance_id: Uuid::new_v4(),
-            publisher_id: Uuid::new_v4(),
             name: "Test Ping Tree".to_string(),
             vertical: "test-vertical".to_string(),
             strategy: strategy.to_string(),
