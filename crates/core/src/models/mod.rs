@@ -7,6 +7,7 @@ pub mod enums;
 pub mod lead;
 pub mod ping_tree;
 pub mod ping_tree_campaign;
+pub mod ping_tree_publisher;
 pub mod publisher;
 pub mod user;
 pub mod vertical;

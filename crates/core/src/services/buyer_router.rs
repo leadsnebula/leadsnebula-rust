@@ -107,8 +107,13 @@ impl BuyerRouter {
         };
 
         // Prepare request payload (wrap lead data in "lead" object for Pulsar compatibility)
+        let mut lead_data = serde_json::to_value(&self.lead)?;
+        // Ensure request_type is set to "ping" for ping requests (override any existing value)
+        if let Some(obj) = lead_data.as_object_mut() {
+            obj.insert("request_type".to_string(), serde_json::json!("ping"));
+        }
         let payload = serde_json::json!({
-            "lead": serde_json::to_value(&self.lead)?
+            "lead": lead_data
         });
 
         // Send HTTP request - for internal buyers, no API key needed

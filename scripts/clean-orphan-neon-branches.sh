@@ -32,7 +32,28 @@ require NEONCTL_API_KEY
 NEONCTL_CMD="${NEONCTL_CMD:-npx --yes neonctl}"
 
 echo "Listing branches for project $PROJECT_ID..."
-branches=$($NEONCTL_CMD branches list --project "$PROJECT_ID" --api-key "$NEONCTL_API_KEY" --format json)
+# Redirect stderr to suppress npm/npx warnings, capture stdout for JSON
+# Use --output json (not --format json) to match other scripts
+branches_output=$($NEONCTL_CMD branches list --project "$PROJECT_ID" --api-key "$NEONCTL_API_KEY" --output json 2>/dev/null || true)
+
+# Extract JSON from output (in case there's non-JSON content mixed in from npm/npx)
+# Remove all lines before the first line that starts with '[' or '{'
+branches=$(echo "$branches_output" | sed -n '/^\s*[\[{]/,$p')
+
+# If sed didn't find JSON start, try the whole output
+if [ -z "$branches" ] || ! echo "$branches" | jq empty 2>/dev/null; then
+  # Try the original output as-is
+  branches="$branches_output"
+fi
+
+# Validate that we have valid JSON before proceeding
+if ! echo "$branches" | jq empty 2>/dev/null; then
+  echo "Error: Failed to get valid JSON from neonctl output" >&2
+  echo "Raw output (first 500 chars):" >&2
+  echo "$branches_output" | head -c 500 >&2
+  echo "" >&2
+  exit 1
+fi
 
 # Use jq if available, otherwise print branches and exit
 if command -v jq >/dev/null 2>&1; then

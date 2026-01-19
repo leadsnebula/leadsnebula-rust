@@ -38,6 +38,9 @@ fn map_error_to_user(err_text: &str) -> (String, String) {
     if lower.contains("permission denied") || lower.contains("permission") {
         problems.push("Server permission error. Contact the administrator.".to_string());
     }
+    if lower.contains("column") && lower.contains("publisher_id") && lower.contains("does not exist") {
+        problems.push("Server configuration error: database schema mismatch. Contact the administrator.".to_string());
+    }
     if lower.contains("violates not-null constraint") || lower.contains("null value") {
         // Generic not-null / null detection - add an explanatory line if nothing more specific matched
         if problems.is_empty() {
@@ -239,6 +242,75 @@ async fn create_lead(
             }));
         }
     };
+
+    // Validate publisher_id if provided in request body
+    if let Some(ref provided_publisher_id) = lead_data.publisher_id {
+        let provided_uuid = uuid::Uuid::parse_str(provided_publisher_id).ok();
+        if let Some(provided_uuid) = provided_uuid {
+            if provided_uuid != publisher.id {
+                return Ok(Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some("Publisher ID mismatch. Your API key is associated with a different publisher.".to_string()),
+                        error: Some(format!("Publisher ID mismatch: provided={}, authenticated={}", provided_publisher_id, publisher.id)),
+                    },
+                    lead: LeadNode {
+                        promise_id: None,
+                        lead_id: None,
+                        lead_uuid: None,
+                        ping_id: None,
+                        bid: None,
+                        post_id: None,
+                        price: None,
+                    },
+                    verbose: if verbose_requested {
+                        Some(serde_json::json!({
+                            "error_code": "ERR_401",
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "endpoint": "POST /api/v1/leads",
+                            "status_code": 401,
+                            "provided_publisher_id": provided_publisher_id,
+                            "authenticated_publisher_id": publisher.id.to_string()
+                        }))
+                    } else {
+                        None
+                    },
+                    http_status: Some(401),
+                }));
+            }
+        } else {
+            // Invalid UUID format
+            return Ok(Json(LeadResponse {
+                status: StatusNode {
+                    success: false,
+                    status: "error".to_string(),
+                    message: Some(format!("Invalid publisher_id format: {}", provided_publisher_id)),
+                    error: Some(format!("Invalid UUID format for publisher_id: {}", provided_publisher_id)),
+                },
+                lead: LeadNode {
+                    promise_id: None,
+                    lead_id: None,
+                    lead_uuid: None,
+                    ping_id: None,
+                    bid: None,
+                    post_id: None,
+                    price: None,
+                },
+                verbose: if verbose_requested {
+                    Some(serde_json::json!({
+                        "error_code": "ERR_400",
+                        "timestamp": Utc::now().to_rfc3339(),
+                        "endpoint": "POST /api/v1/leads",
+                        "status_code": 400
+                    }))
+                } else {
+                    None
+                },
+                http_status: Some(400),
+            }));
+        }
+    }
 
     // Handle post request (update existing lead)
     if request_type == "post" {
@@ -800,7 +872,12 @@ async fn create_lead(
 
     // Attempt to check ping tree presence (best-effort; table may not exist in all installs)
     // Ping tree presence is helpful but not mandatory here; routing will return a clear error if absent
-    match sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM ping_trees WHERE publisher_id = $1 AND vertical = $2 AND deleted_at IS NULL LIMIT 1")
+    // Updated to use ping_tree_publishers join table instead of publisher_id column
+    match sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT pt.id FROM ping_trees pt 
+         INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id 
+         WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL LIMIT 1"
+    )
         .bind(publisher.id)
         .bind(vertical.slug.clone())
         .fetch_optional(&*state.db_pool)

@@ -11,7 +11,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::str::FromStr;
 use uuid::Uuid;
+use rust_decimal::Decimal;
 
 use crate::AppState;
 
@@ -156,6 +158,26 @@ pub fn dashboard_routes() -> Router<AppState> {
         .route(
             "/api/v1/dashboard/ping_trees/:ping_tree_id/audit_logs",
             get(list_ping_tree_audit_logs),
+        )
+        .route(
+            "/api/v1/dashboard/ping_trees/:id/publishers",
+            get(list_ping_tree_publishers),
+        )
+        .route(
+            "/api/v1/dashboard/ping_trees/:id/publishers",
+            post(add_publisher_to_ping_tree),
+        )
+        .route(
+            "/api/v1/dashboard/ping_trees/:id/publishers/:publisher_id",
+            delete(remove_publisher_from_ping_tree),
+        )
+        .route(
+            "/api/v1/dashboard/ping_trees/:id/publishers/:publisher_id",
+            put(update_ping_tree_publisher_revshare),
+        )
+        .route(
+            "/api/v1/dashboard/publishers/:id/revenue-share",
+            get(get_publisher_revenue_share),
         )
         .route("/api/v1/dashboard/verticals", get(list_verticals))
         .route("/api/v1/dashboard/leads", get(list_leads))
@@ -3263,7 +3285,7 @@ async fn list_ping_trees(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
     let ping_trees = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees ORDER BY created_at DESC",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees ORDER BY created_at DESC",
     )
     .fetch_all(state.db_pool.as_ref())
     .await
@@ -3274,22 +3296,29 @@ async fn list_ping_trees(
 
     info!("Found {} ping trees", ping_trees.len());
 
-    let response: Vec<serde_json::Value> = ping_trees
-        .iter()
-        .map(|pt| {
-            serde_json::json!({
-                "id": pt.id.to_string(),
-                "name": pt.name,
-                "vertical": pt.vertical,
-                "strategy": pt.strategy,
-                "status": pt.status,
-                "publisher_id": pt.publisher_id.to_string(),
-                "priority": pt.priority,
-                "created_at": pt.created_at.to_rfc3339(),
-                "deleted_at": pt.deleted_at.map(|dt| dt.to_rfc3339())
-            })
-        })
-        .collect();
+    // Get publisher counts for each ping tree
+    let mut response = Vec::new();
+    for pt in &ping_trees {
+        let publisher_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ping_tree_publishers WHERE ping_tree_id = $1",
+        )
+        .bind(pt.id)
+        .fetch_one(state.db_pool.as_ref())
+        .await
+        .unwrap_or(0);
+
+        response.push(serde_json::json!({
+            "id": pt.id.to_string(),
+            "name": pt.name,
+            "vertical": pt.vertical,
+            "strategy": pt.strategy,
+            "status": pt.status,
+            "publisher_count": publisher_count,
+            "priority": pt.priority,
+            "created_at": pt.created_at.to_rfc3339(),
+            "deleted_at": pt.deleted_at.map(|dt| dt.to_rfc3339())
+        }));
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3302,7 +3331,6 @@ pub struct CreatePingTreeRequest {
     pub name: String,
     pub vertical: String,
     pub strategy: String,
-    pub publisher_id: Uuid,
     pub instance_id: Option<Uuid>,
     pub priority: Option<i32>,
 }
@@ -3331,17 +3359,16 @@ async fn create_ping_tree(
     sqlx::query(
         r#"
         INSERT INTO ping_trees (
-            id, instance_id, publisher_id, name, vertical, strategy, status,
+            id, instance_id, name, vertical, strategy, status,
             priority, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, 'active',
-            $7, NOW(), NOW()
+            $1, $2, $3, $4, $5, 'active',
+            $6, NOW(), NOW()
         )
         "#,
     )
     .bind(ping_tree_id)
     .bind(instance_id)
-    .bind(payload.publisher_id)
     .bind(&payload.name)
     .bind(&payload.vertical)
     .bind(&payload.strategy)
@@ -3358,7 +3385,6 @@ async fn create_ping_tree(
             "vertical": payload.vertical,
             "strategy": payload.strategy,
             "status": "active",
-            "publisher_id": payload.publisher_id.to_string(),
             "priority": payload.priority
         },
         "message": "Ping tree created successfully"
@@ -3370,7 +3396,7 @@ async fn get_ping_tree(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(state.db_pool.as_ref())
@@ -3387,6 +3413,14 @@ async fn get_ping_tree(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Get publishers assigned to this ping tree
+    let publishers = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(
+        state.db_pool.as_ref(),
+        &id,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     Ok(Json(serde_json::json!({
         "success": true,
         "ping_tree": {
@@ -3395,10 +3429,18 @@ async fn get_ping_tree(
             "vertical": ping_tree.vertical,
             "strategy": ping_tree.strategy,
             "status": ping_tree.status,
-            "publisher_id": ping_tree.publisher_id.to_string(),
             "priority": ping_tree.priority,
             "created_at": ping_tree.created_at.to_rfc3339()
         },
+        "publishers": publishers.iter().map(|p| {
+            // Convert Decimal to f64 for JSON response
+            serde_json::json!({
+                "id": p.id.to_string(),
+                "publisher_id": p.publisher_id.to_string(),
+                "revshare_percentage": p.revshare_percentage.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+                "revshare_flat_amount": p.revshare_flat_amount.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
+            })
+        }).collect::<Vec<_>>(),
         "campaigns": campaigns.iter().map(|c| serde_json::json!({
             "id": c.id.to_string(),
             "campaign_id": c.campaign_id.to_string(),
@@ -3417,7 +3459,7 @@ async fn update_ping_tree(
 
     // Get ping tree before update for audit log
     let ping_tree_before = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(state.db_pool.as_ref())
@@ -3511,7 +3553,7 @@ async fn update_ping_tree(
 
     // Get ping tree after update
     let ping_tree_after = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(state.db_pool.as_ref())
@@ -3595,7 +3637,7 @@ async fn delete_ping_tree(
 
     // Get ping tree before deletion for audit log
     let ping_tree_before = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(state.db_pool.as_ref())
@@ -3686,7 +3728,7 @@ async fn add_campaign_to_ping_tree(
 
     // Get ping tree and campaign info for audit log
     let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(ping_tree_id)
     .fetch_optional(state.db_pool.as_ref())
@@ -3789,7 +3831,7 @@ async fn remove_campaign_from_ping_tree(
 
     // Get ping tree and campaign info for audit log before deletion
     let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(ping_tree_id)
     .fetch_optional(state.db_pool.as_ref())
@@ -3889,6 +3931,321 @@ async fn remove_campaign_from_ping_tree(
     Ok(Json(serde_json::json!({
         "success": true,
         "message": "Campaign removed from ping tree successfully"
+    })))
+}
+
+// Ping Tree Publisher Assignment API
+#[derive(Deserialize)]
+pub struct AddPublisherToPingTreeRequest {
+    pub publisher_id: Uuid,
+    pub revshare_percentage: Option<f64>,
+    pub revshare_flat_amount: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePingTreePublisherRevshareRequest {
+    pub revshare_percentage: Option<f64>,
+    pub revshare_flat_amount: Option<f64>,
+}
+
+async fn list_ping_tree_publishers(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Verify ping tree exists
+    let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if ping_tree.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let publishers = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(
+        state.db_pool.as_ref(),
+        &id,
+    )
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publishers: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Get publisher details
+    let mut publisher_details = Vec::new();
+    for ptp in &publishers {
+        let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+            "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(ptp.publisher_id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+
+        publisher_details.push(serde_json::json!({
+            "id": ptp.id.to_string(),
+            "publisher_id": ptp.publisher_id.to_string(),
+            "publisher_name": publisher.as_ref().map(|p| p.name.clone()),
+            "vertical": ptp.vertical,
+            "revshare_percentage": ptp.revshare_percentage.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+            "revshare_flat_amount": ptp.revshare_flat_amount.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+            "created_at": ptp.created_at.to_rfc3339()
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "publishers": publisher_details
+    })))
+}
+
+async fn add_publisher_to_ping_tree(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<AddPublisherToPingTreeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get ping tree to verify it exists and get vertical
+    let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let ping_tree = match ping_tree {
+        Some(pt) => pt,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Verify publisher exists
+    let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(payload.publisher_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if publisher.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Convert f64 to Decimal for database
+    let revshare_percentage = payload.revshare_percentage.and_then(|v| Decimal::from_str(&v.to_string()).ok());
+    let revshare_flat_amount = payload.revshare_flat_amount.and_then(|v| Decimal::from_str(&v.to_string()).ok());
+
+    // Create assignment with validation and defaults
+    let assignment = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::create(
+        state.db_pool.as_ref(),
+        id,
+        payload.publisher_id,
+        ping_tree.vertical.clone(), // Auto-set from ping_tree
+        revshare_percentage,
+        revshare_flat_amount,
+    )
+    .await
+    .map_err(|e| {
+        error!("Database error creating publisher assignment: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Convert Decimal to f64 for JSON response
+    use rust_decimal::Decimal;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "assignment": {
+            "id": assignment.id.to_string(),
+            "publisher_id": assignment.publisher_id.to_string(),
+            "revshare_percentage": assignment.revshare_percentage.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+            "revshare_flat_amount": assignment.revshare_flat_amount.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
+        },
+        "message": "Publisher added to ping tree successfully"
+    })))
+}
+
+async fn remove_publisher_from_ping_tree(
+    State(state): State<AppState>,
+    Path((id, publisher_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Verify ping tree exists
+    let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if ping_tree.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Delete assignment
+    leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::delete(
+        state.db_pool.as_ref(),
+        &id,
+        &publisher_id,
+    )
+    .await
+    .map_err(|e| {
+        error!("Database error removing publisher assignment: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // TODO: Invalidate cache "routing:{publisher_id}:{vertical}" (Phase 2)
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Publisher removed from ping tree successfully"
+    })))
+}
+
+async fn update_ping_tree_publisher_revshare(
+    State(state): State<AppState>,
+    Path((id, publisher_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdatePingTreePublisherRevshareRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Find assignment
+    let assignment = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree_and_publisher(
+        state.db_pool.as_ref(),
+        &id,
+        &publisher_id,
+    )
+    .await
+    .map_err(|e| {
+        error!("Database error fetching assignment: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let assignment = match assignment {
+        Some(a) => a,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Convert f64 to Decimal for database
+    let revshare_percentage = payload.revshare_percentage.and_then(|v| Decimal::from_str(&v.to_string()).ok());
+    let revshare_flat_amount = payload.revshare_flat_amount.and_then(|v| Decimal::from_str(&v.to_string()).ok());
+
+    // Update revshare
+    let updated = leadsnebula_core::models::ping_tree_publisher::PingTreePublisher::update_revshare(
+        state.db_pool.as_ref(),
+        &assignment.id,
+        revshare_percentage,
+        revshare_flat_amount,
+    )
+    .await
+    .map_err(|e| {
+        error!("Database error updating revshare: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // TODO: Invalidate cache "routing:{publisher_id}:{vertical}" (Phase 2)
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "assignment": {
+            "id": updated.id.to_string(),
+            "publisher_id": updated.publisher_id.to_string(),
+            "revshare_percentage": updated.revshare_percentage,
+            "revshare_flat_amount": updated.revshare_flat_amount
+        },
+        "message": "Revshare updated successfully"
+    })))
+}
+
+async fn get_publisher_revenue_share(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Verify publisher exists
+    let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if publisher.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Get all assignments for this publisher
+    let assignments = sqlx::query_as::<_, leadsnebula_core::models::ping_tree_publisher::PingTreePublisher>(
+        r#"
+        SELECT id, ping_tree_id, publisher_id, vertical, 
+               revshare_percentage, revshare_flat_amount,
+               created_at, updated_at
+        FROM ping_tree_publishers 
+        WHERE publisher_id = $1 
+        ORDER BY vertical, created_at
+        "#,
+    )
+    .bind(id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching assignments: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Get ping tree details for each assignment
+    let mut revenue_share_configs = Vec::new();
+    for assignment in &assignments {
+        let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+            "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(assignment.ping_tree_id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+
+        revenue_share_configs.push(serde_json::json!({
+            "ping_tree_id": assignment.ping_tree_id.to_string(),
+            "ping_tree_name": ping_tree.as_ref().map(|pt| pt.name.clone()),
+            "vertical": assignment.vertical,
+            "revshare_percentage": assignment.revshare_percentage.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+            "revshare_flat_amount": assignment.revshare_flat_amount.map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)),
+            "created_at": assignment.created_at.to_rfc3339()
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "publisher_id": id.to_string(),
+        "revenue_share_configs": revenue_share_configs
     })))
 }
 

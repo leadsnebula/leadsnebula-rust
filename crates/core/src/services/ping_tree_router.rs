@@ -56,26 +56,26 @@ impl PingTreeRouter {
         pool: Arc<PgPool>,
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
-        // Find active ping tree for publisher and vertical
-        let ping_tree =
+        // Find active ping tree for publisher and vertical with revshare info
+        let (ping_tree, _revshare_percentage, _revshare_flat_amount) =
             match PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
                 .await?
             {
-                Some(pt) => pt,
+                Some((pt, revshare_pct, revshare_flat)) => (pt, revshare_pct, revshare_flat),
                 None => {
                     // Update lead status to error
                     self.update_lead_status(
                         pool.as_ref(),
                         LeadStatus::Error,
-                        Some("No active ping tree found"),
+                        Some("Publisher not assigned to any ping tree"),
                     )
                     .await?;
                     return Ok(RoutingResult {
                         success: false,
                         status: "error".to_string(),
                         error: Some(format!(
-                            "No active ping tree found for publisher {} and vertical {}",
-                            self.publisher_id, self.vertical
+                            "Publisher not assigned to any ping tree for vertical: {}",
+                            self.vertical
                         )),
                         promise_id: None,
                         ping_id: None,
@@ -832,7 +832,14 @@ impl PingTreeRouter {
 
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
-            let ping_result = self
+            // Create a temporary router with "ping" request_type for the ping auction phase
+            let ping_router = PingTreeRouter::new(
+                self.lead.clone(),
+                self.publisher_id,
+                self.vertical.clone(),
+                "ping".to_string(), // Force "ping" request_type for ping auction
+            );
+            let ping_result = ping_router
                 .route_ping_auction(
                     pool.clone(),
                     campaigns,
