@@ -159,6 +159,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: Some(100.0), // Set bid for ping auction
         };
         let responses = vec![(&resp1, campaign1, Some(1))];
         let (_winner, winner_id, _) = select_winner_for_test(responses);
@@ -176,6 +177,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(0.0),
+            bid: Some(0.0), // Set bid for ping auction
         };
         let responses = vec![(&resp1, campaign1, None), (&resp2, campaign2, None)];
         let (_winner, winner_id, _) = select_winner_for_test(responses);
@@ -191,6 +193,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(-10.0),
+            bid: Some(-10.0), // Set bid for ping auction
         };
         let responses = vec![(&resp1, campaign1, None), (&resp3, campaign2, None)];
         let (_winner, winner_id, _) = select_winner_for_test(responses);
@@ -206,6 +209,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.005),
+            bid: Some(100.005), // Set bid for ping auction
         };
         let responses = vec![
             (&resp1, campaign1, Some(2)),
@@ -233,6 +237,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: None,
         };
         let resp2 = BuyerResponse {
             success: true,
@@ -243,6 +248,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: None,
         };
         let resp3 = BuyerResponse {
             success: true,
@@ -253,6 +259,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: None,
         };
 
         let responses = vec![
@@ -291,6 +298,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: Some(100.0), // Set bid for ping auction
         };
         let resp2 = BuyerResponse {
             success: true,
@@ -301,6 +309,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: Some(100.0), // Set bid for ping auction
         };
         let resp3 = BuyerResponse {
             success: true,
@@ -311,6 +320,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: Some(100.0), // Set bid for ping auction
         };
 
         let responses = vec![
@@ -340,6 +350,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(150.0),
+            bid: None,
         };
         let resp2 = BuyerResponse {
             success: true,
@@ -350,6 +361,7 @@ mod ping_tree_router_unit_tests {
             ping_id: None,
             post_id: None,
             price: Some(100.0),
+            bid: None,
         };
 
         let responses = vec![

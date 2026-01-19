@@ -10,6 +10,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -135,6 +136,10 @@ pub fn dashboard_routes() -> Router<AppState> {
         .route("/api/v1/dashboard/campaigns/:id", get(get_campaign))
         .route("/api/v1/dashboard/campaigns/:id", post(update_campaign))
         .route("/api/v1/dashboard/campaigns/:id", delete(delete_campaign))
+        .route(
+            "/api/v1/dashboard/campaigns/:campaign_id/audit_logs",
+            get(list_campaign_audit_logs),
+        )
         .route("/api/v1/dashboard/ping_trees", get(list_ping_trees))
         .route("/api/v1/dashboard/ping_trees", post(create_ping_tree))
         .route("/api/v1/dashboard/ping_trees/:id", get(get_ping_tree))
@@ -148,7 +153,12 @@ pub fn dashboard_routes() -> Router<AppState> {
             "/api/v1/dashboard/ping_trees/:id/campaigns/:campaign_id",
             delete(remove_campaign_from_ping_tree),
         )
+        .route(
+            "/api/v1/dashboard/ping_trees/:ping_tree_id/audit_logs",
+            get(list_ping_tree_audit_logs),
+        )
         .route("/api/v1/dashboard/verticals", get(list_verticals))
+        .route("/api/v1/dashboard/leads", get(list_leads))
         .route(
             "/api/v1/dashboard/buyer_integrations",
             get(list_buyer_integrations),
@@ -2135,7 +2145,7 @@ async fn get_buyer(
         "buyer": {
             "id": buyer.id.to_string(),
             "name": buyer.name,
-            "status": buyer.status,
+            "status": buyer.status.as_str(),
             "created_at": buyer.created_at.to_rfc3339(),
             "deleted_at": buyer.deleted_at.map(|d| d.to_rfc3339()),
             "buyer_type": buyer.buyer_type,
@@ -2802,8 +2812,9 @@ async fn list_campaigns(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
+
     let campaigns = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
-        "SELECT * FROM campaigns WHERE deleted_at IS NULL ORDER BY created_at DESC",
+        "SELECT * FROM campaigns ORDER BY created_at DESC",
     )
     .fetch_all(state.db_pool.as_ref())
     .await
@@ -2814,18 +2825,42 @@ async fn list_campaigns(
 
     info!("Found {} campaigns", campaigns.len());
 
+    // Get ping tree membership for all campaigns
+    let campaign_ids: Vec<Uuid> = campaigns.iter().map(|c| c.id).collect();
+    let ping_tree_memberships: std::collections::HashMap<Uuid, bool> = if !campaign_ids.is_empty() {
+        // Query all ping tree memberships at once
+        let members: std::collections::HashSet<Uuid> =
+            sqlx::query_scalar::<_, Uuid>("SELECT DISTINCT campaign_id FROM ping_tree_campaigns")
+                .fetch_all(state.db_pool.as_ref())
+                .await
+                .ok()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
+        campaign_ids
+            .iter()
+            .map(|id| (*id, members.contains(id)))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let response: Vec<serde_json::Value> = campaigns
         .iter()
         .map(|c| {
+            let in_ping_tree = ping_tree_memberships.get(&c.id).copied().unwrap_or(false);
             serde_json::json!({
                 "id": c.id.to_string(),
                 "name": c.name,
                 "vertical": c.vertical,
                 "campaign_token": c.campaign_token,
-                "status": c.status,
+                "status": c.status.as_str(),
                 "publisher_id": c.publisher_id.to_string(),
                 "buyer_id": c.buyer_id.to_string(),
-                "created_at": c.created_at.to_rfc3339()
+                "created_at": c.created_at.to_rfc3339(),
+                "deleted_at": c.deleted_at.map(|dt| dt.to_rfc3339()),
+                "in_ping_tree": in_ping_tree
             })
         })
         .collect();
@@ -2926,6 +2961,8 @@ async fn get_campaign(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+
     let campaign = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
         "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
     )
@@ -2935,6 +2972,15 @@ async fn get_campaign(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Check if campaign is in any ping tree
+    let in_ping_tree: bool =
+        sqlx::query("SELECT COUNT(*) > 0 FROM ping_tree_campaigns WHERE campaign_id = $1")
+            .bind(id)
+            .fetch_one(state.db_pool.as_ref())
+            .await
+            .map(|row: sqlx::postgres::PgRow| row.get::<bool, _>(0))
+            .unwrap_or(false);
+
     Ok(Json(serde_json::json!({
         "success": true,
         "campaign": {
@@ -2942,10 +2988,11 @@ async fn get_campaign(
             "name": campaign.name,
             "vertical": campaign.vertical,
             "campaign_token": campaign.campaign_token,
-            "status": campaign.status,
+            "status": campaign.status.as_str(),
             "publisher_id": campaign.publisher_id.to_string(),
             "buyer_id": campaign.buyer_id.to_string(),
-            "created_at": campaign.created_at.to_rfc3339()
+            "created_at": campaign.created_at.to_rfc3339(),
+            "in_ping_tree": in_ping_tree
         }
     })))
 }
@@ -2955,14 +3002,238 @@ async fn update_campaign(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get campaign before update for audit log
+    let campaign_before = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
+        "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching campaign: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let campaign_before = match campaign_before {
+        Some(c) => c,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Track changes for audit log
+    let mut changed_fields = serde_json::Map::new();
+    let mut has_updates = false;
+
+    // Build update query dynamically
+    let mut query_builder = sqlx::QueryBuilder::new("UPDATE campaigns SET ");
+
     if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE campaigns SET name = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL")
-            .bind(name)
-            .bind(id)
-            .execute(state.db_pool.as_ref())
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if campaign_before.name.as_deref().unwrap_or("") != name {
+            changed_fields.insert(
+                "name".to_string(),
+                serde_json::json!({
+                    "before": campaign_before.name,
+                    "after": name
+                }),
+            );
+        }
+        query_builder.push("name = ");
+        query_builder.push_bind(name);
+        query_builder.push(", ");
+        has_updates = true;
     }
+
+    if let Some(publisher_id_str) = payload.get("publisher_id").and_then(|v| v.as_str()) {
+        if let Ok(publisher_id) = Uuid::parse_str(publisher_id_str) {
+            if campaign_before.publisher_id != publisher_id {
+                changed_fields.insert(
+                    "publisher_id".to_string(),
+                    serde_json::json!({
+                        "before": campaign_before.publisher_id.to_string(),
+                        "after": publisher_id.to_string()
+                    }),
+                );
+            }
+            query_builder.push("publisher_id = ");
+            query_builder.push_bind(publisher_id);
+            query_builder.push(", ");
+            has_updates = true;
+        }
+    }
+
+    if let Some(buyer_id_str) = payload.get("buyer_id").and_then(|v| v.as_str()) {
+        if let Ok(buyer_id) = Uuid::parse_str(buyer_id_str) {
+            if campaign_before.buyer_id != buyer_id {
+                changed_fields.insert(
+                    "buyer_id".to_string(),
+                    serde_json::json!({
+                        "before": campaign_before.buyer_id.to_string(),
+                        "after": buyer_id.to_string()
+                    }),
+                );
+            }
+            query_builder.push("buyer_id = ");
+            query_builder.push_bind(buyer_id);
+            query_builder.push(", ");
+            has_updates = true;
+        }
+    }
+
+    // Handle status updates based on ping tree membership
+    if let Some(status_str) = payload.get("status").and_then(|v| v.as_str()) {
+        use leadsnebula_core::models::enums::CampaignStatus;
+        use sqlx::Row;
+
+        // Check if campaign is in any ping tree
+        let in_ping_tree: bool =
+            sqlx::query("SELECT COUNT(*) > 0 FROM ping_tree_campaigns WHERE campaign_id = $1")
+                .bind(id)
+                .fetch_one(state.db_pool.as_ref())
+                .await
+                .map(|row: sqlx::postgres::PgRow| row.get::<bool, _>(0))
+                .unwrap_or(false);
+
+        let status_enum = match status_str {
+            "active" => {
+                // If activating and not in ping tree, set to "inactive" (ronin)
+                // If activating and in ping tree, set to "active"
+                if in_ping_tree {
+                    CampaignStatus::Active
+                } else {
+                    CampaignStatus::Inactive
+                }
+            }
+            "paused" => CampaignStatus::Paused,
+            "inactive" => CampaignStatus::Inactive,
+            _ => {
+                error!("Invalid campaign status value: {}", status_str);
+                return Ok(Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Invalid status value: {}. Must be one of: active, paused, inactive", status_str)
+                })));
+            }
+        };
+
+        if campaign_before.status != status_enum {
+            changed_fields.insert(
+                "status".to_string(),
+                serde_json::json!({
+                    "before": campaign_before.status.as_str(),
+                    "after": status_enum.as_str()
+                }),
+            );
+            query_builder.push("status = ");
+            query_builder.push_bind(status_enum);
+            query_builder.push(", ");
+            has_updates = true;
+        }
+    }
+
+    if !has_updates {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "No changes to update"
+        })));
+    }
+
+    query_builder.push("updated_at = NOW() WHERE id = ");
+    query_builder.push_bind(id);
+    query_builder.push(" AND deleted_at IS NULL");
+
+    let update_query = query_builder.build();
+    update_query
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error updating campaign: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Get campaign after update for audit log
+    let campaign_after = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
+        "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
+    // Build before/after JSON for audit log
+    let campaign_before_full = serde_json::json!({
+        "id": campaign_before.id.to_string(),
+        "name": campaign_before.name,
+        "vertical": campaign_before.vertical,
+        "campaign_token": campaign_before.campaign_token,
+        "status": campaign_before.status.to_string(),
+        "publisher_id": campaign_before.publisher_id.to_string(),
+        "buyer_id": campaign_before.buyer_id.to_string(),
+        "instance_id": campaign_before.instance_id.to_string(),
+    });
+
+    let campaign_after_full = campaign_after.as_ref().map(|c| {
+        serde_json::json!({
+            "id": c.id.to_string(),
+            "name": c.name,
+            "vertical": c.vertical,
+            "campaign_token": c.campaign_token,
+            "status": c.status.to_string(),
+            "publisher_id": c.publisher_id.to_string(),
+            "buyer_id": c.buyer_id.to_string(),
+            "instance_id": c.instance_id.to_string(),
+        })
+    });
+
+    // Determine action type
+    let action_type = if changed_fields.contains_key("name") && changed_fields.len() == 1 {
+        "campaign_name_changed"
+    } else if changed_fields.contains_key("publisher_id") && changed_fields.len() == 1 {
+        "campaign_publisher_changed"
+    } else if changed_fields.contains_key("buyer_id") && changed_fields.len() == 1 {
+        "campaign_buyer_changed"
+    } else {
+        "campaign_updated"
+    };
+
+    // Build audit log details following ISO/SOC format
+    let timestamp = chrono::Utc::now();
+    let audit_details = serde_json::json!({
+        "action": "update",
+        "target_type": "Campaign",
+        "target_id": id.to_string(),
+        "target_name": campaign_after_full.as_ref().and_then(|c| c.get("name").and_then(|n| n.as_str())).unwrap_or(""),
+        "changes": changed_fields,
+        "before": campaign_before_full,
+        "after": campaign_after_full,
+        "context": {
+            "reason": "User updated campaign via dashboard",
+            "method": "POST",
+            "endpoint": format!("/api/v1/dashboard/campaigns/{}", id),
+            "source": "dashboard_web_ui"
+        },
+        "outcome": "success",
+        "timestamp": timestamp.to_rfc3339(),
+        "compliance": {
+            "standard": "ISO_27001_SOC2_NIST",
+            "version": "2024"
+        }
+    });
+
+    // Create audit log entry
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(campaign_before.instance_id),
+        None, // TODO: Extract user_id from request extensions
+        action_type,
+        Some("Campaign"),
+        Some(id),
+        audit_details,
+        serde_json::json!({}),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -2992,7 +3263,7 @@ async fn list_ping_trees(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
     let ping_trees = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT * FROM ping_trees WHERE deleted_at IS NULL ORDER BY created_at DESC",
+        "SELECT * FROM ping_trees ORDER BY created_at DESC",
     )
     .fetch_all(state.db_pool.as_ref())
     .await
@@ -3014,7 +3285,8 @@ async fn list_ping_trees(
                 "status": pt.status,
                 "publisher_id": pt.publisher_id.to_string(),
                 "priority": pt.priority,
-                "created_at": pt.created_at.to_rfc3339()
+                "created_at": pt.created_at.to_rfc3339(),
+                "deleted_at": pt.deleted_at.map(|dt| dt.to_rfc3339())
             })
         })
         .collect();
@@ -3141,14 +3413,173 @@ async fn update_ping_tree(
     Path(id): Path<Uuid>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get ping tree before update for audit log
+    let ping_tree_before = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let ping_tree_before = match ping_tree_before {
+        Some(pt) => pt,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let mut changed_fields = serde_json::Map::new();
+    let mut has_updates = false;
+
+    // Build update query dynamically
+    let mut query_builder = sqlx::QueryBuilder::new("UPDATE ping_trees SET ");
+
     if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE ping_trees SET name = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL")
-            .bind(name)
-            .bind(id)
-            .execute(state.db_pool.as_ref())
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if ping_tree_before.name != name {
+            changed_fields.insert(
+                "name".to_string(),
+                serde_json::json!({
+                    "before": ping_tree_before.name,
+                    "after": name
+                }),
+            );
+        }
+        query_builder.push("name = ");
+        query_builder.push_bind(name);
+        query_builder.push(", ");
+        has_updates = true;
     }
+
+    if let Some(priority) = payload.get("priority").and_then(|v| v.as_i64()) {
+        let priority_i32 = priority as i32;
+        if ping_tree_before.priority != Some(priority_i32) {
+            changed_fields.insert(
+                "priority".to_string(),
+                serde_json::json!({
+                    "before": ping_tree_before.priority,
+                    "after": priority_i32
+                }),
+            );
+        }
+        query_builder.push("priority = ");
+        query_builder.push_bind(priority_i32);
+        query_builder.push(", ");
+        has_updates = true;
+    }
+
+    if let Some(status_str) = payload.get("status").and_then(|v| v.as_str()) {
+        if ping_tree_before.status != status_str {
+            changed_fields.insert(
+                "status".to_string(),
+                serde_json::json!({
+                    "before": ping_tree_before.status,
+                    "after": status_str
+                }),
+            );
+        }
+        if has_updates {
+            query_builder.push(", ");
+        }
+        query_builder.push("status = ");
+        query_builder.push_bind(status_str);
+        has_updates = true;
+    }
+
+    if !has_updates {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "No changes to update"
+        })));
+    }
+
+    query_builder.push("updated_at = NOW() WHERE id = ");
+    query_builder.push_bind(id);
+    query_builder.push(" AND deleted_at IS NULL");
+
+    let update_query = query_builder.build();
+    update_query
+        .execute(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error updating ping tree: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Get ping tree after update
+    let ping_tree_after = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
+    // Build before/after JSON for audit log
+    let ping_tree_before_full = serde_json::json!({
+        "id": ping_tree_before.id.to_string(),
+        "name": ping_tree_before.name,
+        "vertical": ping_tree_before.vertical,
+        "strategy": ping_tree_before.strategy,
+        "status": ping_tree_before.status,
+        "priority": ping_tree_before.priority,
+        "instance_id": ping_tree_before.instance_id.to_string(),
+    });
+
+    let ping_tree_after_full = ping_tree_after.as_ref().map(|pt| {
+        serde_json::json!({
+            "id": pt.id.to_string(),
+            "name": pt.name,
+            "vertical": pt.vertical,
+            "strategy": pt.strategy,
+            "status": pt.status,
+            "priority": pt.priority,
+            "instance_id": pt.instance_id.to_string(),
+        })
+    });
+
+    // Build audit log details
+    let timestamp = chrono::Utc::now();
+    let audit_details = serde_json::json!({
+        "action": "update",
+        "target_type": "PingTree",
+        "target_id": id.to_string(),
+        "target_name": ping_tree_after_full.as_ref().and_then(|pt| pt.get("name").and_then(|n| n.as_str())).unwrap_or(""),
+        "changes": changed_fields,
+        "before": ping_tree_before_full,
+        "after": ping_tree_after_full,
+        "context": {
+            "reason": "User updated ping tree via dashboard",
+            "method": "POST",
+            "endpoint": format!("/api/v1/dashboard/ping_trees/{}", id),
+            "source": "dashboard_web_ui"
+        },
+        "outcome": "success",
+        "timestamp": timestamp.to_rfc3339(),
+        "compliance": {
+            "standard": "ISO_27001_SOC2_NIST",
+            "version": "2024"
+        }
+    });
+
+    // Create audit log entry
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(ping_tree_before.instance_id),
+        None, // TODO: Extract user_id from request extensions
+        "ping_tree_updated",
+        Some("PingTree"),
+        Some(id),
+        audit_details,
+        serde_json::json!({}),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3160,11 +3591,79 @@ async fn delete_ping_tree(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get ping tree before deletion for audit log
+    let ping_tree_before = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let ping_tree_before = match ping_tree_before {
+        Some(pt) => pt,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Get affected campaigns for audit log
+    let affected_campaigns: Vec<serde_json::Value> =
+        sqlx::query("SELECT c.id, c.name, c.campaign_token FROM campaigns c INNER JOIN ping_tree_campaigns ptc ON c.id = ptc.campaign_id WHERE ptc.ping_tree_id = $1")
+            .bind(id)
+            .fetch_all(state.db_pool.as_ref())
+            .await
+            .ok()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                use sqlx::Row;
+                let id: Option<Uuid> = row.try_get("id").ok();
+                let name: Option<String> = row.try_get("name").ok();
+                let token: Option<String> = row.try_get("campaign_token").ok();
+                id.map(|id| {
+                    serde_json::json!({
+                        "id": id.to_string(),
+                        "name": name.unwrap_or_default(),
+                        "campaign_token": token.unwrap_or_default()
+                    })
+                })
+            })
+            .collect();
+
+    // Soft delete the ping tree
     sqlx::query("UPDATE ping_trees SET deleted_at = NOW() WHERE id = $1")
         .bind(id)
         .execute(state.db_pool.as_ref())
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            error!("Database error soft deleting ping tree: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Log audit for ping tree deletion
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(ping_tree_before.instance_id),
+        None, // TODO: Extract user_id from request extensions
+        "ping_tree_deleted",
+        Some("PingTree"),
+        Some(id),
+        serde_json::json!({
+            "ping_tree_name": ping_tree_before.name,
+            "ping_tree_vertical": ping_tree_before.vertical,
+            "ping_tree_strategy": ping_tree_before.strategy
+        }),
+        serde_json::json!({
+            "campaigns": affected_campaigns
+        }),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3183,6 +3682,34 @@ async fn add_campaign_to_ping_tree(
     Path(ping_tree_id): Path<Uuid>,
     Json(payload): Json<AddCampaignToPingTreeRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get ping tree and campaign info for audit log
+    let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(ping_tree_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let ping_tree = match ping_tree {
+        Some(pt) => pt,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let campaign = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
+        "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(payload.campaign_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
     sqlx::query(
         r#"
         INSERT INTO ping_tree_campaigns (
@@ -3201,6 +3728,53 @@ async fn add_campaign_to_ping_tree(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Do NOT automatically update campaign status when adding to ping tree
+    // User must manually activate the campaign via the toggle
+    // This allows inactive campaigns to be added to ping trees without auto-activating
+
+    // Create audit log
+    let audit_details = serde_json::json!({
+        "action": "add_campaign",
+        "target_type": "PingTree",
+        "target_id": ping_tree_id.to_string(),
+        "target_name": ping_tree.name,
+        "campaign_id": payload.campaign_id.to_string(),
+        "campaign_name": campaign.as_ref().and_then(|c| c.name.clone()),
+        "priority": payload.priority,
+        "context": {
+            "reason": "User added campaign to ping tree via dashboard",
+            "method": "POST",
+            "endpoint": format!("/api/v1/dashboard/ping_trees/{}/campaigns", ping_tree_id),
+            "source": "dashboard_web_ui"
+        },
+        "outcome": "success",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "compliance": {
+            "standard": "ISO_27001_SOC2_NIST",
+            "version": "2024"
+        }
+    });
+
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(ping_tree.instance_id),
+        None, // TODO: Extract user_id from request extensions
+        "ping_tree_campaign_added",
+        Some("PingTree"),
+        Some(ping_tree_id),
+        audit_details,
+        serde_json::json!({
+            "campaign": campaign.as_ref().map(|c| serde_json::json!({
+                "id": c.id.to_string(),
+                "name": c.name,
+                "campaign_token": c.campaign_token
+            }))
+        }),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
+
     Ok(Json(serde_json::json!({
         "success": true,
         "message": "Campaign added to ping tree successfully"
@@ -3211,12 +3785,106 @@ async fn remove_campaign_from_ping_tree(
     State(state): State<AppState>,
     Path((ping_tree_id, campaign_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tracing::error;
+
+    // Get ping tree and campaign info for audit log before deletion
+    let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
+        "SELECT * FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(ping_tree_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching ping tree: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let ping_tree = match ping_tree {
+        Some(pt) => pt,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let campaign = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
+        "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(campaign_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
     sqlx::query("DELETE FROM ping_tree_campaigns WHERE ping_tree_id = $1 AND campaign_id = $2")
         .bind(ping_tree_id)
         .bind(campaign_id)
         .execute(state.db_pool.as_ref())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Check if campaign is in any other ping trees
+    let campaign_in_other_trees: Option<i64> = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ping_tree_campaigns WHERE campaign_id = $1 AND ping_tree_id != $2",
+    )
+    .bind(campaign_id)
+    .bind(ping_tree_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
+    // If campaign is not in any other ping trees, set to "inactive" (ronin - not in any ping tree)
+    // Note: "ronin" is not a database status enum value, so we use "inactive" to represent campaigns not in any ping tree
+    // The UI can display "inactive" status as "ronin" for campaigns not in any ping tree
+    if campaign_in_other_trees.unwrap_or(0) == 0 {
+        sqlx::query(
+            "UPDATE campaigns SET status = 'inactive' WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(campaign_id)
+        .execute(state.db_pool.as_ref())
+        .await
+        .ok(); // Don't fail the request if status update fails
+    }
+
+    // Create audit log
+    let audit_details = serde_json::json!({
+        "action": "remove_campaign",
+        "target_type": "PingTree",
+        "target_id": ping_tree_id.to_string(),
+        "target_name": ping_tree.name,
+        "campaign_id": campaign_id.to_string(),
+        "campaign_name": campaign.as_ref().and_then(|c| c.name.clone()),
+        "context": {
+            "reason": "User removed campaign from ping tree via dashboard",
+            "method": "DELETE",
+            "endpoint": format!("/api/v1/dashboard/ping_trees/{}/campaigns/{}", ping_tree_id, campaign_id),
+            "source": "dashboard_web_ui"
+        },
+        "outcome": "success",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "compliance": {
+            "standard": "ISO_27001_SOC2_NIST",
+            "version": "2024"
+        }
+    });
+
+    let _ = create_audit_log(
+        state.db_pool.as_ref(),
+        Some(ping_tree.instance_id),
+        None, // TODO: Extract user_id from request extensions
+        "ping_tree_campaign_removed",
+        Some("PingTree"),
+        Some(ping_tree_id),
+        audit_details,
+        serde_json::json!({
+            "campaign": campaign.as_ref().map(|c| serde_json::json!({
+                "id": c.id.to_string(),
+                "name": c.name,
+                "campaign_token": c.campaign_token
+            }))
+        }),
+        None, // TODO: Extract IP address from request
+        None, // TODO: Extract user agent from request
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -4428,6 +5096,150 @@ async fn list_buyer_audit_logs(
     })))
 }
 
+async fn list_campaign_audit_logs(
+    State(state): State<AppState>,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    let logs = sqlx::query(
+        r#"
+        SELECT 
+            al.id,
+            al.instance_id,
+            al.instance_user_id,
+            al.action_type,
+            al.resource_type,
+            al.resource_id,
+            al.details,
+            al.affected_resources,
+            al.ip_address,
+            al.user_agent,
+            al.created_at,
+            al.updated_at,
+            u.email as user_email,
+            u.first_name as user_first_name,
+            u.last_name as user_last_name
+        FROM audit_logs al
+        LEFT JOIN instance_users u ON al.instance_user_id = u.id
+        WHERE al.resource_type = 'Campaign' AND al.resource_id = $1
+        ORDER BY al.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(campaign_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing audit logs: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let audit_logs: Vec<serde_json::Value> = logs
+        .iter()
+        .map(|row| {
+            let user_name = match (
+                row.try_get::<Option<String>, _>("user_first_name").ok().flatten(),
+                row.try_get::<Option<String>, _>("user_last_name").ok().flatten(),
+            ) {
+                (Some(first), Some(last)) if !first.is_empty() || !last.is_empty() => {
+                    format!("{} {}", first, last).trim().to_string()
+                }
+                _ => row.try_get::<Option<String>, _>("user_email").ok().flatten().unwrap_or_else(|| "Unknown".to_string()),
+            };
+
+            let details_value = row.try_get::<serde_json::Value, _>("details").ok().unwrap_or_else(|| serde_json::json!({}));
+
+            serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").ok(),
+                "action_type": row.try_get::<String, _>("action_type").ok(),
+                "user": user_name,
+                "details": details_value,
+                "affected_resources": row.try_get::<serde_json::Value, _>("affected_resources").ok().unwrap_or_else(|| serde_json::json!({})),
+                "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok().map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "audit_logs": audit_logs
+    })))
+}
+
+async fn list_ping_tree_audit_logs(
+    State(state): State<AppState>,
+    Path(ping_tree_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    let logs = sqlx::query(
+        r#"
+        SELECT 
+            al.id,
+            al.instance_id,
+            al.instance_user_id,
+            al.action_type,
+            al.resource_type,
+            al.resource_id,
+            al.details,
+            al.affected_resources,
+            al.ip_address,
+            al.user_agent,
+            al.created_at,
+            al.updated_at,
+            u.email as user_email,
+            u.first_name as user_first_name,
+            u.last_name as user_last_name
+        FROM audit_logs al
+        LEFT JOIN instance_users u ON al.instance_user_id = u.id
+        WHERE al.resource_type = 'PingTree' AND al.resource_id = $1
+        ORDER BY al.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(ping_tree_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing ping tree audit logs: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let audit_logs: Vec<serde_json::Value> = logs
+        .iter()
+        .map(|row| {
+            let user_name = match (
+                row.try_get::<Option<String>, _>("user_first_name").ok().flatten(),
+                row.try_get::<Option<String>, _>("user_last_name").ok().flatten(),
+            ) {
+                (Some(first), Some(last)) if !first.is_empty() || !last.is_empty() => {
+                    format!("{} {}", first, last).trim().to_string()
+                }
+                _ => row.try_get::<Option<String>, _>("user_email").ok().flatten().unwrap_or_else(|| "Unknown".to_string()),
+            };
+
+            let details_value = row.try_get::<serde_json::Value, _>("details").ok().unwrap_or_else(|| serde_json::json!({}));
+
+            serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").ok(),
+                "action_type": row.try_get::<String, _>("action_type").ok(),
+                "user": user_name,
+                "details": details_value,
+                "affected_resources": row.try_get::<serde_json::Value, _>("affected_resources").ok().unwrap_or_else(|| serde_json::json!({})),
+                "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok().map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "audit_logs": audit_logs
+    })))
+}
+
 // Helper function to create audit log entries
 #[allow(clippy::too_many_arguments)]
 async fn create_audit_log(
@@ -4463,4 +5275,558 @@ async fn create_audit_log(
     .await?;
 
     Ok(())
+}
+
+async fn list_leads(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::encryption::EncryptionService;
+    use tracing::error;
+
+    // Get user from request extensions (set by jwt_auth_middleware)
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Get user's instance_id from instances table (where user is the owner)
+    let instance_id: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching instance_id: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .flatten();
+
+    // Initialize encryption service for PII decryption using SSM deterministic key
+    // PII fields are encrypted using Rails-compatible deterministic encryption
+    let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
+    let det_path = format!(
+        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
+        env_norm
+    );
+    let salt_path = format!(
+        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
+        env_norm
+    );
+
+    // Get deterministic key and salt from SSM
+    let pii_decryption_key =
+        if let Ok(Some(det_key)) = state.ssm.get_parameter(&det_path, true).await {
+            if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path, true).await {
+                tracing::info!("Successfully fetched SSM parameters for PII decryption");
+                Some(
+                    leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
+                        &det_key, &salt,
+                    ),
+                )
+            } else {
+                error!(
+                    "Failed to get key derivation salt from SSM at {}",
+                    salt_path
+                );
+                None
+            }
+        } else {
+            error!("Failed to get deterministic key from SSM at {}", det_path);
+            None
+        };
+
+    let pii_decryption_key = pii_decryption_key.ok_or_else(|| {
+        error!("Failed to initialize PII decryption key from SSM");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Fetch leads with vertical, publisher, buyer info, and calculate processing time
+    let leads_query = sqlx::query(
+        r#"
+        SELECT 
+            l.uuid,
+            l.lead_id,
+            l.status::text as status,
+            l.submitted_at,
+            l.sold_at,
+            l.created_at,
+            l.updated_at,
+            l.first_name_encrypted,
+            l.last_name_encrypted,
+            l.email_encrypted,
+            l.street_address_encrypted,
+            l.zip_encrypted,
+            l.ip_address_encrypted,
+            l.ping_id,
+            l.post_id,
+            l.vertical_id,
+            l.vertical_data,
+            l.tcpa_consent,
+            l.tcpa_language,
+            l.jornaya_lead_id,
+            l.trusted_form_url,
+            l.is_test,
+            v.slug as vertical_slug,
+            v.name as vertical_name,
+            p.name as publisher_name,
+            b.name as buyer_name,
+            EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms
+        FROM leads l
+        LEFT JOIN verticals v ON l.vertical_id = v.id
+        LEFT JOIN publishers p ON l.publisher_id = p.id AND p.deleted_at IS NULL
+        LEFT JOIN buyers b ON l.buyer_id = b.id AND b.deleted_at IS NULL
+        WHERE EXISTS (
+            SELECT 1 FROM publishers pub 
+            WHERE pub.id = l.publisher_id 
+            AND pub.instance_id = $1 
+            AND pub.deleted_at IS NULL
+        )
+        ORDER BY l.created_at DESC
+        LIMIT 1000
+        "#,
+    )
+    .bind(instance_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching leads: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Group leads by vertical and build response
+    let mut leads_by_vertical: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+
+    for row in leads_query {
+        let lead_uuid: Uuid = row.try_get("uuid").map_err(|e| {
+            error!("Error getting lead uuid: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let vertical_slug: String = row
+            .try_get("vertical_slug")
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Note: Request payload reconstruction is not possible because lead data (zip, ip_address, etc.)
+        // is not stored in the leads table - it's only in ping_payloads. If ping_payloads doesn't exist,
+        // original_request_payload will be None, which is acceptable for old leads.
+
+        // Decrypt PII fields using Rails-compatible envelope format
+        // Try decrypt_envelope first (Rails format), fallback to simple decrypt if that fails
+        let decrypt_pii = |enc: Option<String>, field_name: &str| -> Option<String> {
+            if enc.is_none() {
+                tracing::debug!(
+                    "PII field {} is null/empty for lead {}",
+                    field_name,
+                    lead_uuid
+                );
+                return None;
+            }
+            let e = enc.unwrap();
+            if e.is_empty() {
+                tracing::debug!(
+                    "PII field {} is empty string for lead {}",
+                    field_name,
+                    lead_uuid
+                );
+                return None;
+            }
+            // Try Rails envelope format first
+            match leadsnebula_core::encryption::EncryptionService::decrypt_envelope(
+                &pii_decryption_key,
+                &e,
+            ) {
+                Ok(decrypted) => {
+                    tracing::debug!(
+                        "Successfully decrypted {} using envelope format",
+                        field_name
+                    );
+                    Some(decrypted)
+                }
+                Err(e1) => {
+                    tracing::debug!(
+                        "Envelope decryption failed for {}: {}, trying simple decrypt",
+                        field_name,
+                        e1
+                    );
+                    // Fallback to simple decrypt (for legacy or non-envelope format)
+                    EncryptionService::new(&pii_decryption_key)
+                        .ok()
+                        .and_then(|svc| match svc.decrypt(&e) {
+                            Ok(decrypted) => {
+                                tracing::debug!(
+                                    "Successfully decrypted {} using simple format",
+                                    field_name
+                                );
+                                Some(decrypted)
+                            }
+                            Err(e2) => {
+                                tracing::warn!(
+                                    "Failed to decrypt {}: envelope error: {}, simple error: {}",
+                                    field_name,
+                                    e1,
+                                    e2
+                                );
+                                None
+                            }
+                        })
+                }
+            }
+        };
+
+        let first_name = decrypt_pii(
+            row.try_get::<Option<String>, _>("first_name_encrypted")
+                .ok()
+                .flatten(),
+            "first_name",
+        );
+        let last_name = decrypt_pii(
+            row.try_get::<Option<String>, _>("last_name_encrypted")
+                .ok()
+                .flatten(),
+            "last_name",
+        );
+        let email = decrypt_pii(
+            row.try_get::<Option<String>, _>("email_encrypted")
+                .ok()
+                .flatten(),
+            "email",
+        );
+        let street_address = decrypt_pii(
+            row.try_get::<Option<String>, _>("street_address_encrypted")
+                .ok()
+                .flatten(),
+            "street_address",
+        );
+        let zip = decrypt_pii(
+            row.try_get::<Option<String>, _>("zip_encrypted")
+                .ok()
+                .flatten(),
+            "zip",
+        );
+        let ip_address = decrypt_pii(
+            row.try_get::<Option<String>, _>("ip_address_encrypted")
+                .ok()
+                .flatten(),
+            "ip_address",
+        );
+
+        // Fetch the original request payload from ping_payloads (same for all buyers in auction)
+        let original_request_payload: Option<serde_json::Value> = sqlx::query(
+            r#"
+            SELECT 
+                payload,
+                request_payload_encrypted
+            FROM ping_payloads
+            WHERE lead_id = $1
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(lead_uuid)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row: sqlx::postgres::PgRow| {
+            let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
+                enc.and_then(|e| {
+                    leadsnebula_core::encryption::EncryptionService::decrypt_envelope(
+                        &pii_decryption_key,
+                        &e,
+                    )
+                    .ok()
+                    .or_else(|| {
+                        EncryptionService::new(&pii_decryption_key)
+                            .ok()
+                            .and_then(|svc| svc.decrypt(&e).ok())
+                    })
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                })
+            };
+            let request_encrypted: Option<String> = row
+                .try_get::<Option<String>, _>("request_payload_encrypted")
+                .ok()
+                .flatten();
+            let payload_json: Option<serde_json::Value> = row
+                .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+                .ok()
+                .flatten()
+                .map(|j| j.0);
+
+            decrypt_payload(request_encrypted).or(payload_json)
+        });
+
+        // If ping_payloads doesn't have a record, we can't reconstruct the full request payload
+        // because the lead data (zip, ip_address, monthly_bill, etc.) is not stored in the leads table
+        // It's only stored in ping_payloads. For old leads without ping_payloads, request_payload will be None.
+        // This is acceptable - the response payload will still be available.
+
+        // Fetch buyer responses for ping requests (auction responses)
+        // These are stored in buyer_responses table with ping_id set (or NULL for old timeout/error responses)
+        // Include responses that are clearly ping responses: have ping_id OR (no post_id AND payload indicates ping response)
+        let buyer_responses_raw = sqlx::query(
+            r#"
+            SELECT 
+                br.id,
+                br.ping_id,
+                br.buyer_id,
+                br.campaign_id,
+                br.payload,
+                br.response_payload_encrypted,
+                br.created_at,
+                b.name as buyer_name,
+                c.name as campaign_name,
+                EXTRACT(EPOCH FROM (br.created_at - (SELECT created_at FROM leads WHERE uuid = $1))) * 1000 as processing_time_ms
+            FROM buyer_responses br
+            LEFT JOIN buyers b ON br.buyer_id = b.id AND b.deleted_at IS NULL
+            LEFT JOIN campaigns c ON br.campaign_id = c.id AND c.deleted_at IS NULL
+            WHERE br.lead_id = $1 
+            AND br.post_id IS NULL
+            AND (
+                br.ping_id IS NOT NULL 
+                OR (br.ping_id IS NULL AND (br.payload->>'status' IN ('timeout', 'error', 'accepted', 'rejected')))
+            )
+            ORDER BY br.created_at ASC
+            "#
+        )
+        .bind(lead_uuid)
+        .fetch_all(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error fetching buyer ping responses: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let ping_payloads: Vec<serde_json::Value> = buyer_responses_raw
+        .iter()
+        .map(|ping_row| {
+            let ping_id: Option<String> = ping_row.try_get::<Option<String>, _>("ping_id").ok().flatten();
+            let buyer_id: Option<Uuid> = ping_row.try_get::<Option<Uuid>, _>("buyer_id").ok().flatten();
+            let campaign_id: Option<Uuid> = ping_row.try_get::<Option<Uuid>, _>("campaign_id").ok().flatten();
+            let payload: Option<serde_json::Value> = ping_row.try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload").ok().flatten().map(|j| j.0);
+            let response_encrypted: Option<String> = ping_row.try_get::<Option<String>, _>("response_payload_encrypted").ok().flatten();
+            let buyer_name: Option<String> = ping_row.try_get::<Option<String>, _>("buyer_name").ok().flatten();
+            let campaign_name: Option<String> = ping_row.try_get::<Option<String>, _>("campaign_name").ok().flatten();
+            let processing_time_ms: Option<f64> = ping_row.try_get::<Option<f64>, _>("processing_time_ms").ok().flatten();
+
+            // Try to decrypt encrypted payloads using SSM deterministic key
+            // Try decrypt_envelope first (Rails format), fallback to simple decrypt
+            let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
+                enc.and_then(|e| {
+                    // Try Rails envelope format first
+                    leadsnebula_core::encryption::EncryptionService::decrypt_envelope(&pii_decryption_key, &e)
+                        .ok()
+                        .or_else(|| {
+                            // Fallback to simple decrypt
+                            EncryptionService::new(&pii_decryption_key)
+                                .ok()
+                                .and_then(|svc| svc.decrypt(&e).ok())
+                        })
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                })
+            };
+
+            // For buyer responses, the payload IS the response (BuyerResponse struct)
+            // The request payload is stored in ping_payloads table (initial request)
+            // Response payload: stored in response_payload_encrypted when encrypted, otherwise in payload JSONB
+            let response_payload_decrypted = decrypt_payload(response_encrypted)
+                .or_else(|| payload.clone());
+
+            // Extract bid from response
+            // BuyerResponse has bid field for ping responses
+            let bid = response_payload_decrypted.as_ref()
+                .and_then(|r| r.get("bid"))
+                .and_then(|b| b.as_f64())
+                .or_else(|| {
+                    // Fallback: try routing_result.price (legacy format)
+                    response_payload_decrypted.as_ref()
+                        .and_then(|r| r.get("routing_result"))
+                        .and_then(|rr| rr.get("price"))
+                        .and_then(|p| p.as_f64())
+                });
+
+            // Use the original request payload (fetched once above, same for all buyers)
+            let request_payload = original_request_payload.clone();
+
+            serde_json::json!({
+                "id": ping_row.try_get::<i64, _>("id").ok(),
+                "ping_id": ping_id,
+                "buyer_id": buyer_id.map(|id| id.to_string()),
+                "campaign_id": campaign_id.map(|id| id.to_string()),
+                "buyer_name": buyer_name,
+                "campaign_name": campaign_name,
+                "bid": bid,
+                "processing_time_ms": processing_time_ms,
+                "request_payload": request_payload,
+                "response_payload": response_payload_decrypted,
+                "created_at": ping_row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at").ok().flatten().map(|d| d.to_rfc3339()),
+            })
+        })
+        .collect();
+
+        // Fetch post payload for this lead
+        let post_payload: Option<serde_json::Value> = if let Ok(Some(post_id_str)) =
+            row.try_get::<Option<String>, _>("post_id")
+        {
+            sqlx::query(
+                r#"
+                SELECT 
+                    id,
+                    post_id,
+                    payload,
+                    request_payload_encrypted,
+                    response_payload_encrypted,
+                    created_at,
+                    updated_at,
+                    EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000 as processing_time_ms
+                FROM post_payloads
+                WHERE lead_id = $1 AND post_id = $2
+                LIMIT 1
+                "#
+            )
+            .bind(lead_uuid)
+            .bind(&post_id_str)
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .map_err(|e| {
+                error!("Database error fetching post payload: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map(|post_row| {
+                let payload: Option<serde_json::Value> = post_row.try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload").ok().flatten().map(|j| j.0);
+                let request_encrypted: Option<String> = post_row.try_get::<Option<String>, _>("request_payload_encrypted").ok().flatten();
+                let response_encrypted: Option<String> = post_row.try_get::<Option<String>, _>("response_payload_encrypted").ok().flatten();
+                let processing_time_ms: Option<f64> = post_row.try_get::<Option<f64>, _>("processing_time_ms").ok().flatten();
+
+                // Try to decrypt encrypted payloads using SSM deterministic key
+                // Try decrypt_envelope first (Rails format), fallback to simple decrypt
+                let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
+                    enc.and_then(|e| {
+                        // Try Rails envelope format first
+                        leadsnebula_core::encryption::EncryptionService::decrypt_envelope(&pii_decryption_key, &e)
+                            .ok()
+                            .or_else(|| {
+                                // Fallback to simple decrypt
+                                EncryptionService::new(&pii_decryption_key)
+                                    .ok()
+                                    .and_then(|svc| svc.decrypt(&e).ok())
+                            })
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    })
+                };
+
+                // Request payload: try encrypted first, then fallback to payload JSONB
+                let request_payload = decrypt_payload(request_encrypted)
+                    .or_else(|| payload.clone());
+
+                // Response payload: stored in response_payload_encrypted when encrypted
+                // The response contains routing_result with price (for post requests)
+                let response_payload_decrypted = decrypt_payload(response_encrypted);
+
+                // Extract price from response
+                // For post requests, routing_result.price is the final sale price
+                let price = response_payload_decrypted.as_ref()
+                    .and_then(|r| r.get("routing_result"))
+                    .and_then(|rr| rr.get("price"))
+                    .and_then(|p| p.as_f64());
+
+                serde_json::json!({
+                    "id": post_row.try_get::<i64, _>("id").ok(),
+                    "post_id": post_row.try_get::<Option<String>, _>("post_id").ok().flatten(),
+                    "price": price,
+                    "processing_time_ms": processing_time_ms,
+                    "request_payload": request_payload,
+                    "response_payload": response_payload_decrypted,
+                    "created_at": post_row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at").ok().flatten().map(|d| d.to_rfc3339()),
+                })
+            })
+        } else {
+            None
+        };
+
+        // Get price from post_payload if available
+        let lead_price = post_payload
+            .as_ref()
+            .and_then(|pp| pp.get("price"))
+            .and_then(|p| p.as_f64());
+
+        // Calculate processing time - use SQL result or fallback to manual calculation
+        let processing_time_ms = {
+            let pt = row
+                .try_get::<Option<f64>, _>("processing_time_ms")
+                .ok()
+                .flatten();
+            if pt.is_none() {
+                // If calculation failed, try manual calculation
+                let created_at = row
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at")
+                    .ok()
+                    .flatten();
+                let sold_at = row
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("sold_at")
+                    .ok()
+                    .flatten();
+                let updated_at = row
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("updated_at")
+                    .ok()
+                    .flatten();
+                if let Some(created) = created_at {
+                    let end_time = sold_at.or(updated_at).unwrap_or_else(chrono::Utc::now);
+                    let duration = end_time.signed_duration_since(created);
+                    Some(duration.num_milliseconds() as f64)
+                } else {
+                    None
+                }
+            } else {
+                pt
+            }
+        };
+
+        let lead_json = serde_json::json!({
+            "uuid": lead_uuid.to_string(),
+            "lead_id": row.try_get::<Option<String>, _>("lead_id").ok().flatten(),
+            "status": row.try_get::<String, _>("status").ok(),
+            "price": lead_price,
+            "submitted_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("submitted_at").ok().flatten().map(|d| d.to_rfc3339()),
+            "processing_time_ms": processing_time_ms,
+            "publisher_name": row.try_get::<Option<String>, _>("publisher_name").ok().flatten(),
+            "buyer_name": row.try_get::<Option<String>, _>("buyer_name").ok().flatten(),
+            "pii": {
+                "first_name": first_name,
+                "last_name": last_name,
+                "email": email,
+                "street_address": street_address,
+                "zip": zip,
+                "ip_address": ip_address,
+            },
+            "ping_payloads": ping_payloads,
+            "post_payload": post_payload,
+        });
+
+        leads_by_vertical
+            .entry(vertical_slug.clone())
+            .or_default()
+            .push(lead_json);
+    }
+
+    // Build final response grouped by vertical
+    let mut verticals: Vec<serde_json::Value> = Vec::new();
+    for (slug, leads) in leads_by_vertical {
+        // Capitalize the slug for display name
+        let vertical_name = slug
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().collect::<String>() + &slug[1..])
+            .unwrap_or_else(|| slug.to_uppercase());
+
+        verticals.push(serde_json::json!({
+            "slug": slug,
+            "name": vertical_name,
+            "leads": leads,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "verticals": verticals,
+    })))
 }

@@ -19,6 +19,11 @@ pub async fn hmac_verification_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    // Allow internal requests (with X-Internal-Buyer-ID) to bypass HMAC verification
+    if headers.get("X-Internal-Buyer-ID").is_some() {
+        return Ok(next.run(request).await);
+    }
+
     // Get publisher from request extensions (set by api_key_auth_middleware)
     let publisher = request
         .extensions()

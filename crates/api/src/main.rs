@@ -3,10 +3,7 @@ mod middleware;
 mod routes;
 
 use config::AppState;
-use middleware::{
-    api_auth::api_key_auth_middleware, hmac::hmac_verification_middleware,
-    jwt_auth::jwt_auth_middleware,
-};
+use middleware::{api_auth::api_key_auth_middleware, jwt_auth::jwt_auth_middleware};
 use routes::{auth_routes, carina_routes, dashboard_routes, health_routes, pulsar_routes};
 use std::fs;
 use std::io;
@@ -171,10 +168,7 @@ async fn main() -> anyhow::Result<()> {
                     state.clone(),
                     api_key_auth_middleware,
                 )))
-                .merge(pulsar_routes().layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    hmac_verification_middleware,
-                )))
+                .merge(pulsar_routes()) // No authentication middleware - Pulsar is internal
                 .with_state(state)
                 .layer(
                     ServiceBuilder::new()

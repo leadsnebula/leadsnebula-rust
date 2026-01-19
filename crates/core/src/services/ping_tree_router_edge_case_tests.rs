@@ -8,6 +8,8 @@ mod ping_tree_router_edge_case_tests {
     use uuid::Uuid;
 
     fn create_buyer_response(success: bool, price: Option<f64>, status: &str) -> BuyerResponse {
+        // For ping auctions, use bid; for post auctions, use price
+        // Since select_winner filters by bid, we need to set bid for ping auction tests
         BuyerResponse {
             success,
             status: status.to_string(),
@@ -17,6 +19,7 @@ mod ping_tree_router_edge_case_tests {
             ping_id: None,
             post_id: None,
             price,
+            bid: price, // Use price as bid for ping auction tests
         }
     }
 

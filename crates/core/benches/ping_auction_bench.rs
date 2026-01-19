@@ -25,6 +25,7 @@ fn create_buyer_response(
         ping_id: Some(format!("PING_{}", Uuid::new_v4())),
         post_id: None,
         price,
+        bid: None,
     }
 }
 

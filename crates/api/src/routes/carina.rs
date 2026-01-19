@@ -161,7 +161,12 @@ async fn create_lead(
         .as_deref()
         .unwrap_or("ping")
         .to_lowercase();
-    let verbose_requested = lead_data.verbose.unwrap_or(request_level_verbose);
+    // Top-level verbose takes precedence; only use lead-level verbose if top-level is not set
+    let verbose_requested = if payload.verbose.is_some() {
+        request_level_verbose
+    } else {
+        lead_data.verbose.unwrap_or(false)
+    };
 
     // Validate vertical
     let vertical = match leadsnebula_core::models::vertical::Vertical::find_by_slug(
@@ -481,12 +486,12 @@ async fn create_lead(
                 let message = if status == "sold" {
                     if let Some(name) = buyer_name.clone() {
                         if let Some(p) = rounded_price {
-                            Some(format!("Lead sold to {} for {}", name, p))
+                            Some(format!("Lead sold to {} for ${}", name, p))
                         } else {
                             Some(format!("Lead sold to {}", name))
                         }
                     } else if let Some(p) = rounded_price {
-                        Some(format!("Lead sold for {}", p))
+                        Some(format!("Lead sold for ${}", p))
                     } else {
                         Some("Lead sold".to_string())
                     }
@@ -865,6 +870,72 @@ async fn create_lead(
         None
     };
 
+    // Encrypt PII fields using SSM deterministic key
+    let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
+    let det_path = format!(
+        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
+        env_norm
+    );
+    let salt_path = format!(
+        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
+        env_norm
+    );
+
+    // Get deterministic key and salt from SSM for PII encryption
+    let pii_encryption_key = if let Ok(Some(det_key)) =
+        state.ssm.get_parameter(&det_path, true).await
+    {
+        if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path, true).await {
+            Some(
+                leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
+                    &det_key, &salt,
+                ),
+            )
+        } else {
+            tracing::warn!("Failed to get key derivation salt from SSM at {} - PII fields will not be encrypted", salt_path);
+            None
+        }
+    } else {
+        tracing::warn!(
+            "Failed to get deterministic key from SSM at {} - PII fields will not be encrypted",
+            det_path
+        );
+        None
+    };
+
+    // Encrypt PII fields
+    let encrypt_pii = |value: Option<String>| -> Option<String> {
+        if let (Some(val), Some(key)) = (value, &pii_encryption_key) {
+            if !val.is_empty() {
+                if let Ok(envelope) =
+                    leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+                        key, &val, true,
+                    )
+                {
+                    return Some(envelope);
+                } else {
+                    tracing::warn!("Failed to encrypt PII field");
+                }
+            }
+        }
+        None
+    };
+
+    let first_name_encrypted = encrypt_pii(lead_data.first_name.clone());
+    let last_name_encrypted = encrypt_pii(lead_data.last_name.clone());
+    let email_encrypted = encrypt_pii(lead_data.email.clone());
+    let cell_phone_encrypted = encrypt_pii(
+        lead_data
+            .cell_phone
+            .clone()
+            .or(lead_data.mobile_phone.clone()),
+    );
+    let street_address_encrypted = encrypt_pii(lead_data.street_address.clone());
+    let city_encrypted = encrypt_pii(lead_data.city.clone());
+    let state_encrypted = encrypt_pii(lead_data.state.clone());
+    let zip_encrypted = encrypt_pii(lead_data.zip.clone());
+    let ip_address_encrypted = encrypt_pii(lead_data.ip_address.clone());
+
     // Insert lead into database
     tracing::info!(
         "Creating lead: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}",
@@ -880,10 +951,13 @@ async fn create_lead(
         INSERT INTO leads (
             event_id, lead_id, publisher_id, vertical_id, request_type, strategy, status,
             promise_id, tcpa_consent, tcpa_language, is_test, session_id, vertical_data,
-                buyer_id, campaign_id, post_id, submitted_at, created_at
+            buyer_id, campaign_id, post_id, submitted_at, created_at,
+            first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted,
+            street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, NOW(), NOW()
+            $14, $15, $16, NOW(), NOW(),
+            $17, $18, $19, $20, $21, $22, $23, $24, $25
         ) RETURNING uuid
         "#,
     )
@@ -910,6 +984,16 @@ async fn create_lead(
     .bind(campaign_id_opt.expect("campaign_id must be present after pre-checks"))
     // Provide a placeholder post_id to satisfy NOT NULL constraint for legacy installs
     .bind("")
+    // Bind encrypted PII fields
+    .bind(first_name_encrypted)
+    .bind(last_name_encrypted)
+    .bind(email_encrypted)
+    .bind(cell_phone_encrypted)
+    .bind(street_address_encrypted)
+    .bind(city_encrypted)
+    .bind(state_encrypted)
+    .bind(zip_encrypted)
+    .bind(ip_address_encrypted)
     .fetch_one(&*state.db_pool)
     .await;
 
@@ -955,57 +1039,86 @@ async fn create_lead(
     // Persist incoming request payload into ping_payloads for later inspection.
     let request_payload_json =
         serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
-    // Try to encrypt the request payload using Rails-compatible keys from SSM (deterministic)
+    // Try to encrypt the request payload using the same SSM deterministic key
     let mut encrypted_request_opt: Option<String> = None;
-    let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
-    let det_path = format!(
-        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
-        env_norm
-    );
-    let salt_path = format!(
-        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
-        env_norm
-    );
-    if let Ok(Some(det_key)) = state.ssm.get_parameter(&det_path, true).await {
-        if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path, true).await {
-            if let Ok(derived) = std::panic::catch_unwind(|| {
-                leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
-                    &det_key, &salt,
-                )
-            }) {
-                let key_bytes: [u8; 32] = derived;
-                if let Ok(req_str) = serde_json::to_string(&request_payload_json) {
-                    if let Ok(envelope) =
-                        leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                            &key_bytes, &req_str, true,
-                        )
-                    {
-                        encrypted_request_opt = Some(envelope);
-                    }
-                }
+    if let Some(key_bytes) = pii_encryption_key {
+        if let Ok(req_str) = serde_json::to_string(&request_payload_json) {
+            if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+                &key_bytes, &req_str, true,
+            ) {
+                encrypted_request_opt = Some(envelope);
             }
         }
     }
 
-    let inserted_payload = if let Some(encrypted_request) = encrypted_request_opt {
-        sqlx::query("INSERT INTO ping_payloads (lead_id, payload, request_payload_encrypted, created_at) VALUES ($1, $2, $3, now()) RETURNING id")
+    // Create a ping record first (required for ping_payloads foreign key)
+    // ping_id (text) is required for pings table, and pings.id (bigint) is required for ping_payloads.ping_id
+    // Generate ping_id similar to Pulsar handler: FP_<base64(lead_id|timestamp|result)>
+    use base64::Engine;
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let payload_str = format!("{}|{}|pending", lead_id, timestamp);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload_str);
+    let ping_id_text = format!("FP_{}", encoded);
+
+    let ping_id_result = sqlx::query("INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, $3, $4, now(), now()) RETURNING id")
+        .bind(&ping_id_text)
+        .bind(lead_uuid)
+        .bind(&promise_id)
+        .bind("processing")
+        .fetch_one(&*state.db_pool)
+        .await;
+
+    let ping_id_opt = match ping_id_result {
+        Ok(row) => Some(row.get::<i64, _>("id")),
+        Err(e) => {
+            tracing::error!("Failed to create ping record for lead {}: {}", lead_uuid, e);
+            // Continue without ping_payloads if ping creation fails (best-effort)
+            None
+        }
+    };
+
+    // Now insert into ping_payloads with the ping_id (if ping was created successfully)
+    let inserted_payload = if let Some(ping_id_val) = ping_id_opt {
+        let encrypted_request = encrypted_request_opt.unwrap_or_else(|| {
+            // If encryption failed, use empty string (NOT NULL constraint requires a value)
+            tracing::warn!(
+                "Request payload encryption failed for lead {}, using empty string",
+                lead_uuid
+            );
+            String::new()
+        });
+
+        sqlx::query("INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, now()) RETURNING id")
+            .bind(ping_id_val)
             .bind(lead_uuid)
             .bind(sqlx::types::Json(&request_payload_json))
             .bind(encrypted_request)
             .fetch_one(&*state.db_pool)
             .await
     } else {
-        sqlx::query("INSERT INTO ping_payloads (lead_id, payload, created_at) VALUES ($1, $2, now()) RETURNING id")
-            .bind(lead_uuid)
-            .bind(sqlx::types::Json(&request_payload_json))
-            .fetch_one(&*state.db_pool)
-            .await
+        // If ping creation failed, skip ping_payloads insert (best-effort, don't fail the whole request)
+        Err(sqlx::Error::RowNotFound)
     };
 
     // Capture payload row id if insert succeeded (best-effort)
     let payload_row_id: Option<uuid::Uuid> = match inserted_payload {
-        Ok(r) => r.get::<uuid::Uuid, _>("id").into(),
-        Err(_) => None,
+        Ok(r) => {
+            let id = r.get::<uuid::Uuid, _>("id");
+            tracing::info!(
+                "Successfully created ping_payloads record: id={}, lead_id={}",
+                id,
+                lead_uuid
+            );
+            Some(id)
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to create ping_payloads record for lead {}: {}",
+                lead_uuid,
+                e
+            );
+            None
+        }
     };
 
     // Load the created lead
@@ -1094,7 +1207,7 @@ async fn create_lead(
                 }
             } else if routing_result.status == "sold" {
                 if let Some(p) = price {
-                    Some(format!("Lead Sold for {}", p))
+                    Some(format!("Lead Sold for ${}", p))
                 } else {
                     Some("Lead Sold".to_string())
                 }

@@ -47,6 +47,7 @@ mod loom_tests {
                 ping_id: None,
                 post_id: None,
                 price: Some(100.0),
+                bid: Some(100.0), // Set bid for ping auction
             };
 
             let resp2 = BuyerResponse {
@@ -58,6 +59,7 @@ mod loom_tests {
                 ping_id: None,
                 post_id: None,
                 price: Some(150.0),
+                bid: Some(150.0), // Set bid for ping auction
             };
 
             let campaign1 = Uuid::new_v4();

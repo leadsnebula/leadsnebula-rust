@@ -4,6 +4,8 @@ use crate::models::{
 };
 use crate::services::buyer_router::BuyerResponse;
 use anyhow::Result;
+use hex;
+use rand;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -269,12 +271,27 @@ impl PingTreeRouter {
         for (result, campaign_id) in task_results {
             match result {
                 Ok(Ok(Ok(response))) => {
+                    tracing::info!(
+                        "Buyer response for campaign {}: success={}, status={}, bid={:?}, price={:?}, promise_id={:?}, error={:?}",
+                        campaign_id,
+                        response.success,
+                        response.status,
+                        response.bid,
+                        response.price,
+                        response.promise_id,
+                        response.error
+                    );
                     let priority = priority_map.get(&campaign_id).copied().flatten();
                     responses.push((response, campaign_id, priority));
                 }
                 Ok(Ok(Err(e))) => {
                     tracing::error!("BuyerRouter error for campaign {}: {}", campaign_id, e);
-                    // Add error response
+                    // Add error response - generate ping_id for ping requests so it shows up in leads report
+                    let ping_id = if self.request_type == "ping" {
+                        Some(format!("ping_error_{}", uuid::Uuid::new_v4()))
+                    } else {
+                        None
+                    };
                     responses.push((
                         BuyerResponse {
                             success: false,
@@ -282,9 +299,10 @@ impl PingTreeRouter {
                             error: Some(e.to_string()),
                             message: None,
                             promise_id: None,
-                            ping_id: None,
+                            ping_id,
                             post_id: None,
                             price: None,
+                            bid: None,
                         },
                         campaign_id,
                         priority_map.get(&campaign_id).copied().flatten(),
@@ -292,7 +310,12 @@ impl PingTreeRouter {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Task error for campaign {}: {}", campaign_id, e);
-                    // Add error response to track task failures
+                    // Add error response to track task failures - generate ping_id for ping requests
+                    let ping_id = if self.request_type == "ping" {
+                        Some(format!("ping_error_{}", uuid::Uuid::new_v4()))
+                    } else {
+                        None
+                    };
                     responses.push((
                         BuyerResponse {
                             success: false,
@@ -300,9 +323,10 @@ impl PingTreeRouter {
                             error: Some(format!("Task failed: {}", e)),
                             message: None,
                             promise_id: None,
-                            ping_id: None,
+                            ping_id,
                             post_id: None,
                             price: None,
+                            bid: None,
                         },
                         campaign_id,
                         priority_map.get(&campaign_id).copied().flatten(),
@@ -310,7 +334,12 @@ impl PingTreeRouter {
                 }
                 Err(_) => {
                     tracing::warn!("Ping auction timeout for campaign {}", campaign_id);
-                    // Add timeout response
+                    // Add timeout response - generate ping_id for ping requests so it shows up in leads report
+                    let ping_id = if self.request_type == "ping" {
+                        Some(format!("ping_timeout_{}", uuid::Uuid::new_v4()))
+                    } else {
+                        None
+                    };
                     responses.push((
                         BuyerResponse {
                             success: false,
@@ -318,9 +347,10 @@ impl PingTreeRouter {
                             error: Some("Buyer did not respond within timeout period".to_string()),
                             message: None,
                             promise_id: None,
-                            ping_id: None,
+                            ping_id,
                             post_id: None,
                             price: None,
+                            bid: None,
                         },
                         campaign_id,
                         priority_map.get(&campaign_id).copied().flatten(),
@@ -354,7 +384,14 @@ impl PingTreeRouter {
                 .map(|c| c.buyer_id);
             // Serialize response - use empty object on error (best-effort persistence)
             let resp_json = serde_json::to_value(resp).unwrap_or_else(|_| serde_json::json!({}));
-            let ping_id_val = resp.ping_id.clone();
+            // Ensure ping_id is set - if response doesn't have one, generate one for ping requests
+            let ping_id_val = resp.ping_id.clone().or_else(|| {
+                if self.request_type == "ping" {
+                    Some(format!("ping_{}", uuid::Uuid::new_v4()))
+                } else {
+                    None
+                }
+            });
 
             // Persist with retry logic for transient database errors asynchronously
             // Clone only what's necessary for the async task
@@ -398,14 +435,46 @@ impl PingTreeRouter {
             });
         }
 
-        // Filter valid responses (success=true, price > 0, status != timeout)
+        // Filter valid responses
+        // For ping requests: success=true, bid > 0, status != timeout, promise_id required
+        // For post requests: success=true, price > 0, status != timeout
         let valid_responses: Vec<_> = responses
             .iter()
-            .filter(|(resp, _, _)| {
-                resp.success
-                    && resp.price.is_some()
-                    && resp.price.unwrap_or(0.0) > 0.0
-                    && resp.status != "timeout"
+            .filter(|(resp, campaign_id, _)| {
+                // For ping auctions, check for bid (not price)
+                let has_bid = resp.bid.is_some() && resp.bid.unwrap_or(0.0) > 0.0;
+                let has_promise_id = resp.promise_id.is_some();
+                let is_valid = resp.success
+                    && has_bid
+                    && has_promise_id
+                    && resp.status != "timeout";
+
+                if !is_valid {
+                    let reason = if !resp.success {
+                        "success=false".to_string()
+                    } else if !has_bid {
+                        format!("missing or invalid bid (bid={:?})", resp.bid)
+                    } else if !has_promise_id {
+                        "missing promise_id".to_string()
+                    } else if resp.status == "timeout" {
+                        "timeout".to_string()
+                    } else {
+                        format!("status={}", resp.status)
+                    };
+
+                    tracing::warn!(
+                        "Invalid buyer ping response for campaign {}: {} (success={}, bid={:?}, promise_id={:?}, status={}, error={:?})",
+                        campaign_id,
+                        reason,
+                        resp.success,
+                        resp.bid,
+                        resp.promise_id,
+                        resp.status,
+                        resp.error
+                    );
+                }
+
+                is_valid
             })
             .collect();
 
@@ -418,6 +487,14 @@ impl PingTreeRouter {
                 .iter()
                 .filter(|(r, _, _)| r.status == "rejected")
                 .count();
+
+            tracing::error!(
+                "No valid buyer responses. Total responses: {}, timeouts: {}, rejected: {}, errors: {}",
+                responses.len(),
+                timeout_count,
+                rejected_count,
+                responses.iter().filter(|(r, _, _)| r.status == "error").count()
+            );
 
             let final_status = if timeout_count == responses.len() {
                 LeadStatus::Timeout
@@ -616,7 +693,12 @@ impl PingTreeRouter {
                         }
                     });
 
-                    if bresp.success && bresp.post_id.is_some() {
+                    // Validate post response: must have success=true, post_id, and price > 0
+                    if bresp.success
+                        && bresp.post_id.is_some()
+                        && bresp.price.is_some()
+                        && bresp.price.unwrap_or(0.0) > 0.0
+                    {
                         // Log performance metrics to Sentry for monitoring
                         #[cfg(feature = "sentry")]
                         {
@@ -811,7 +893,209 @@ impl PingTreeRouter {
                 buyer_id: post_result.buyer_id.or(ping_result.buyer_id),
             })
         } else {
-            // Log performance metrics to Sentry for monitoring (even on error)
+            // Fullpost strategy: send single request with all lead data to all buyers
+            // Similar to route_post but sends to all campaigns and selects winner by price
+            use crate::services::buyer_router::BuyerRouter;
+
+            // Send fullpost request to all campaigns in parallel
+            let mut handles = Vec::new();
+            for campaign in campaigns {
+                let pool_clone = pool.clone();
+                let encryption_key_clone = encryption_key.clone();
+                let lead_clone = self.lead.clone();
+                let campaign_clone = campaign.clone();
+                let request_type = "fullpost".to_string();
+
+                let handle = tokio::spawn(async move {
+                    let buyer_router = BuyerRouter::new(
+                        lead_clone,
+                        vec![campaign_clone.clone()],
+                        request_type,
+                        pool_clone,
+                        encryption_key_clone,
+                    );
+                    buyer_router.route().await
+                });
+                handles.push((campaign.id, handle));
+            }
+
+            // Collect responses
+            let mut responses: Vec<(
+                crate::services::buyer_router::BuyerResponse,
+                Uuid,
+                Option<i32>,
+            )> = Vec::new();
+            for (campaign_id, handle) in handles {
+                match handle.await {
+                    Ok(Ok(bresp)) => {
+                        let priority = priority_map.get(&campaign_id).copied().flatten();
+                        responses.push((bresp, campaign_id, priority));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Buyer router error for campaign {}: {}", campaign_id, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Task panicked for campaign {}: {:?}", campaign_id, e);
+                    }
+                }
+            }
+
+            // Filter valid responses: success=true, price > 0, status != timeout
+            let valid_responses: Vec<_> = responses
+                .iter()
+                .filter(|(resp, _, _)| {
+                    resp.success
+                        && resp.price.is_some()
+                        && resp.price.unwrap_or(0.0) > 0.0
+                        && resp.status != "timeout"
+                })
+                .collect();
+
+            if valid_responses.is_empty() {
+                let timeout_count = responses
+                    .iter()
+                    .filter(|(r, _, _)| r.status == "timeout")
+                    .count();
+                let rejected_count = responses
+                    .iter()
+                    .filter(|(r, _, _)| !r.success && r.status != "timeout")
+                    .count();
+
+                tracing::warn!(
+                    "No valid buyer responses for fullpost. Total responses: {}, timeouts: {}, rejected: {}",
+                    responses.len(),
+                    timeout_count,
+                    rejected_count
+                );
+
+                let final_status = if timeout_count == responses.len() {
+                    LeadStatus::Timeout
+                } else if rejected_count > 0 {
+                    LeadStatus::Rejected
+                } else {
+                    LeadStatus::Error
+                };
+
+                let status_str = final_status.as_str().to_string();
+                self.update_lead_status(
+                    pool.as_ref(),
+                    final_status,
+                    Some("No valid buyer responses"),
+                )
+                .await?;
+
+                #[cfg(feature = "sentry")]
+                {
+                    let total_time_ms = start_time.elapsed().as_millis() as u64;
+                    sentry::configure_scope(|scope| {
+                        scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
+                    });
+                }
+
+                return Ok(RoutingResult {
+                    success: false,
+                    status: status_str,
+                    error: Some(format!(
+                        "No valid buyer responses ({} timeouts, {} rejected)",
+                        timeout_count, rejected_count
+                    )),
+                    promise_id: None,
+                    ping_id: None,
+                    post_id: None,
+                    price: None,
+                    campaign_id: None,
+                    buyer_id: None,
+                });
+            }
+
+            // Select winner: highest price, then priority, then random
+            // For fullpost, sort by price (not bid)
+            let mut sorted: Vec<_> = valid_responses.iter().collect();
+            sorted.sort_by(|a, b| {
+                let price_a = a.0.price.unwrap_or(0.0);
+                let price_b = b.0.price.unwrap_or(0.0);
+                match price_b.partial_cmp(&price_a) {
+                    Some(std::cmp::Ordering::Equal) => {
+                        // Same price, compare priorities (lower = higher priority)
+                        let pri_a = a.2.unwrap_or(i32::MAX);
+                        let pri_b = b.2.unwrap_or(i32::MAX);
+                        pri_a.cmp(&pri_b)
+                    }
+                    Some(ord) => ord,
+                    None => std::cmp::Ordering::Equal,
+                }
+            });
+            let winner = sorted
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No valid responses"))?;
+            let (winner_response, winner_campaign_id, _) = (winner.0.clone(), winner.1, winner.2);
+
+            // Find winning campaign
+            let winner_campaign = campaigns
+                .iter()
+                .find(|c| c.id == winner_campaign_id)
+                .ok_or_else(|| anyhow::anyhow!("Winner campaign not found"))?;
+
+            // Update lead with winner information
+            let post_id = winner_response.post_id.clone();
+            let price = winner_response.price;
+            let promise_id = winner_response.promise_id.clone();
+
+            // Generate promise_id if not present (for fullpost, it's optional but we'll generate one)
+            let final_promise_id = promise_id.or_else(|| {
+                Some(format!(
+                    "PROMISE_{}",
+                    hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
+                ))
+            });
+
+            // Update lead in database
+            sqlx::query(
+                "UPDATE leads SET campaign_id = $1, buyer_id = $2, promise_id = $3, post_id = $4, status = $5, updated_at = now() WHERE uuid = $6",
+            )
+            .bind(winner_campaign_id)
+            .bind(winner_campaign.buyer_id)
+            .bind(&final_promise_id)
+            .bind(&post_id)
+            .bind(&LeadStatus::Sold)
+            .bind(self.lead.uuid)
+            .execute(pool.as_ref())
+            .await?;
+
+            // Persist buyer responses asynchronously
+            for (resp, campaign_id, _) in responses {
+                let pool_clone = pool.as_ref().clone();
+                let lead_id_val = self.lead.uuid;
+                let campaign_id_val = campaign_id;
+                let resp_json =
+                    serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}));
+                let payload_owned = resp_json;
+                let ping_owned: Option<String> = None;
+                let post_owned = resp.post_id.clone();
+                let buyer_id_owned = campaigns
+                    .iter()
+                    .find(|c| c.id == campaign_id)
+                    .map(|c| c.buyer_id);
+
+                let handle = tokio::spawn(async move {
+                    PingTreeRouter::persist_buyer_response_with_retry(
+                        pool_clone,
+                        lead_id_val,
+                        ping_owned,
+                        post_owned,
+                        buyer_id_owned,
+                        campaign_id_val,
+                        payload_owned,
+                    )
+                    .await;
+                });
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await {
+                        tracing::error!("Persistence task panicked: {:?}", e);
+                    }
+                });
+            }
+
             #[cfg(feature = "sentry")]
             {
                 let total_time_ms = start_time.elapsed().as_millis() as u64;
@@ -820,22 +1104,16 @@ impl PingTreeRouter {
                 });
             }
 
-            self.update_lead_status(
-                pool.as_ref(),
-                LeadStatus::Error,
-                Some("Fullpost strategy not yet implemented"),
-            )
-            .await?;
             Ok(RoutingResult {
-                success: false,
-                status: "error".to_string(),
-                error: Some("Fullpost strategy not yet implemented for ping trees".to_string()),
-                promise_id: None,
+                success: true,
+                status: "sold".to_string(),
+                error: None,
+                promise_id: final_promise_id,
                 ping_id: None,
-                post_id: None,
-                price: None,
-                campaign_id: None,
-                buyer_id: None,
+                post_id,
+                price,
+                campaign_id: Some(winner_campaign_id),
+                buyer_id: Some(winner_campaign.buyer_id),
             })
         }
     }
@@ -1010,10 +1288,10 @@ pub fn select_winner_for_test(
 fn select_winner(
     responses: Vec<&(BuyerResponse, Uuid, Option<i32>)>,
 ) -> (BuyerResponse, Uuid, Option<i32>) {
-    // Sort by price (descending), then by priority (ascending)
+    // Sort by bid (descending) for ping auctions, then by priority (ascending)
     let mut sorted: Vec<_> = responses
         .iter()
-        .filter(|(resp, _, _)| resp.price.is_some() && resp.price.unwrap_or(0.0) > 0.0)
+        .filter(|(resp, _, _)| resp.bid.is_some() && resp.bid.unwrap_or(0.0) > 0.0)
         .collect();
 
     if sorted.is_empty() {
@@ -1025,14 +1303,14 @@ fn select_winner(
         panic!("No responses provided to select_winner");
     }
 
-    // Sort by price descending, then by priority ascending
+    // Sort by bid descending, then by priority ascending
     sorted.sort_by(|a, b| {
-        let price_a = a.0.price.unwrap_or(0.0);
-        let price_b = b.0.price.unwrap_or(0.0);
+        let bid_a = a.0.bid.unwrap_or(0.0);
+        let bid_b = b.0.bid.unwrap_or(0.0);
 
-        match price_b.partial_cmp(&price_a) {
+        match bid_b.partial_cmp(&bid_a) {
             Some(std::cmp::Ordering::Equal) => {
-                // Same price, compare priorities (lower = higher priority)
+                // Same bid, compare priorities (lower = higher priority)
                 let pri_a = a.2.unwrap_or(i32::MAX);
                 let pri_b = b.2.unwrap_or(i32::MAX);
                 pri_a.cmp(&pri_b)
@@ -1083,6 +1361,8 @@ mod tests {
     use proptest::prelude::*;
 
     fn create_buyer_response(success: bool, price: Option<f64>, status: &str) -> BuyerResponse {
+        // For ping auctions, use bid; for post auctions, use price
+        // Since select_winner filters by bid, we need to set bid for ping auction tests
         BuyerResponse {
             success,
             status: status.to_string(),
@@ -1092,6 +1372,7 @@ mod tests {
             ping_id: None,
             post_id: None,
             price,
+            bid: price, // Use price as bid for ping auction tests
         }
     }
 

@@ -3,13 +3,12 @@
 #![allow(dead_code)]
 
 use axum::{
-    extract::{Extension, State},
+    extract::State,
     http::{header::HeaderMap, StatusCode},
     response::Json,
     routing::post,
     Router,
 };
-use leadsnebula_core::models::publisher::Publisher;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -64,7 +63,8 @@ pub struct PulsarResponse {
     pub ping_id: Option<String>,
     pub post_id: Option<String>,
     pub promise_id: Option<String>,
-    pub price: Option<u32>,
+    pub price: Option<u32>, // For post responses
+    pub bid: Option<u32>,   // For ping responses
     pub message: Option<String>,
     pub error: Option<String>,
     pub reason: Option<String>,
@@ -77,7 +77,6 @@ pub fn pulsar_routes() -> Router<AppState> {
 async fn handle_pulsar_lead(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Extension(_publisher): Extension<Publisher>,
     Json(payload): Json<PulsarLeadRequest>,
 ) -> Result<Json<PulsarResponse>, StatusCode> {
     // Extract buyer_id from internal header
@@ -108,6 +107,7 @@ async fn handle_pulsar_lead(
             post_id: None,
             promise_id: None,
             price: None,
+            bid: None,
             message: None,
             error: Some("Invalid request_type. Must be 'ping', 'post', or 'fullpost'".to_string()),
             reason: None,
@@ -150,6 +150,7 @@ async fn handle_ping(
             post_id: None,
             promise_id: None,
             price: None,
+            bid: None,
             message: Some("Lead did not meet qualification requirements".to_string()),
             error: Some("Lead rejected by qualification rules".to_string()),
             reason: Some("Qualification check failed".to_string()),
@@ -177,7 +178,8 @@ async fn handle_ping(
         ping_id: Some(ping_id),
         post_id: None,
         promise_id: Some(promise_id),
-        price: Some((rand::random::<u32>() % 200 + 100) as u32),
+        price: None, // Ping responses don't have price
+        bid: Some((rand::random::<u32>() % 200 + 100) as u32), // Ping responses have bid
         message: Some("Lead accepted for ping".to_string()),
         error: None,
         reason: None,
@@ -215,6 +217,7 @@ async fn handle_post(
             post_id: None,
             promise_id: Some(promise_id),
             price: None,
+            bid: None,
             message: Some(format!(
                 "The promise_id '{}' was already used for a sold lead and cannot be reused.",
                 promise_id_for_message
@@ -235,6 +238,7 @@ async fn handle_post(
             post_id: None,
             promise_id: Some(promise_id),
             price: None,
+            bid: None,
             message: Some("Lead did not meet qualification requirements".to_string()),
             error: Some("Lead rejected by qualification rules".to_string()),
             reason: Some("Qualification check failed".to_string()),
@@ -268,6 +272,7 @@ async fn handle_post(
         post_id: Some(post_id),
         promise_id: Some(promise_id),
         price: Some(rand::random::<u32>() % 200 + 100),
+        bid: None, // Post responses don't have bid
         message: Some("Lead accepted and sold".to_string()),
         error: None,
         reason: None,
@@ -311,6 +316,7 @@ async fn handle_fullpost(
         post_id: Some(post_id),
         promise_id: Some(promise_id),
         price: Some(rand::random::<u32>() % 200 + 100),
+        bid: None, // Fullpost responses have price, not bid
         message: Some("Lead accepted and sold via fullpost".to_string()),
         error: None,
         reason: None,
