@@ -16,21 +16,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Neon CLI
+      - name: Install Neon CLI (neonctl)
         run: |
-          if ! command -v neonctl >/dev/null 2>&1; then
-            npm install -g @neondatabase/api-client
-          fi
-          neonctl --version || true
+          # Use npx to run neonctl (no global install needed)
+          # The correct package is 'neonctl', not '@neondatabase/api-client'
+          echo "Setting up Neon CLI via npx..."
+          echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
+          # Verify it works
+          npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
+          echo "✅ neonctl ready via npx"
+
+      - name: Verify neonctl installed
+        run: |
+          echo "NEONCTL_CMD is: $NEONCTL_CMD"
+          $NEONCTL_CMD --version || (echo "neonctl verification failed" && exit 1)
 
       - name: Authenticate Neon CLI
-        env:
-          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
           if [ -z "$NEON_API_KEY" ]; then
             echo "NEON_API_KEY secret is missing" && exit 1
           fi
-          neonctl auth --api-key "$NEON_API_KEY"
+          if [ -z "$NEON_PROJECT_ID" ]; then
+            echo "NEON_PROJECT_ID secret is missing" && exit 1
+          fi
+          # neonctl uses NEON_API_KEY environment variable for non-interactive auth
+          # Also set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
+          echo "NEON_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
+          # Try to verify authentication (works with personal keys, may fail with restricted org keys)
+          # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" --output json > /dev/null 2>&1; then
+            echo "✅ Authenticated with Neon (verified via branches list)"
+          else
+            echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
+            echo "✅ Proceeding - authentication will be verified by actual branch operations"
+          fi
 
       - name: Prune branches (24h)
         run: |

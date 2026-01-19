@@ -28,8 +28,11 @@ fi
 require() { if [ -z "${!1-}" ]; then echo "Required env var $1 is not set" >&2; exit 2; fi }
 require NEONCTL_API_KEY
 
+# Use NEONCTL_CMD if set (from workflow), otherwise use npx --yes neonctl
+NEONCTL_CMD="${NEONCTL_CMD:-npx --yes neonctl}"
+
 echo "Listing branches for project $PROJECT_ID..."
-branches=$(neonctl branches list --project "$PROJECT_ID" --format json)
+branches=$($NEONCTL_CMD branches list --project "$PROJECT_ID" --api-key "$NEONCTL_API_KEY" --format json)
 
 # Use jq if available, otherwise print branches and exit
 if command -v jq >/dev/null 2>&1; then
@@ -52,7 +55,7 @@ if command -v jq >/dev/null 2>&1; then
   echo "Deleting CI branches older than $OLDER_THAN..."
   echo "$CI_BRANCHES" | while IFS='|' read -r name created; do
     echo "Deleting branch $name (created at $created)"
-    neonctl branches delete "$name" --project "$PROJECT_ID" || echo "Failed to delete $name (may already be deleted)"
+    $NEONCTL_CMD branches delete "$name" --project "$PROJECT_ID" --api-key "$NEONCTL_API_KEY" || echo "Failed to delete $name (may already be deleted)"
   done
   
   echo "Pruning complete"

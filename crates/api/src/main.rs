@@ -181,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
                                     axum::http::header::AUTHORIZATION,
                                     axum::http::header::CONTENT_TYPE,
                                     axum::http::HeaderName::from_static("x-api-key"),
+                                    axum::http::HeaderName::from_static("x-hmac-signature"),
                                 ])
                                 .expose_headers(tower_http::cors::Any),
                         ),
@@ -209,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
                                     axum::http::header::AUTHORIZATION,
                                     axum::http::header::CONTENT_TYPE,
                                     axum::http::HeaderName::from_static("x-api-key"),
+                                    axum::http::HeaderName::from_static("x-hmac-signature"),
                                 ])
                                 .expose_headers(tower_http::cors::Any),
                         ),
@@ -234,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                                     axum::http::header::AUTHORIZATION,
                                     axum::http::header::CONTENT_TYPE,
                                     axum::http::HeaderName::from_static("x-api-key"),
+                                    axum::http::HeaderName::from_static("x-hmac-signature"),
                                 ])
                                 .expose_headers(tower_http::cors::Any),
                         ),
