@@ -5,6 +5,7 @@ use crate::models::{
     campaign::Campaign,
     lead::Lead,
 };
+use crate::services::auction_timing::AuctionTiming;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use reqwest::header::HeaderMap;
@@ -12,6 +13,12 @@ use reqwest::Client;
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
+        .http2_prior_knowledge() // Enable HTTP/2
+        .pool_max_idle_per_host(10) // Connection pooling
+        .pool_idle_timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(30)) // Request timeout
+        .connect_timeout(Duration::from_secs(5)) // Connection timeout
+        .tcp_keepalive(Duration::from_secs(60))
         .build()
         .expect("Failed to build global HTTP client")
 });
@@ -117,6 +124,16 @@ impl BuyerRouter {
         });
 
         // Send HTTP request - for internal buyers, no API key needed
+        let mut timing = AuctionTiming::new();
+        let buyer_ping_sent_stage = timing.start_stage(
+            "buyer_ping_sent",
+            serde_json::json!({
+                "buyer_id": campaign.buyer_id.to_string(),
+                "campaign_id": campaign.id.to_string(),
+                "endpoint": endpoint.clone()
+            }),
+        );
+
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -134,6 +151,7 @@ impl BuyerRouter {
                 .map_err(|e| anyhow::anyhow!("Invalid buyer ID format: {}", e))?,
         );
 
+        let request_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -143,8 +161,30 @@ impl BuyerRouter {
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
 
+        let request_duration_ms = request_start.elapsed().as_millis() as u64;
+        timing.complete_stage(
+            buyer_ping_sent_stage,
+            Some(serde_json::json!({
+                "request_duration_ms": request_duration_ms,
+                "status_code": response.status().as_u16()
+            })),
+        );
+
         // Parse response
-        self.parse_buyer_response(response, "ping").await
+        let buyer_ping_response_stage =
+            timing.start_stage("buyer_ping_response", serde_json::json!({}));
+        let result = self.parse_buyer_response(response, "ping").await;
+        timing.complete_stage(
+            buyer_ping_response_stage,
+            Some(serde_json::json!({
+                "success": result.as_ref().map(|r| r.success).unwrap_or(false),
+                "has_bid": result.as_ref().map(|r| r.bid.is_some()).unwrap_or(false)
+            })),
+        );
+
+        timing.log_summary(&format!("buyer_{}", campaign.buyer_id));
+
+        result
     }
 
     async fn route_post(&self, campaign: &Campaign) -> Result<BuyerResponse> {
@@ -184,6 +224,16 @@ impl BuyerRouter {
         });
 
         // Send HTTP request - for internal buyers, no API key needed
+        let mut timing = AuctionTiming::new();
+        let buyer_post_sent_stage = timing.start_stage(
+            "buyer_post_sent",
+            serde_json::json!({
+                "buyer_id": campaign.buyer_id.to_string(),
+                "campaign_id": campaign.id.to_string(),
+                "endpoint": endpoint.clone()
+            }),
+        );
+
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -201,6 +251,7 @@ impl BuyerRouter {
                 .map_err(|e| anyhow::anyhow!("Invalid buyer ID format: {}", e))?,
         );
 
+        let request_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -210,8 +261,30 @@ impl BuyerRouter {
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
 
+        let request_duration_ms = request_start.elapsed().as_millis() as u64;
+        timing.complete_stage(
+            buyer_post_sent_stage,
+            Some(serde_json::json!({
+                "request_duration_ms": request_duration_ms,
+                "status_code": response.status().as_u16()
+            })),
+        );
+
         // Parse response
-        self.parse_buyer_response(response, "post").await
+        let buyer_post_response_stage =
+            timing.start_stage("buyer_post_response", serde_json::json!({}));
+        let result = self.parse_buyer_response(response, "post").await;
+        timing.complete_stage(
+            buyer_post_response_stage,
+            Some(serde_json::json!({
+                "success": result.as_ref().map(|r| r.success).unwrap_or(false),
+                "has_price": result.as_ref().map(|r| r.price.is_some()).unwrap_or(false)
+            })),
+        );
+
+        timing.log_summary(&format!("buyer_{}", campaign.buyer_id));
+
+        result
     }
 
     async fn route_fullpost(&self, campaign: &Campaign) -> Result<BuyerResponse> {

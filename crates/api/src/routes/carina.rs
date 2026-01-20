@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::AppState;
+use leadsnebula_core::services::auction_timing::AuctionTiming;
+use leadsnebula_core::services::diagnostic_metrics::DiagnosticMetrics;
+use leadsnebula_core::services::ssm_key_cache::get_ssm_parameter_cached;
 
 fn map_error_to_user(err_text: &str) -> (String, String) {
     let lower = err_text.to_lowercase();
@@ -163,6 +166,18 @@ async fn create_lead(
     Extension(publisher): Extension<Publisher>,
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
+    // Initialize timing and diagnostic metrics for this request
+    let mut timing = AuctionTiming::new();
+    let metrics = DiagnosticMetrics::new();
+
+    let lead_received_stage = timing.start_stage(
+        "lead_received",
+        serde_json::json!({
+            "publisher_id": publisher.id.to_string(),
+            "vertical": payload.lead.vertical.clone()
+        }),
+    );
+
     let request_level_verbose = payload.verbose.unwrap_or(false);
     let lead_data = payload.lead;
     let request_type = lead_data
@@ -177,15 +192,35 @@ async fn create_lead(
         lead_data.verbose.unwrap_or(false)
     };
 
+    timing.complete_stage(lead_received_stage, None);
+
     // Validate vertical
+    let pre_checks_stage = timing.start_stage("pre_checks", serde_json::json!({}));
+    let query_start = std::time::Instant::now();
     let vertical = match leadsnebula_core::models::vertical::Vertical::find_by_slug(
         &state.db_pool,
         &lead_data.vertical,
     )
     .await
     {
-        Ok(Some(v)) => v,
+        Ok(Some(v)) => {
+            let duration_ms = query_start.elapsed().as_millis() as u64;
+            metrics.record_query(duration_ms);
+            tracing::debug!("DB query [find_by_slug]: duration={}ms", duration_ms);
+            timing.complete_stage(
+                pre_checks_stage,
+                Some(serde_json::json!({
+                    "vertical_found": true,
+                    "query_count": 1
+                })),
+            );
+            v
+        }
         Ok(None) => {
+            let duration_ms = query_start.elapsed().as_millis() as u64;
+            metrics.record_query(duration_ms);
+            tracing::debug!("DB query [find_by_slug]: duration={}ms", duration_ms);
+            metrics.log_summary("carina_invalid_vertical");
             return Ok(Json(LeadResponse {
                 status: StatusNode {
                     success: false,
@@ -216,7 +251,11 @@ async fn create_lead(
             }));
         }
         Err(e) => {
+            let duration_ms = query_start.elapsed().as_millis() as u64;
+            metrics.record_query(duration_ms);
+            tracing::debug!("DB query [find_by_slug]: duration={}ms", duration_ms);
             tracing::error!("Database error finding vertical: {}", e);
+            metrics.log_summary("carina_vertical_lookup_error");
             let (message, technical) = map_error_to_user(&e.to_string());
             return Ok(Json(LeadResponse {
                 status: StatusNode {
@@ -616,8 +655,12 @@ async fn create_lead(
                 );
                 let mut enc_req_opt: Option<String> = None;
                 let mut enc_resp_opt: Option<String> = None;
-                if let Ok(Some(det_key)) = state.ssm.get_parameter(&det_path2, true).await {
-                    if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path2, true).await {
+                if let Ok(Some(det_key)) =
+                    get_ssm_parameter_cached(&state.ssm, &det_path2, true).await
+                {
+                    if let Ok(Some(salt)) =
+                        get_ssm_parameter_cached(&state.ssm, &salt_path2, true).await
+                    {
                         let derived =
                             leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
                                 &det_key, &salt,
@@ -682,8 +725,8 @@ async fn create_lead(
                                 let env_norm = leadsnebula_core::normalize_env_for_ssm(&env_clone).to_string();
                                 let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
                                 let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
-                                if let Ok(Some(det_key)) = ssm_clone.get_parameter(&det_path, true).await {
-                                    if let Ok(Some(salt)) = ssm_clone.get_parameter(&salt_path, true).await {
+                                if let Ok(Some(det_key)) = get_ssm_parameter_cached(&ssm_clone, &det_path, true).await {
+                                    if let Ok(Some(salt)) = get_ssm_parameter_cached(&ssm_clone, &salt_path, true).await {
                                         let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
                                         for r in rows {
                                             let id: i64 = r.get("id");
@@ -804,106 +847,127 @@ async fn create_lead(
     };
 
     // Pre-insert checks: determine buyer_id and campaign_id to satisfy NOT NULL constraints
+    // OPTIMIZED: Single query combining all pre-checks (reduces 4-6 queries to 1)
     let mut preproblems: Vec<String> = Vec::new();
     let mut buyer_id_opt: Option<uuid::Uuid> = None;
     let mut campaign_id_opt: Option<uuid::Uuid> = None;
 
-    // If a campaign_token was provided, prefer that campaign
-    if let Some(ref token) = lead_data.campaign_token {
-        match sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM campaigns WHERE campaign_token = $1 AND deleted_at IS NULL LIMIT 1",
-        )
-        .bind(token)
-        .fetch_optional(&*state.db_pool)
-        .await
-        {
-            Ok(Some(cid)) => campaign_id_opt = Some(cid),
-            Ok(None) => {
-                preproblems.push("No campaign configured for this publisher/vertical".to_string())
-            }
-            Err(e) => {
-                tracing::error!("Error checking campaigns by token: {}", e);
-                preproblems.push("Failed to verify campaigns due to server error".to_string());
-            }
-        }
-    }
+    let query_start = std::time::Instant::now();
+    let campaign_token = lead_data.campaign_token.as_deref().unwrap_or("");
 
-    // If campaign not provided/found, try to find any campaign linked to buyers for this vertical
-    if campaign_id_opt.is_none() {
-        match sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM campaigns WHERE buyer_id IN (SELECT id FROM buyers WHERE vertical_id = $1 AND deleted_at IS NULL) AND deleted_at IS NULL LIMIT 1",
-        )
-        .bind(vertical.id)
-        .fetch_optional(&*state.db_pool)
-        .await
-        {
-            Ok(Some(cid)) => campaign_id_opt = Some(cid),
-            Ok(None) => {
-                // don't add problem yet; we'll surface buyer/campaign problems after buyer check
-            }
-            Err(e) => {
-                tracing::error!("Error checking campaigns fallback: {}", e);
-                preproblems.push("Failed to verify campaigns due to server error".to_string());
-            }
-        }
-    }
-
-    // Determine buyer: prefer campaign's buyer if we have a campaign, otherwise find any buyer for the vertical
-    if let Some(cid) = campaign_id_opt {
-        match sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT buyer_id FROM campaigns WHERE id = $1 LIMIT 1",
-        )
-        .bind(cid)
-        .fetch_one(&*state.db_pool)
-        .await
-        {
-            Ok(bid) => buyer_id_opt = Some(bid),
-            Err(e) => {
-                tracing::error!("Error resolving buyer from campaign: {}", e);
-                preproblems.push("Failed to resolve buyer for campaign".to_string());
-            }
-        }
-    } else {
-        match sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM buyers WHERE vertical_id = $1 AND deleted_at IS NULL LIMIT 1",
-        )
-        .bind(vertical.id)
-        .fetch_optional(&*state.db_pool)
-        .await
-        {
-            Ok(Some(bid)) => buyer_id_opt = Some(bid),
-            Ok(None) => {
-                preproblems.push("No buyer configured for this publisher/vertical".to_string())
-            }
-            Err(e) => {
-                tracing::error!("Error checking buyers: {}", e);
-                preproblems.push("Failed to verify buyers due to server error".to_string());
-            }
-        }
-    }
-
-    // Attempt to check ping tree presence (best-effort; table may not exist in all installs)
-    // Ping tree presence is helpful but not mandatory here; routing will return a clear error if absent
-    // Updated to use ping_tree_publishers join table instead of publisher_id column
-    match sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT pt.id FROM ping_trees pt 
-         INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id 
-         WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL LIMIT 1",
+    // Enhanced single query combining all pre-checks (avoids fallback query)
+    let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+        r#"
+        SELECT 
+            c.id AS campaign_id,
+            COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
+            EXISTS(
+                SELECT 1 FROM ping_trees pt
+                INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id
+                WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL
+            ) AS has_ping_tree
+        FROM (VALUES (true)) AS dummy
+        LEFT JOIN campaigns c ON (
+            (c.campaign_token = $3 AND $3 != '') OR 
+            (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = $4 AND deleted_at IS NULL))
+        ) AND c.deleted_at IS NULL
+        LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = $4 AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+        LIMIT 1
+        "#,
     )
     .bind(publisher.id)
     .bind(vertical.slug.clone())
+    .bind(campaign_token)
+    .bind(vertical.id)
     .fetch_optional(&*state.db_pool)
-    .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            tracing::info!("No ping tree configured for this publisher/vertical; routing may fail")
+    .await;
+
+    let duration_ms = query_start.elapsed().as_millis() as u64;
+    metrics.record_query(duration_ms);
+    tracing::debug!("DB query [prechecks_combined]: duration={}ms", duration_ms);
+
+    timing.complete_stage(
+        pre_checks_stage,
+        Some(serde_json::json!({
+            "query_count": 1,
+            "has_campaign": campaign_id_opt.is_some(),
+            "has_buyer": buyer_id_opt.is_some()
+        })),
+    );
+
+    match result {
+        Ok(Some((campaign_id, effective_buyer_id, has_ping_tree))) => {
+            campaign_id_opt = campaign_id;
+            buyer_id_opt = effective_buyer_id;
+
+            // Log ping tree status
+            if !has_ping_tree {
+                tracing::info!(
+                    "No ping tree configured for this publisher/vertical; routing may fail"
+                );
+            }
+
+            // Validate results and add problems if needed
+            if campaign_id_opt.is_none() && lead_data.campaign_token.is_some() {
+                preproblems.push("No campaign configured for this publisher/vertical".to_string());
+            }
+            if buyer_id_opt.is_none() {
+                preproblems.push("No buyer configured for this publisher/vertical".to_string());
+            }
         }
-        Err(e) => tracing::debug!("Ping tree check skipped or failed: {}", e),
+        Ok(None) => {
+            // No results - try fallback buyer lookup
+            let fallback_start = std::time::Instant::now();
+            match sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM buyers WHERE vertical_id = $1 AND deleted_at IS NULL LIMIT 1",
+            )
+            .bind(vertical.id)
+            .fetch_optional(&*state.db_pool)
+            .await
+            {
+                Ok(Some(bid)) => {
+                    let fallback_duration_ms = fallback_start.elapsed().as_millis() as u64;
+                    metrics.record_query(fallback_duration_ms);
+                    tracing::debug!(
+                        "DB query [buyer_fallback]: duration={}ms",
+                        fallback_duration_ms
+                    );
+                    buyer_id_opt = Some(bid);
+                }
+                Ok(None) => {
+                    let fallback_duration_ms = fallback_start.elapsed().as_millis() as u64;
+                    metrics.record_query(fallback_duration_ms);
+                    tracing::debug!(
+                        "DB query [buyer_fallback]: duration={}ms",
+                        fallback_duration_ms
+                    );
+                    preproblems.push("No buyer configured for this publisher/vertical".to_string());
+                }
+                Err(e) => {
+                    let fallback_duration_ms = fallback_start.elapsed().as_millis() as u64;
+                    metrics.record_query(fallback_duration_ms);
+                    tracing::debug!(
+                        "DB query [buyer_fallback]: duration={}ms",
+                        fallback_duration_ms
+                    );
+                    tracing::error!("Error checking buyers: {}", e);
+                    preproblems.push("Failed to verify buyers due to server error".to_string());
+                }
+            }
+
+            if campaign_id_opt.is_none() && lead_data.campaign_token.is_some() {
+                preproblems.push("No campaign configured for this publisher/vertical".to_string());
+            }
+        }
+        Err(e) => {
+            tracing::error!("Error in combined pre-check query: {}", e);
+            preproblems.push("Failed to verify configuration due to server error".to_string());
+        }
     }
 
     if !preproblems.is_empty() {
         let message = preproblems.join("\n");
+        metrics.log_summary("carina_precheck_failed");
         return Ok(Json(LeadResponse {
             status: StatusNode {
                 success: false,
@@ -972,11 +1036,15 @@ async fn create_lead(
         env_norm
     );
 
-    // Get deterministic key and salt from SSM for PII encryption
-    let pii_encryption_key = if let Ok(Some(det_key)) =
-        state.ssm.get_parameter(&det_path, true).await
-    {
-        if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path, true).await {
+    // Get deterministic key and salt from SSM for PII encryption (parallelized)
+    let encryption_setup_stage = timing.start_stage("encryption_setup", serde_json::json!({}));
+    let (det_key_result, salt_result) = tokio::join!(
+        get_ssm_parameter_cached(&state.ssm, &det_path, true),
+        get_ssm_parameter_cached(&state.ssm, &salt_path, true)
+    );
+
+    let pii_encryption_key = if let Ok(Some(det_key)) = det_key_result {
+        if let Ok(Some(salt)) = salt_result {
             Some(
                 leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
                     &det_key, &salt,
@@ -993,6 +1061,13 @@ async fn create_lead(
         );
         None
     };
+
+    timing.complete_stage(
+        encryption_setup_stage,
+        Some(serde_json::json!({
+            "encryption_available": pii_encryption_key.is_some()
+        })),
+    );
 
     // Encrypt PII fields
     let encrypt_pii = |value: Option<String>| -> Option<String> {
@@ -1037,6 +1112,7 @@ async fn create_lead(
         request_type
     );
 
+    let lead_insertion_stage = timing.start_stage("lead_insertion", serde_json::json!({}));
     let result = sqlx::query(
         r#"
         INSERT INTO leads (
@@ -1089,8 +1165,23 @@ async fn create_lead(
     .await;
 
     let lead_uuid = match result {
-        Ok(row) => row.get::<uuid::Uuid, _>(0),
+        Ok(row) => {
+            let uuid_val = row.get::<uuid::Uuid, _>(0);
+            timing.complete_stage(
+                lead_insertion_stage,
+                Some(serde_json::json!({
+                    "lead_uuid": uuid_val.to_string()
+                })),
+            );
+            uuid_val
+        }
         Err(e) => {
+            timing.complete_stage(
+                lead_insertion_stage,
+                Some(serde_json::json!({
+                    "error": e.to_string()
+                })),
+            );
             tracing::error!("Database error creating lead: {}", e);
             tracing::error!("Lead data: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}", 
                 event_id, lead_id, publisher.id, vertical.id, request_type);
@@ -1255,6 +1346,13 @@ async fn create_lead(
     };
 
     // Route the lead through ping tree
+    let routing_start_stage = timing.start_stage(
+        "routing_start",
+        serde_json::json!({
+            "request_type": request_type.clone()
+        }),
+    );
+
     let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
         lead,
         publisher.id,
@@ -1272,6 +1370,14 @@ async fn create_lead(
     {
         Ok(routing_result) => {
             let processing_time_ms = start_processing.elapsed().as_millis() as u64;
+            timing.complete_stage(
+                routing_start_stage,
+                Some(serde_json::json!({
+                    "routing_duration_ms": processing_time_ms,
+                    "success": routing_result.success,
+                    "status": routing_result.status.clone()
+                })),
+            );
             // Determine a clearer message and include price when available
             // Helper to round to 2 decimals
             fn round2(v: Option<f64>) -> Option<f64> {
@@ -1426,8 +1532,8 @@ async fn create_lead(
                                 let env_norm = leadsnebula_core::normalize_env_for_ssm(&env_clone).to_string();
                                 let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
                                 let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
-                                if let Ok(Some(det_key)) = ssm_clone.get_parameter(&det_path, true).await {
-                                    if let Ok(Some(salt)) = ssm_clone.get_parameter(&salt_path, true).await {
+                                if let Ok(Some(det_key)) = get_ssm_parameter_cached(&ssm_clone, &det_path, true).await {
+                                    if let Ok(Some(salt)) = get_ssm_parameter_cached(&ssm_clone, &salt_path, true).await {
                                         let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
                                         for r in rows {
                                             let id: i64 = r.get("id");
@@ -1498,8 +1604,12 @@ async fn create_lead(
                 );
                 let mut enc_req_opt_fp: Option<String> = None;
                 let mut enc_resp_opt_fp: Option<String> = None;
-                if let Ok(Some(det_key)) = state.ssm.get_parameter(&det_path_fp, true).await {
-                    if let Ok(Some(salt)) = state.ssm.get_parameter(&salt_path_fp, true).await {
+                if let Ok(Some(det_key)) =
+                    get_ssm_parameter_cached(&state.ssm, &det_path_fp, true).await
+                {
+                    if let Ok(Some(salt)) =
+                        get_ssm_parameter_cached(&state.ssm, &salt_path_fp, true).await
+                    {
                         let derived =
                             leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
                                 &det_key, &salt,
@@ -1547,6 +1657,10 @@ async fn create_lead(
                 };
             }
 
+            // Log diagnostic summary and timing before returning
+            metrics.log_summary("carina_lead_creation");
+            timing.log_summary(&lead_id);
+
             Ok(Json(LeadResponse {
                 status: StatusNode {
                     success: routing_result.success,
@@ -1568,6 +1682,15 @@ async fn create_lead(
             }))
         }
         Err(e) => {
+            // Log diagnostic summary and timing before returning error
+            timing.complete_stage(
+                routing_start_stage,
+                Some(serde_json::json!({
+                    "error": e.to_string()
+                })),
+            );
+            metrics.log_summary("carina_lead_creation_error");
+            timing.log_summary(&lead_id);
             tracing::error!("Routing error: {}", e);
             let (message, technical) = map_error_to_user(&e.to_string());
             Ok(Json(LeadResponse {

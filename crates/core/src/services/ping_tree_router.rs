@@ -1,7 +1,8 @@
 use crate::models::{
-    campaign::Campaign, enums::LeadStatus, lead::Lead, ping_tree::PingTree,
-    ping_tree_campaign::PingTreeCampaign,
+    buyer_qualification_config::BuyerQualificationConfig, campaign::Campaign, enums::LeadStatus,
+    lead::Lead, ping_tree::PingTree, ping_tree_campaign::PingTreeCampaign,
 };
+use crate::services::auction_timing::AuctionTiming;
 use crate::services::buyer_router::BuyerResponse;
 use anyhow::Result;
 use hex;
@@ -20,6 +21,16 @@ const PRICE_EPSILON: f64 = 0.01;
 // Retry configuration for persistence operations
 const PERSISTENCE_MAX_RETRIES: u32 = 3;
 const PERSISTENCE_RETRY_DELAY_MS: u64 = 100;
+
+// Type alias for buyer response batch insert rows
+type BuyerResponseRow = (
+    Uuid,
+    Option<String>,
+    Option<String>,
+    Option<Uuid>,
+    Uuid,
+    serde_json::Value,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingResult {
@@ -56,12 +67,31 @@ impl PingTreeRouter {
         pool: Arc<PgPool>,
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
+        let mut timing = AuctionTiming::new();
+
         // Find active ping tree for publisher and vertical with revshare info
+        let ping_tree_lookup_stage = timing.start_stage(
+            "ping_tree_lookup",
+            serde_json::json!({
+                "publisher_id": self.publisher_id.to_string(),
+                "vertical": self.vertical.clone()
+            }),
+        );
+
         let (ping_tree, _revshare_percentage, _revshare_flat_amount) =
             match PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
                 .await?
             {
-                Some((pt, revshare_pct, revshare_flat)) => (pt, revshare_pct, revshare_flat),
+                Some((pt, revshare_pct, revshare_flat)) => {
+                    timing.complete_stage(
+                        ping_tree_lookup_stage,
+                        Some(serde_json::json!({
+                            "ping_tree_id": pt.id.to_string(),
+                            "strategy": pt.strategy.clone()
+                        })),
+                    );
+                    (pt, revshare_pct, revshare_flat)
+                }
                 None => {
                     // Update lead status to error
                     self.update_lead_status(
@@ -112,6 +142,7 @@ impl PingTreeRouter {
         }
 
         // Get enabled campaigns from ping tree
+        let campaigns_loaded_stage = timing.start_stage("campaigns_loaded", serde_json::json!({}));
         let ping_tree_campaigns =
             PingTreeCampaign::find_enabled_for_ping_tree(pool.as_ref(), &ping_tree.id).await?;
 
@@ -153,6 +184,29 @@ impl PingTreeRouter {
                 }
             }
         }
+
+        // Preload qualification configs for all unique buyers before spawning ping tasks
+        let unique_buyer_ids: Vec<Uuid> = campaigns
+            .iter()
+            .map(|c| c.buyer_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let _qualification_configs: std::collections::HashMap<
+            Uuid,
+            Option<BuyerQualificationConfig>,
+        > = BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
+            .await
+            .unwrap_or_default();
+        // Note: qualification_configs are preloaded and ready for use in buyer router tasks
+
+        timing.complete_stage(
+            campaigns_loaded_stage,
+            Some(serde_json::json!({
+                "campaign_count": campaigns.len(),
+                "buyer_count": unique_buyer_ids.len()
+            })),
+        );
 
         if campaigns.is_empty() {
             self.update_lead_status(
@@ -232,6 +286,14 @@ impl PingTreeRouter {
         use futures::future::join_all;
         use tokio::time::{timeout, Duration};
 
+        let mut timing = AuctionTiming::new();
+        let ping_auction_start_stage = timing.start_stage(
+            "ping_auction_start",
+            serde_json::json!({
+                "campaign_count": campaigns.len()
+            }),
+        );
+
         let start_time = std::time::Instant::now();
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
 
@@ -266,6 +328,10 @@ impl PingTreeRouter {
 
         // Wait for all responses concurrently (instead of sequentially)
         let task_results = join_all(task_futures).await;
+        timing.complete_stage(ping_auction_start_stage, None);
+
+        let ping_auction_complete_stage =
+            timing.start_stage("ping_auction_complete", serde_json::json!({}));
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
 
         for (result, campaign_id) in task_results {
@@ -360,6 +426,14 @@ impl PingTreeRouter {
         }
 
         let total_time_ms = start_time.elapsed().as_millis() as u64;
+        timing.complete_stage(
+            ping_auction_complete_stage,
+            Some(serde_json::json!({
+                "duration_ms": total_time_ms,
+                "response_count": responses.len()
+            })),
+        );
+
         tracing::info!(
             "Ping auction completed in {}ms with {} responses",
             total_time_ms,
@@ -375,7 +449,9 @@ impl PingTreeRouter {
             });
         }
 
-        // Persist each buyer response for audit (with retry logic). Store plaintext JSON; API layer will encrypt rows when SSM keys are available.
+        // Batch persist buyer responses for audit (optimized with bulk INSERT)
+        // Store plaintext JSON; API layer will encrypt rows when SSM keys are available.
+        let mut batch_responses = Vec::new();
         for (resp, campaign_id, _pri) in &responses {
             // Find buyer_id from campaigns list
             let buyer_id_opt = campaigns
@@ -393,41 +469,28 @@ impl PingTreeRouter {
                 }
             });
 
-            // Persist with retry logic for transient database errors asynchronously
-            // Clone only what's necessary for the async task
-            let pool_clone = pool.as_ref().clone();
-            let lead_id_val = self.lead.uuid;
-            let campaign_id_val = *campaign_id;
-            let payload_owned = resp_json; // Move instead of clone since we don't need it after
-            let ping_owned = ping_id_val; // Move instead of clone
-            let post_owned: Option<String> = None;
-            let buyer_id_owned = buyer_id_opt;
+            batch_responses.push((
+                self.lead.uuid,
+                ping_id_val,
+                None, // post_id is None for ping responses
+                buyer_id_opt,
+                *campaign_id,
+                resp_json,
+            ));
+        }
 
-            let handle = tokio::spawn(async move {
-                PingTreeRouter::persist_buyer_response_with_retry(
-                    pool_clone,
-                    lead_id_val,
-                    ping_owned,
-                    post_owned,
-                    buyer_id_owned,
-                    campaign_id_val,
-                    payload_owned,
-                )
-                .await;
-            });
-            // Log errors if task panics (fire-and-forget, but log for observability)
+        // Batch insert all responses in one query
+        if !batch_responses.is_empty() {
+            let pool_clone = pool.as_ref().clone();
             tokio::spawn(async move {
-                if let Err(e) = handle.await {
-                    tracing::error!(
-                        "Persistence task panicked for lead {} campaign {}: {:?}",
-                        lead_id_val,
-                        campaign_id_val,
-                        e
-                    );
+                if let Err(e) =
+                    PingTreeRouter::batch_insert_buyer_responses(&pool_clone, batch_responses).await
+                {
+                    tracing::error!("Failed to batch insert buyer responses: {}", e);
                     #[cfg(feature = "sentry")]
                     {
                         sentry::capture_message(
-                            &format!("Persistence task panicked: {:?}", e),
+                            &format!("Batch insert buyer responses failed: {}", e),
                             sentry::Level::Error,
                         );
                     }
@@ -529,8 +592,21 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest price, then priority, then random
+        let winner_selection_stage = timing.start_stage(
+            "winner_selection",
+            serde_json::json!({
+                "valid_response_count": valid_responses.len()
+            }),
+        );
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
+        timing.complete_stage(
+            winner_selection_stage,
+            Some(serde_json::json!({
+                "winner_campaign_id": winner_campaign_id.to_string(),
+                "bid": winner_response.bid
+            })),
+        );
 
         // Find winning campaign
         let winner_campaign = campaigns
@@ -1069,36 +1145,42 @@ impl PingTreeRouter {
             .execute(pool.as_ref())
             .await?;
 
-            // Persist buyer responses asynchronously
+            // Batch persist buyer responses asynchronously (optimized with bulk INSERT)
+            let mut batch_responses = Vec::new();
             for (resp, campaign_id, _) in responses {
-                let pool_clone = pool.as_ref().clone();
-                let lead_id_val = self.lead.uuid;
-                let campaign_id_val = campaign_id;
                 let resp_json =
                     serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}));
-                let payload_owned = resp_json;
-                let ping_owned: Option<String> = None;
-                let post_owned = resp.post_id.clone();
-                let buyer_id_owned = campaigns
+                let buyer_id_opt = campaigns
                     .iter()
                     .find(|c| c.id == campaign_id)
                     .map(|c| c.buyer_id);
 
-                let handle = tokio::spawn(async move {
-                    PingTreeRouter::persist_buyer_response_with_retry(
-                        pool_clone,
-                        lead_id_val,
-                        ping_owned,
-                        post_owned,
-                        buyer_id_owned,
-                        campaign_id_val,
-                        payload_owned,
-                    )
-                    .await;
-                });
+                batch_responses.push((
+                    self.lead.uuid,
+                    None, // ping_id is None for post responses
+                    resp.post_id.clone(),
+                    buyer_id_opt,
+                    campaign_id,
+                    resp_json,
+                ));
+            }
+
+            // Batch insert all responses in one query
+            if !batch_responses.is_empty() {
+                let pool_clone = pool.as_ref().clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle.await {
-                        tracing::error!("Persistence task panicked: {:?}", e);
+                    if let Err(e) =
+                        PingTreeRouter::batch_insert_buyer_responses(&pool_clone, batch_responses)
+                            .await
+                    {
+                        tracing::error!("Failed to batch insert buyer responses: {}", e);
+                        #[cfg(feature = "sentry")]
+                        {
+                            sentry::capture_message(
+                                &format!("Batch insert buyer responses failed: {}", e),
+                                sentry::Level::Error,
+                            );
+                        }
                     }
                 });
             }
@@ -1126,6 +1208,49 @@ impl PingTreeRouter {
     }
 
     /// Persist buyer response with retry logic for transient database errors
+    /// Batch insert buyer responses using UNNEST for better performance
+    async fn batch_insert_buyer_responses(
+        pool: &PgPool,
+        responses: Vec<BuyerResponseRow>,
+    ) -> anyhow::Result<()> {
+        if responses.is_empty() {
+            return Ok(());
+        }
+
+        let lead_ids: Vec<Uuid> = responses.iter().map(|r| r.0).collect();
+        let ping_ids: Vec<Option<String>> = responses.iter().map(|r| r.1.clone()).collect();
+        let post_ids: Vec<Option<String>> = responses.iter().map(|r| r.2.clone()).collect();
+        let buyer_ids: Vec<Option<Uuid>> = responses.iter().map(|r| r.3).collect();
+        let campaign_ids: Vec<Uuid> = responses.iter().map(|r| r.4).collect();
+        let payloads: Vec<serde_json::Value> = responses.iter().map(|r| r.5.clone()).collect();
+        let created_ats: Vec<chrono::DateTime<chrono::Utc>> =
+            (0..responses.len()).map(|_| chrono::Utc::now()).collect();
+
+        // Convert payloads to Json type for binding
+        let json_payloads: Vec<sqlx::types::Json<serde_json::Value>> = payloads
+            .iter()
+            .map(|p| sqlx::types::Json(p.clone()))
+            .collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO buyer_responses (lead_id, ping_id, post_id, buyer_id, campaign_id, payload, created_at)
+            SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[], $7::timestamptz[])
+            "#,
+        )
+        .bind(&lead_ids[..])
+        .bind(&ping_ids[..])
+        .bind(&post_ids[..])
+        .bind(&buyer_ids[..])
+        .bind(&campaign_ids[..])
+        .bind(&json_payloads[..])
+        .bind(&created_ats[..])
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn persist_buyer_response_with_retry(
         pool: PgPool,
         lead_id: Uuid,

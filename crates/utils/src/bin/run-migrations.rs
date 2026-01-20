@@ -1,10 +1,11 @@
 use anyhow::Result;
-use leadsnebula_core::services::database::create_pool;
 use leadsnebula_core::ssm::SsmService;
 use sqlx::migrate::Migrator;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 #[tokio::main]
@@ -43,7 +44,13 @@ async fn main() -> Result<()> {
             )
         })?;
 
-    let pool = create_pool(&database_url).await?;
+    // Use a simpler pool configuration for migrations (only need 1 connection)
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .min_connections(0) // Don't pre-establish connections for migrations
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&database_url)
+        .await?;
 
     info!("Running database migrations...");
 
@@ -132,15 +139,30 @@ async fn run_migrations(pool: &PgPool, migrations_dir: &Path, _test_mode: bool) 
 
                 // Extract and remove modified migration versions
                 if error_msg.contains("was previously applied but has been modified") {
-                    let modified_versions: Vec<i64> = error_msg
-                        .split("migration")
-                        .skip(1)
-                        .filter_map(|part| {
-                            part.split_whitespace()
-                                .next()
-                                .and_then(|s| s.parse::<i64>().ok())
-                        })
-                        .collect();
+                    // Try multiple patterns to extract version number
+                    let mut modified_versions: Vec<i64> = Vec::new();
+
+                    // Pattern 1: "migration 20250101000007 was previously applied"
+                    for part in error_msg.split("migration") {
+                        if let Some(version_str) = part.split_whitespace().next() {
+                            if let Ok(version) = version_str.parse::<i64>() {
+                                modified_versions.push(version);
+                                break; // Found it, no need to continue
+                            }
+                        }
+                    }
+
+                    // Pattern 2: Try regex-like extraction "migration <number>"
+                    if modified_versions.is_empty() {
+                        if let Some(start) = error_msg.find("migration ") {
+                            let rest = &error_msg[start + 10..]; // "migration " is 10 chars
+                            if let Some(end) = rest.find(' ') {
+                                if let Ok(version) = rest[..end].parse::<i64>() {
+                                    modified_versions.push(version);
+                                }
+                            }
+                        }
+                    }
 
                     for version in &modified_versions {
                         if let Err(e) =

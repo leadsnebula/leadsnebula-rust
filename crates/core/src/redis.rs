@@ -163,7 +163,7 @@ impl RedisClient {
         Ok(result)
     }
 
-    fn prefix_key(&self, key: &str) -> String {
+    pub fn prefix_key(&self, key: &str) -> String {
         format!("{}:{}", self.env, key)
     }
 

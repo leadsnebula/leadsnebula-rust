@@ -24,3 +24,42 @@ pub struct BuyerQualificationConfig {
 fn default_json_object() -> serde_json::Value {
     serde_json::json!({})
 }
+
+impl BuyerQualificationConfig {
+    /// Find qualification configs for multiple buyers in a single query
+    /// Returns a HashMap keyed by buyer_id for fast lookup
+    pub async fn find_by_buyer_ids(
+        pool: &sqlx::PgPool,
+        buyer_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Option<Self>>, sqlx::Error> {
+        if buyer_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let configs = sqlx::query_as::<_, BuyerQualificationConfig>(
+            r#"
+            SELECT * FROM buyer_qualification_configs
+            WHERE buyer_id = ANY($1) AND enabled = true AND is_active = true
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(buyer_ids)
+        .fetch_all(pool)
+        .await?;
+
+        // Group by buyer_id, taking the first (most recent) config per buyer
+        let mut result = std::collections::HashMap::new();
+        for buyer_id in buyer_ids {
+            result.insert(*buyer_id, None);
+        }
+        for config in configs {
+            result.entry(config.buyer_id).and_modify(|e| {
+                if e.is_none() {
+                    *e = Some(config.clone());
+                }
+            });
+        }
+
+        Ok(result)
+    }
+}

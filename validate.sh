@@ -301,12 +301,43 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                 sleep 5
             fi
             
+            # Run integration_auth test
             TEST_OUTPUT=$(cargo test --test integration_auth --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/test_output.log)
             TEST_EXIT_CODE=${PIPESTATUS[0]}
             
             if [ $TEST_EXIT_CODE -eq 0 ]; then
-                TEST_PASSED=true
-                echo "✅ Database integration tests OK"
+                # Run integration_publisher_crud test if it exists
+                if [ -f "crates/api/tests/integration_publisher_crud.rs" ] || [ -f "tests/integration_publisher_crud.rs" ]; then
+                    echo "   Running integration_publisher_crud tests..."
+                    PUB_CRUD_OUTPUT=$(cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee -a /tmp/test_output.log)
+                    TEST_EXIT_CODE=${PIPESTATUS[0]}
+                fi
+                
+                if [ $TEST_EXIT_CODE -eq 0 ]; then
+                    TEST_PASSED=true
+                    echo "✅ Database integration tests OK"
+                else
+                    # Check if failure is due to database access conflicts
+                    if grep -q "database.*is being accessed by other users\|55006" /tmp/test_output.log; then
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                            echo "   ⚠️  Test databases locked by previous runs, retrying..."
+                            continue
+                        else
+                            echo "   ⚠️  Database tests failed due to leftover test databases."
+                            echo "   This is a known sqlx::test limitation in local development."
+                            echo "   CI/production will not be affected (fresh databases each run)."
+                            echo "   To fix locally: wait a few minutes or restart PostgreSQL."
+                            echo "⚠️  Database integration tests skipped (non-blocking for CI/deployment)."
+                            # Don't count this as an error since it's a local dev issue
+                            TEST_PASSED=true  # Mark as passed to continue validation
+                        fi
+                    else
+                        echo "❌ Database integration tests failed. Fix all failing tests before committing."
+                        ERRORS=$((ERRORS + 1))
+                        break
+                    fi
+                fi
             else
                 # Check if failure is due to database access conflicts
                 if grep -q "database.*is being accessed by other users\|55006" /tmp/test_output.log; then
