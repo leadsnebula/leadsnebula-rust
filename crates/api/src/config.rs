@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose, Engine as _};
+use leadsnebula_core::cache::CacheService;
 use leadsnebula_core::redis::RedisClient;
 use leadsnebula_core::services::database::create_pool;
 use leadsnebula_core::ssm::SsmService;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub redis: Option<Arc<RedisClient>>,
     #[allow(dead_code)] // Used by services that need SSM
     pub ssm: Arc<SsmService>,
+    #[allow(dead_code)] // Used by routes for caching
+    pub cache: Option<Arc<CacheService>>,
 }
 
 impl AppConfig {
@@ -477,11 +480,20 @@ impl AppState {
             }
         };
 
+        // Create CacheService from Redis (if available)
+        let cache = redis.as_ref().map(|r| {
+            Arc::new(CacheService::new(
+                Some(r.clone()),
+                config.environment.clone(),
+            ))
+        });
+
         Ok(Self {
             config,
             db_pool,
             redis,
             ssm,
+            cache,
         })
     }
 }

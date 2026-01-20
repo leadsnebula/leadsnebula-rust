@@ -6,7 +6,7 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
     info!("Creating database connection pool");
     let pool = PgPoolOptions::new()
         .max_connections(100) // Increase for concurrent auctions
-        .min_connections(0) // Don't pre-establish connections (prevents timeout on startup)
+        .min_connections(10) // Keep connections warm to avoid cold start latency
         .acquire_timeout(Duration::from_secs(10)) // Increase timeout for initial connection
         .idle_timeout(Some(Duration::from_secs(600)))
         .max_lifetime(Some(Duration::from_secs(1800)))

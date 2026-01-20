@@ -61,6 +61,10 @@ fn init() {
 
 #[tokio::test]
 async fn test_create_publisher() -> sqlx::Result<()> {
+    if !common::has_database_url() {
+        eprintln!("⚠️  DATABASE_URL not set - skipping test_create_publisher");
+        return Ok(());
+    }
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
@@ -129,6 +133,10 @@ async fn test_create_publisher() -> sqlx::Result<()> {
 
 #[tokio::test]
 async fn test_list_publishers() -> sqlx::Result<()> {
+    if !common::has_database_url() {
+        eprintln!("⚠️  DATABASE_URL not set - skipping test_list_publishers");
+        return Ok(());
+    }
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
@@ -197,6 +205,10 @@ async fn test_list_publishers() -> sqlx::Result<()> {
 
 #[tokio::test]
 async fn test_update_publisher() -> sqlx::Result<()> {
+    if !common::has_database_url() {
+        eprintln!("⚠️  DATABASE_URL not set - skipping test_update_publisher");
+        return Ok(());
+    }
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
@@ -265,6 +277,10 @@ async fn test_update_publisher() -> sqlx::Result<()> {
 
 #[tokio::test]
 async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
+    if !common::has_database_url() {
+        eprintln!("⚠️  DATABASE_URL not set - skipping test_publisher_email_uniqueness_for_active");
+        return Ok(());
+    }
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
@@ -345,6 +361,10 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
 
 #[tokio::test]
 async fn test_deleted_publisher_email_reuse() -> sqlx::Result<()> {
+    if !common::has_database_url() {
+        eprintln!("⚠️  DATABASE_URL not set - skipping test_deleted_publisher_email_reuse");
+        return Ok(());
+    }
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");

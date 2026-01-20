@@ -3,6 +3,28 @@
 
 use sqlx::PgPool;
 
+/// Check if DATABASE_URL is available for integration tests
+/// Returns true if DATABASE_URL is set, false otherwise
+pub fn has_database_url() -> bool {
+    // Load local env if present (non-fatal)
+    let _ = dotenvy::from_filename(".env.local");
+    let _ = dotenvy::dotenv();
+
+    std::env::var("DATABASE_URL").is_ok()
+}
+
+/// Macro to skip a test if DATABASE_URL is not set
+/// Usage: skip_if_no_db!();
+#[macro_export]
+macro_rules! skip_if_no_db {
+    () => {
+        if !$crate::tests::common::has_database_url() {
+            eprintln!("⚠️  DATABASE_URL not set - skipping test");
+            return;
+        }
+    };
+}
+
 /// Create a test database pool, applying migrations only if needed
 /// This handles the case where migrations are already applied to the database
 ///

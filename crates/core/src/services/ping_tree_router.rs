@@ -2,7 +2,6 @@ use crate::models::{
     buyer_qualification_config::BuyerQualificationConfig, campaign::Campaign, enums::LeadStatus,
     lead::Lead, ping_tree::PingTree, ping_tree_campaign::PingTreeCampaign,
 };
-use crate::services::auction_timing::AuctionTiming;
 use crate::services::buyer_router::BuyerResponse;
 use anyhow::Result;
 use hex;
@@ -67,31 +66,12 @@ impl PingTreeRouter {
         pool: Arc<PgPool>,
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
-        let mut timing = AuctionTiming::new();
-
         // Find active ping tree for publisher and vertical with revshare info
-        let ping_tree_lookup_stage = timing.start_stage(
-            "ping_tree_lookup",
-            serde_json::json!({
-                "publisher_id": self.publisher_id.to_string(),
-                "vertical": self.vertical.clone()
-            }),
-        );
-
         let (ping_tree, _revshare_percentage, _revshare_flat_amount) =
             match PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
                 .await?
             {
-                Some((pt, revshare_pct, revshare_flat)) => {
-                    timing.complete_stage(
-                        ping_tree_lookup_stage,
-                        Some(serde_json::json!({
-                            "ping_tree_id": pt.id.to_string(),
-                            "strategy": pt.strategy.clone()
-                        })),
-                    );
-                    (pt, revshare_pct, revshare_flat)
-                }
+                Some((pt, revshare_pct, revshare_flat)) => (pt, revshare_pct, revshare_flat),
                 None => {
                     // Update lead status to error
                     self.update_lead_status(
@@ -142,7 +122,6 @@ impl PingTreeRouter {
         }
 
         // Get enabled campaigns from ping tree
-        let campaigns_loaded_stage = timing.start_stage("campaigns_loaded", serde_json::json!({}));
         let ping_tree_campaigns =
             PingTreeCampaign::find_enabled_for_ping_tree(pool.as_ref(), &ping_tree.id).await?;
 
@@ -166,12 +145,19 @@ impl PingTreeRouter {
             });
         }
 
-        // Load campaigns in batch (optimize N+1 queries)
+        // Load campaigns in batch with eager loading (optimize N+1 queries)
+        // Eager load campaigns with buyers and integrations in a single query
         let campaign_ids: Vec<Uuid> = ping_tree_campaigns
             .iter()
             .map(|ptc| ptc.campaign_id)
             .collect();
-        let all_campaigns = Campaign::find_by_ids(pool.as_ref(), &campaign_ids).await?;
+        let campaigns_with_associations =
+            Campaign::find_by_ids_with_associations(pool.as_ref(), &campaign_ids).await?;
+        // Extract just the campaigns (buyers/integrations are already loaded, but we don't need them here)
+        let all_campaigns: Vec<Campaign> = campaigns_with_associations
+            .iter()
+            .map(|(c, _, _)| c.clone())
+            .collect();
 
         let mut campaigns = Vec::new();
         let mut priority_map = std::collections::HashMap::new();
@@ -199,14 +185,6 @@ impl PingTreeRouter {
             .await
             .unwrap_or_default();
         // Note: qualification_configs are preloaded and ready for use in buyer router tasks
-
-        timing.complete_stage(
-            campaigns_loaded_stage,
-            Some(serde_json::json!({
-                "campaign_count": campaigns.len(),
-                "buyer_count": unique_buyer_ids.len()
-            })),
-        );
 
         if campaigns.is_empty() {
             self.update_lead_status(
@@ -285,16 +263,6 @@ impl PingTreeRouter {
         use crate::services::buyer_router::BuyerRouter;
         use futures::future::join_all;
         use tokio::time::{timeout, Duration};
-
-        let mut timing = AuctionTiming::new();
-        let ping_auction_start_stage = timing.start_stage(
-            "ping_auction_start",
-            serde_json::json!({
-                "campaign_count": campaigns.len()
-            }),
-        );
-
-        let start_time = std::time::Instant::now();
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
 
         // Send concurrent pings to all campaigns
@@ -328,10 +296,6 @@ impl PingTreeRouter {
 
         // Wait for all responses concurrently (instead of sequentially)
         let task_results = join_all(task_futures).await;
-        timing.complete_stage(ping_auction_start_stage, None);
-
-        let ping_auction_complete_stage =
-            timing.start_stage("ping_auction_complete", serde_json::json!({}));
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
 
         for (result, campaign_id) in task_results {
@@ -425,26 +389,12 @@ impl PingTreeRouter {
             }
         }
 
-        let total_time_ms = start_time.elapsed().as_millis() as u64;
-        timing.complete_stage(
-            ping_auction_complete_stage,
-            Some(serde_json::json!({
-                "duration_ms": total_time_ms,
-                "response_count": responses.len()
-            })),
-        );
-
-        tracing::info!(
-            "Ping auction completed in {}ms with {} responses",
-            total_time_ms,
-            responses.len()
-        );
+        tracing::info!("Ping auction completed with {} responses", responses.len());
 
         // Log performance metrics to Sentry for monitoring
         #[cfg(feature = "sentry")]
         {
             sentry::configure_scope(|scope| {
-                scope.set_extra("ping_auction_duration_ms", total_time_ms.to_string().into());
                 scope.set_tag("ping_auction_responses", responses.len().to_string());
             });
         }
@@ -592,21 +542,8 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest price, then priority, then random
-        let winner_selection_stage = timing.start_stage(
-            "winner_selection",
-            serde_json::json!({
-                "valid_response_count": valid_responses.len()
-            }),
-        );
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
-        timing.complete_stage(
-            winner_selection_stage,
-            Some(serde_json::json!({
-                "winner_campaign_id": winner_campaign_id.to_string(),
-                "bid": winner_response.bid
-            })),
-        );
 
         // Find winning campaign
         let winner_campaign = campaigns
@@ -678,13 +615,6 @@ impl PingTreeRouter {
         if let Some(campaign_id) = self.lead.campaign_id {
             if !campaigns.iter().any(|c| c.id == campaign_id) {
                 // Log performance metrics to Sentry for monitoring (even on error)
-                #[cfg(feature = "sentry")]
-                {
-                    let total_time_ms = start_time.elapsed().as_millis() as u64;
-                    sentry::configure_scope(|scope| {
-                        scope.set_extra("post_duration_ms", total_time_ms.to_string().into());
-                    });
-                }
 
                 self.update_lead_status(
                     pool.as_ref(),
@@ -776,16 +706,6 @@ impl PingTreeRouter {
                         && bresp.price.unwrap_or(0.0) > 0.0
                     {
                         // Log performance metrics to Sentry for monitoring
-                        #[cfg(feature = "sentry")]
-                        {
-                            let total_time_ms = start_time.elapsed().as_millis() as u64;
-                            sentry::configure_scope(|scope| {
-                                scope.set_extra(
-                                    "post_duration_ms",
-                                    total_time_ms.to_string().into(),
-                                );
-                            });
-                        }
 
                         let post_id = bresp.post_id.clone().unwrap();
                         // Persist post acceptance
@@ -804,16 +724,6 @@ impl PingTreeRouter {
                         })
                     } else {
                         // Log performance metrics to Sentry for monitoring (even on rejection)
-                        #[cfg(feature = "sentry")]
-                        {
-                            let total_time_ms = start_time.elapsed().as_millis() as u64;
-                            sentry::configure_scope(|scope| {
-                                scope.set_extra(
-                                    "post_duration_ms",
-                                    total_time_ms.to_string().into(),
-                                );
-                            });
-                        }
 
                         // Buyer rejected or errored
                         let final_status = match bresp.status.as_str() {
@@ -867,13 +777,6 @@ impl PingTreeRouter {
             }
         } else {
             // Log performance metrics to Sentry for monitoring (even on error)
-            #[cfg(feature = "sentry")]
-            {
-                let total_time_ms = start_time.elapsed().as_millis() as u64;
-                sentry::configure_scope(|scope| {
-                    scope.set_extra("post_duration_ms", total_time_ms.into());
-                });
-            }
 
             self.update_lead_status(
                 pool.as_ref(),
@@ -903,9 +806,6 @@ impl PingTreeRouter {
         priority_map: &std::collections::HashMap<Uuid, Option<i32>>,
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
-        #[allow(unused_variables)]
-        let start_time = std::time::Instant::now();
-
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
             // Create a temporary router with "ping" request_type for the ping auction phase
@@ -925,13 +825,6 @@ impl PingTreeRouter {
                 .await?;
             if !ping_result.success {
                 // Log performance metrics to Sentry for monitoring (even on early return)
-                #[cfg(feature = "sentry")]
-                {
-                    let total_time_ms = start_time.elapsed().as_millis() as u64;
-                    sentry::configure_scope(|scope| {
-                        scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
-                    });
-                }
                 return Ok(ping_result);
             }
 
@@ -955,13 +848,6 @@ impl PingTreeRouter {
                 .await?;
 
             // Log performance metrics to Sentry for monitoring
-            #[cfg(feature = "sentry")]
-            {
-                let total_time_ms = start_time.elapsed().as_millis() as u64;
-                sentry::configure_scope(|scope| {
-                    scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
-                });
-            }
 
             // Merge ping and post results
             Ok(RoutingResult {
@@ -1066,14 +952,6 @@ impl PingTreeRouter {
                     Some("No valid buyer responses"),
                 )
                 .await?;
-
-                #[cfg(feature = "sentry")]
-                {
-                    let total_time_ms = start_time.elapsed().as_millis() as u64;
-                    sentry::configure_scope(|scope| {
-                        scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
-                    });
-                }
 
                 return Ok(RoutingResult {
                     success: false,
@@ -1182,14 +1060,6 @@ impl PingTreeRouter {
                             );
                         }
                     }
-                });
-            }
-
-            #[cfg(feature = "sentry")]
-            {
-                let total_time_ms = start_time.elapsed().as_millis() as u64;
-                sentry::configure_scope(|scope| {
-                    scope.set_extra("fullpost_duration_ms", total_time_ms.to_string().into());
                 });
             }
 

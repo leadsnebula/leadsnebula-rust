@@ -5,7 +5,6 @@ use crate::models::{
     campaign::Campaign,
     lead::Lead,
 };
-use crate::services::auction_timing::AuctionTiming;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use reqwest::header::HeaderMap;
@@ -95,27 +94,25 @@ impl BuyerRouter {
     }
 
     async fn route_ping(&self, campaign: &Campaign) -> Result<BuyerResponse> {
-        // Look up buyer integration (credentials not needed for internal buyers)
+        // Look up buyer integration to check if it's internal
         let integration = self.get_buyer_integration(campaign).await?;
 
-        // For internal buyers (Pulsar), construct endpoint directly
-        // For external buyers, use endpoint from integration
-        let endpoint = if integration.is_internal {
-            // Internal buyers use the Pulsar endpoint on the same server
-            let base_url = std::env::var("INTERNAL_API_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string());
-            format!("{}/api/v1/pulsar/leads", base_url)
-        } else {
-            // External buyers - endpoint should be in integration
-            integration
-                .posting_url_template
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?
-        };
+        // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
+        if integration.is_internal {
+            use crate::services::pulsar::PulsarService;
+            let result =
+                PulsarService::route_ping_direct(self.pool.clone(), &self.lead, campaign).await;
+            return result;
+        }
 
-        // Prepare request payload (wrap lead data in "lead" object for Pulsar compatibility)
+        // For external buyers, use HTTP
+        let endpoint = integration
+            .posting_url_template
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?;
+
+        // Prepare request payload
         let mut lead_data = serde_json::to_value(&self.lead)?;
-        // Ensure request_type is set to "ping" for ping requests (override any existing value)
         if let Some(obj) = lead_data.as_object_mut() {
             obj.insert("request_type".to_string(), serde_json::json!("ping"));
         }
@@ -123,17 +120,7 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
-        // Send HTTP request - for internal buyers, no API key needed
-        let mut timing = AuctionTiming::new();
-        let buyer_ping_sent_stage = timing.start_stage(
-            "buyer_ping_sent",
-            serde_json::json!({
-                "buyer_id": campaign.buyer_id.to_string(),
-                "campaign_id": campaign.id.to_string(),
-                "endpoint": endpoint.clone()
-            }),
-        );
-
+        // Send HTTP request
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -142,16 +129,7 @@ impl BuyerRouter {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("Invalid content type: {}", e))?,
         );
-        headers.insert(
-            "X-Internal-Buyer-ID",
-            campaign
-                .buyer_id
-                .to_string()
-                .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid buyer ID format: {}", e))?,
-        );
 
-        let request_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -161,30 +139,8 @@ impl BuyerRouter {
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
 
-        let request_duration_ms = request_start.elapsed().as_millis() as u64;
-        timing.complete_stage(
-            buyer_ping_sent_stage,
-            Some(serde_json::json!({
-                "request_duration_ms": request_duration_ms,
-                "status_code": response.status().as_u16()
-            })),
-        );
-
         // Parse response
-        let buyer_ping_response_stage =
-            timing.start_stage("buyer_ping_response", serde_json::json!({}));
-        let result = self.parse_buyer_response(response, "ping").await;
-        timing.complete_stage(
-            buyer_ping_response_stage,
-            Some(serde_json::json!({
-                "success": result.as_ref().map(|r| r.success).unwrap_or(false),
-                "has_bid": result.as_ref().map(|r| r.bid.is_some()).unwrap_or(false)
-            })),
-        );
-
-        timing.log_summary(&format!("buyer_{}", campaign.buyer_id));
-
-        result
+        self.parse_buyer_response(response, "ping").await
     }
 
     async fn route_post(&self, campaign: &Campaign) -> Result<BuyerResponse> {
@@ -194,23 +150,26 @@ impl BuyerRouter {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing promise_id for post request"))?;
 
-        // Look up buyer integration (credentials not needed for internal buyers)
+        // Look up buyer integration to check if it's internal
         let integration = self.get_buyer_integration(campaign).await?;
 
-        // For internal buyers (Pulsar), construct endpoint directly
-        // For external buyers, use endpoint from integration
-        let endpoint = if integration.is_internal {
-            // Internal buyers use the Pulsar endpoint on the same server
-            let base_url = std::env::var("INTERNAL_API_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string());
-            format!("{}/api/v1/pulsar/leads", base_url)
-        } else {
-            // External buyers - endpoint should be in integration
-            integration
-                .posting_url_template
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?
-        };
+        // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
+        if integration.is_internal {
+            use crate::services::pulsar::PulsarService;
+            return PulsarService::route_post_direct(
+                self.pool.clone(),
+                &self.lead,
+                campaign,
+                promise_id,
+            )
+            .await;
+        }
+
+        // For external buyers, use HTTP
+        let endpoint = integration
+            .posting_url_template
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?;
 
         // Prepare request payload (wrap lead data in "lead" object for Pulsar compatibility)
         let mut lead_data = serde_json::to_value(&self.lead)?;
@@ -223,17 +182,7 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
-        // Send HTTP request - for internal buyers, no API key needed
-        let mut timing = AuctionTiming::new();
-        let buyer_post_sent_stage = timing.start_stage(
-            "buyer_post_sent",
-            serde_json::json!({
-                "buyer_id": campaign.buyer_id.to_string(),
-                "campaign_id": campaign.id.to_string(),
-                "endpoint": endpoint.clone()
-            }),
-        );
-
+        // Send HTTP request
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -251,7 +200,6 @@ impl BuyerRouter {
                 .map_err(|e| anyhow::anyhow!("Invalid buyer ID format: {}", e))?,
         );
 
-        let request_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -261,62 +209,37 @@ impl BuyerRouter {
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
 
-        let request_duration_ms = request_start.elapsed().as_millis() as u64;
-        timing.complete_stage(
-            buyer_post_sent_stage,
-            Some(serde_json::json!({
-                "request_duration_ms": request_duration_ms,
-                "status_code": response.status().as_u16()
-            })),
-        );
-
         // Parse response
-        let buyer_post_response_stage =
-            timing.start_stage("buyer_post_response", serde_json::json!({}));
-        let result = self.parse_buyer_response(response, "post").await;
-        timing.complete_stage(
-            buyer_post_response_stage,
-            Some(serde_json::json!({
-                "success": result.as_ref().map(|r| r.success).unwrap_or(false),
-                "has_price": result.as_ref().map(|r| r.price.is_some()).unwrap_or(false)
-            })),
-        );
-
-        timing.log_summary(&format!("buyer_{}", campaign.buyer_id));
-
-        result
+        self.parse_buyer_response(response, "post").await
     }
 
     async fn route_fullpost(&self, campaign: &Campaign) -> Result<BuyerResponse> {
-        // Look up buyer integration (credentials not needed for internal buyers)
+        // Look up buyer integration to check if it's internal
         let integration = self.get_buyer_integration(campaign).await?;
 
-        // For internal buyers (Pulsar), construct endpoint directly
-        // For external buyers, use endpoint from integration
-        let endpoint = if integration.is_internal {
-            // Internal buyers use the Pulsar endpoint on the same server
-            let base_url = std::env::var("INTERNAL_API_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string());
-            format!("{}/api/v1/pulsar/leads", base_url)
-        } else {
-            // External buyers - endpoint should be in integration
-            integration
-                .posting_url_template
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?
-        };
+        // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
+        if integration.is_internal {
+            use crate::services::pulsar::PulsarService;
+            return PulsarService::route_fullpost_direct(self.pool.clone(), &self.lead, campaign)
+                .await;
+        }
 
-        // Prepare request payload (wrap lead data in "lead" object for Pulsar compatibility)
+        // For external buyers, use HTTP
+        let endpoint = integration
+            .posting_url_template
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?;
+
+        // Prepare request payload
         let mut lead_data = serde_json::to_value(&self.lead)?;
         if let Some(obj) = lead_data.as_object_mut() {
-            // Set request_type to "fullpost" for fullpost requests
             obj.insert("request_type".to_string(), serde_json::json!("fullpost"));
         }
         let payload = serde_json::json!({
             "lead": lead_data
         });
 
-        // Send HTTP request - for internal buyers, no API key needed
+        // Send HTTP request
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
         headers.insert(
