@@ -37,7 +37,7 @@ impl CacheService {
             match &result {
                 Ok(Some(_)) => {
                     self.hits.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
+                    tracing::info!(
                         cache_key = %key,
                         cache_result = "hit",
                         "Cache hit"
@@ -45,7 +45,7 @@ impl CacheService {
                 }
                 Ok(None) => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(
+                    tracing::info!(
                         cache_key = %key,
                         cache_result = "miss",
                         "Cache miss"
@@ -64,7 +64,7 @@ impl CacheService {
             result
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
+            tracing::info!(
                 cache_key = %key,
                 cache_result = "miss",
                 reason = "redis_not_configured",
@@ -123,7 +123,7 @@ impl CacheService {
         // Try cache first
         if let Some(cached) = self.get(key).await? {
             if let Ok(value) = serde_json::from_str::<T>(&cached) {
-                tracing::debug!(
+                tracing::info!(
                     cache_key = %key,
                     cache_result = "hit",
                     ttl_seconds = ttl_seconds,
@@ -140,7 +140,7 @@ impl CacheService {
         }
 
         // Cache miss - fetch from DB
-        tracing::debug!(
+        tracing::info!(
             cache_key = %key,
             cache_result = "miss",
             ttl_seconds = ttl_seconds,
@@ -149,7 +149,7 @@ impl CacheService {
         let value = f().await?;
         let serialized = serde_json::to_string(&value)?;
         self.set_with_ttl(key, &serialized, ttl_seconds).await?;
-        tracing::debug!(
+        tracing::info!(
             cache_key = %key,
             cache_result = "set",
             ttl_seconds = ttl_seconds,

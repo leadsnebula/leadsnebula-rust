@@ -20,6 +20,7 @@ use crate::AppState;
 use leadsnebula_core::services::auction_timing::AuctionTiming;
 use leadsnebula_core::services::diagnostic_metrics::DiagnosticMetrics;
 use leadsnebula_core::services::ssm_key_cache::get_ssm_parameter_cached;
+use std::sync::{Arc, Mutex};
 
 fn map_error_to_user(err_text: &str) -> (String, String) {
     let lower = err_text.to_lowercase();
@@ -595,13 +596,16 @@ async fn create_lead(
         }
 
         // Route the post through the ping-tree router to perform buyer post handling
+        let timing_arc = Arc::new(Mutex::new(timing));
+        let metrics_arc = Arc::new(metrics);
         let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
             lead.clone(),
             publisher.id,
             vertical.slug.clone(),
             request_type.clone(),
             state.cache.clone(),
-        );
+        )
+        .with_timing_and_metrics(timing_arc, metrics_arc);
         match router
             .route(
                 state.db_pool.clone(),
@@ -1436,13 +1440,20 @@ async fn create_lead(
 
     // Route the lead through ping tree
     let stage_routing_start = timing.start_stage("routing_start", serde_json::json!({}));
+    let timing_arc = Arc::new(Mutex::new(timing));
+    let metrics_arc = Arc::new(metrics);
+    {
+        let mut t = timing_arc.lock().unwrap();
+        t.complete_stage(stage_routing_start, Some(serde_json::json!({})));
+    }
     let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
         lead,
         publisher.id,
         vertical.slug.clone(),
         request_type.clone(),
         state.cache.clone(),
-    );
+    )
+    .with_timing_and_metrics(timing_arc.clone(), metrics_arc.clone());
 
     let routing_result = router
         .route(
@@ -1450,8 +1461,10 @@ async fn create_lead(
             std::sync::Arc::new(state.config.encryption_key.clone()),
         )
         .await;
-    timing.complete_stage(stage_routing_start, Some(serde_json::json!({})));
-    let stage_routing_complete = timing.start_stage("routing_complete", serde_json::json!({}));
+    let stage_routing_complete = {
+        let mut t = timing_arc.lock().unwrap();
+        t.start_stage("routing_complete", serde_json::json!({}))
+    };
 
     match routing_result {
         Ok(routing_result) => {
@@ -1734,12 +1747,15 @@ async fn create_lead(
             }
 
             // Log diagnostic summary and timing before returning
-            timing.complete_stage(
-                stage_routing_complete,
-                Some(serde_json::json!({"status": routing_result.status.clone()})),
-            );
-            timing.log_summary(&lead_uuid.to_string());
-            metrics.log_summary("carina");
+            {
+                let mut t = timing_arc.lock().unwrap();
+                t.complete_stage(
+                    stage_routing_complete,
+                    Some(serde_json::json!({"status": routing_result.status.clone()})),
+                );
+                t.log_summary(&lead_uuid.to_string());
+            }
+            metrics_arc.log_summary("carina");
 
             Ok(Json(LeadResponse {
                 status: StatusNode {
@@ -1763,12 +1779,15 @@ async fn create_lead(
         }
         Err(e) => {
             tracing::error!("Routing error: {}", e);
-            timing.complete_stage(
-                stage_routing_complete,
-                Some(serde_json::json!({"error": e.to_string()})),
-            );
-            timing.log_summary(&lead_uuid.to_string());
-            metrics.log_summary("carina");
+            {
+                let mut t = timing_arc.lock().unwrap();
+                t.complete_stage(
+                    stage_routing_complete,
+                    Some(serde_json::json!({"error": e.to_string()})),
+                );
+                t.log_summary(&lead_uuid.to_string());
+            }
+            metrics_arc.log_summary("carina");
             let (message, technical) = map_error_to_user(&e.to_string());
             Ok(Json(LeadResponse {
                 status: StatusNode {

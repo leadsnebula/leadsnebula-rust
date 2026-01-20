@@ -19,6 +19,9 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .timeout(Duration::from_secs(30)) // Request timeout
         .connect_timeout(Duration::from_secs(5)) // Connection timeout
         .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true) // Lower latency by disabling Nagle's algorithm
+        .http2_keep_alive_interval(Duration::from_secs(30)) // Send keep-alives every 30s
+        .http2_keep_alive_timeout(Duration::from_secs(20)) // Timeout if no response in 20s
         .build()
         .expect("Failed to build global HTTP client")
 });
@@ -115,8 +118,10 @@ impl BuyerRouter {
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
             tracing::info!(
-                "Using direct Pulsar call (NO HTTP) for campaign {}",
-                campaign.id
+                campaign_id = %campaign.id,
+                buyer_id = %campaign.buyer_id,
+                method = "direct",
+                "Using direct Pulsar call (NO HTTP)"
             );
             if integration.slug != "pulsar" {
                 tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
@@ -140,6 +145,19 @@ impl BuyerRouter {
             let result =
                 PulsarService::route_ping_direct(self.pool.clone(), &self.lead, campaign).await;
             let ping_duration = ping_start.elapsed().as_millis() as u64;
+
+            if let Ok(ref resp) = result {
+                tracing::info!(
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    status = %resp.status,
+                    bid = ?resp.bid,
+                    success = resp.success,
+                    duration_ms = ping_duration,
+                    method = "direct",
+                    "Direct Pulsar ping response received"
+                );
+            }
 
             // Complete buyer_ping_sent and start buyer_ping_response
             if let Some(ref t) = self.timing {
@@ -187,6 +205,14 @@ impl BuyerRouter {
             .posting_url_template
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?;
+
+        tracing::info!(
+            campaign_id = %campaign.id,
+            buyer_id = %campaign.buyer_id,
+            endpoint = %endpoint,
+            method = "HTTP",
+            "Sending buyer ping request"
+        );
 
         // Prepare request payload
         let mut lead_data = serde_json::to_value(&self.lead)?;
@@ -252,6 +278,18 @@ impl BuyerRouter {
         let parse_start = std::time::Instant::now();
         let result = self.parse_buyer_response(response, "ping").await;
         let parse_duration = parse_start.elapsed().as_millis() as u64;
+
+        if let Ok(ref resp) = result {
+            tracing::info!(
+                campaign_id = %campaign.id,
+                buyer_id = %campaign.buyer_id,
+                status = %resp.status,
+                bid = ?resp.bid,
+                success = resp.success,
+                duration_ms = ping_duration,
+                "Buyer ping response received"
+            );
+        }
 
         // Complete buyer_ping_response
         if let Some(ref t) = self.timing {

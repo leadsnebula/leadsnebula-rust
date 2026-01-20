@@ -142,6 +142,15 @@ impl PingTreeRouter {
 
         let (ping_tree, _revshare_percentage, _revshare_flat_amount) = match ping_tree_result {
             Some((pt, revshare_pct, revshare_flat)) => {
+                tracing::info!(
+                    lead_id = %self.lead.uuid,
+                    ping_tree_id = %pt.id,
+                    publisher_id = %self.publisher_id,
+                    vertical = %self.vertical,
+                    duration_ms = ping_tree_duration,
+                    cache_hit = was_cache_hit,
+                    "Ping tree lookup completed"
+                );
                 {
                     let mut t = timing.lock().unwrap();
                     t.complete_stage(
@@ -248,6 +257,14 @@ impl PingTreeRouter {
         } else if campaigns_duration > 0 {
             metrics.record_cache_miss();
         }
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            ping_tree_id = %ping_tree.id,
+            campaign_count = ping_tree_campaigns.len(),
+            duration_ms = campaigns_duration,
+            cache_hit = was_cache_hit,
+            "Campaigns loaded"
+        );
         {
             let mut t = timing.lock().unwrap();
             t.complete_stage(
@@ -425,6 +442,12 @@ impl PingTreeRouter {
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
 
         // Start ping auction stage
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            campaign_count = campaigns.len(),
+            request_type = %self.request_type,
+            "Starting ping auction"
+        );
         let stage_ping_auction = {
             let mut t = timing.lock().unwrap();
             t.start_stage(
@@ -445,7 +468,9 @@ impl PingTreeRouter {
             let campaign_id = campaign.id;
 
             // Wrap each task with timeout and store campaign_id for result mapping
+            // Track individual buyer processing time
             let task_future = async move {
+                let buyer_start = std::time::Instant::now();
                 let task = tokio::spawn(async move {
                     let router = BuyerRouter::new(
                         lead,
@@ -457,7 +482,8 @@ impl PingTreeRouter {
                     router.route().await
                 });
                 let result = timeout(PING_AUCTION_TIMEOUT, task).await;
-                (result, campaign_id)
+                let processing_time_ms = buyer_start.elapsed().as_millis() as u64;
+                (result, campaign_id, processing_time_ms)
             };
             task_futures.push(task_future);
         }
@@ -468,8 +494,9 @@ impl PingTreeRouter {
         let ping_auction_duration = ping_auction_start.elapsed().as_millis() as u64;
         metrics.record_query(ping_auction_duration); // Track ping auction duration
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
+        let mut per_buyer_timings: Vec<serde_json::Value> = Vec::new();
 
-        for (result, campaign_id) in task_results {
+        for (result, campaign_id, processing_time_ms) in task_results {
             match result {
                 Ok(Ok(Ok(response))) => {
                     tracing::info!(
@@ -483,10 +510,33 @@ impl PingTreeRouter {
                         response.error
                     );
                     let priority = priority_map.get(&campaign_id).copied().flatten();
+                    // Track per-buyer timing
+                    if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
+                        per_buyer_timings.push(serde_json::json!({
+                            "campaign_id": campaign_id,
+                            "buyer_id": campaign.buyer_id,
+                            "processing_time_ms": processing_time_ms,
+                            "status": response.status,
+                            "bid": response.bid,
+                            "success": response.success
+                        }));
+                    }
                     responses.push((response, campaign_id, priority));
                 }
                 Ok(Ok(Err(e))) => {
                     tracing::error!("BuyerRouter error for campaign {}: {}", campaign_id, e);
+                    // Track per-buyer timing for errors
+                    if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
+                        per_buyer_timings.push(serde_json::json!({
+                            "campaign_id": campaign_id,
+                            "buyer_id": campaign.buyer_id,
+                            "processing_time_ms": processing_time_ms,
+                            "status": "error",
+                            "bid": null,
+                            "success": false,
+                            "error": e.to_string()
+                        }));
+                    }
                     // Add error response - generate ping_id for ping requests so it shows up in leads report
                     let ping_id = if self.request_type == "ping" {
                         Some(format!("ping_error_{}", uuid::Uuid::new_v4()))
@@ -511,6 +561,18 @@ impl PingTreeRouter {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Task error for campaign {}: {}", campaign_id, e);
+                    // Track per-buyer timing for task errors
+                    if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
+                        per_buyer_timings.push(serde_json::json!({
+                            "campaign_id": campaign_id,
+                            "buyer_id": campaign.buyer_id,
+                            "processing_time_ms": processing_time_ms,
+                            "status": "error",
+                            "bid": null,
+                            "success": false,
+                            "error": format!("Task failed: {}", e)
+                        }));
+                    }
                     // Add error response to track task failures - generate ping_id for ping requests
                     let ping_id = if self.request_type == "ping" {
                         Some(format!("ping_error_{}", uuid::Uuid::new_v4()))
@@ -535,6 +597,18 @@ impl PingTreeRouter {
                 }
                 Err(_) => {
                     tracing::warn!("Ping auction timeout for campaign {}", campaign_id);
+                    // Track per-buyer timing for timeouts
+                    if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
+                        per_buyer_timings.push(serde_json::json!({
+                            "campaign_id": campaign_id,
+                            "buyer_id": campaign.buyer_id,
+                            "processing_time_ms": processing_time_ms,
+                            "status": "timeout",
+                            "bid": null,
+                            "success": false,
+                            "error": "Buyer did not respond within timeout period"
+                        }));
+                    }
                     // Add timeout response - generate ping_id for ping requests so it shows up in leads report
                     let ping_id = if self.request_type == "ping" {
                         Some(format!("ping_timeout_{}", uuid::Uuid::new_v4()))
@@ -560,7 +634,15 @@ impl PingTreeRouter {
             }
         }
 
-        tracing::info!("Ping auction completed with {} responses", responses.len());
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            total_responses = responses.len(),
+            accepted_count = responses.iter().filter(|(r, _, _)| r.status == "accepted").count(),
+            rejected_count = responses.iter().filter(|(r, _, _)| r.status == "rejected").count(),
+            timeout_count = responses.iter().filter(|(r, _, _)| r.status == "timeout").count(),
+            error_count = responses.iter().filter(|(r, _, _)| r.status == "error").count(),
+            "Ping auction completed - all responses received"
+        );
 
         // Log performance metrics to Sentry for monitoring
         #[cfg(feature = "sentry")]
@@ -602,6 +684,11 @@ impl PingTreeRouter {
 
         // Batch insert all responses in one query
         if !batch_responses.is_empty() {
+            tracing::info!(
+                lead_id = %self.lead.uuid,
+                response_count = batch_responses.len(),
+                "Batch inserting buyer responses"
+            );
             let stage_buyer_responses_persisted = {
                 let mut t = timing.lock().unwrap();
                 t.start_stage(
@@ -609,50 +696,47 @@ impl PingTreeRouter {
                     serde_json::json!({"response_count": batch_responses.len()}),
                 )
             };
-            let pool_clone = pool.as_ref().clone();
-            let timing_clone = timing.clone();
-            tokio::spawn(async move {
-                let insert_start = std::time::Instant::now();
-                let result =
-                    PingTreeRouter::batch_insert_buyer_responses(&pool_clone, batch_responses)
-                        .await;
-                let insert_duration = insert_start.elapsed().as_millis() as u64;
+            let insert_start = std::time::Instant::now();
+            let result =
+                PingTreeRouter::batch_insert_buyer_responses(pool.as_ref(), batch_responses).await;
+            let insert_duration = insert_start.elapsed().as_millis() as u64;
+            {
+                let mut t = timing.lock().unwrap();
+                t.complete_stage(
+                    stage_buyer_responses_persisted,
+                    Some(serde_json::json!({
+                        "duration_ms": insert_duration
+                    })),
+                );
+            }
+            if result.is_ok() {
+                tracing::info!(
+                    lead_id = %self.lead.uuid,
+                    duration_ms = insert_duration,
+                    "Buyer responses batch inserted successfully"
+                );
+            } else if let Err(e) = &result {
+                tracing::error!("Failed to batch insert buyer responses: {}", e);
+                #[cfg(feature = "sentry")]
                 {
-                    let mut t = timing_clone.lock().unwrap();
-                    t.complete_stage(
-                        stage_buyer_responses_persisted,
-                        Some(serde_json::json!({
-                            "duration_ms": insert_duration
-                        })),
+                    sentry::capture_message(
+                        &format!("Batch insert buyer responses failed: {}", e),
+                        sentry::Level::Error,
                     );
                 }
-                if let Err(e) = result {
-                    tracing::error!("Failed to batch insert buyer responses: {}", e);
-                    #[cfg(feature = "sentry")]
-                    {
-                        sentry::capture_message(
-                            &format!("Batch insert buyer responses failed: {}", e),
-                            sentry::Level::Error,
-                        );
-                    }
-                }
-            });
+            }
         }
 
-        // Complete ping auction stage with timing
+        // Complete ping auction stage with timing and per-buyer timings
         {
             let mut t = timing.lock().unwrap();
             t.complete_stage(
                 stage_ping_auction,
                 Some(serde_json::json!({
+                    "campaign_count": campaigns.len(),
                     "total_responses": responses.len(),
                     "duration_ms": ping_auction_duration,
-                    "responses": responses.iter().map(|(resp, id, _)| serde_json::json!({
-                        "campaign_id": id,
-                        "status": resp.status,
-                        "bid": resp.bid,
-                        "success": resp.success
-                    })).collect::<Vec<_>>()
+                    "per_buyer_timings": per_buyer_timings
                 })),
             );
         }
@@ -751,6 +835,12 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest bid, then priority, then random
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            total_responses = responses.len(),
+            valid_responses = valid_responses.len(),
+            "Selecting winner from valid responses"
+        );
         let stage_winner_selection = {
             let mut t = timing.lock().unwrap();
             t.start_stage(
@@ -761,6 +851,13 @@ impl PingTreeRouter {
         let winner_selection_start = std::time::Instant::now();
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            winner_campaign_id = %winner_campaign_id,
+            winner_bid = ?winner_response.bid,
+            winner_status = %winner_response.status,
+            "Winner selected"
+        );
         let winner_selection_duration = winner_selection_start.elapsed().as_millis() as u64;
         {
             let mut t = timing.lock().unwrap();
@@ -1399,6 +1496,11 @@ impl PingTreeRouter {
             return Ok(());
         }
 
+        tracing::info!(
+            response_count = responses.len(),
+            "Executing batch insert for buyer responses"
+        );
+
         // Validate no duplicate ping_ids before batch insert
         let ping_ids: Vec<Option<String>> = responses.iter().map(|r| r.1.clone()).collect();
         let unique_ping_ids: HashSet<Option<String>> = ping_ids.iter().cloned().collect();
@@ -1436,6 +1538,11 @@ impl PingTreeRouter {
         .bind(&created_ats[..])
         .execute(pool)
         .await?;
+
+        tracing::info!(
+            response_count = responses.len(),
+            "Batch insert completed successfully"
+        );
 
         Ok(())
     }
