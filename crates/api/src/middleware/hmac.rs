@@ -8,7 +8,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use leadsnebula_core::models::publisher::Publisher;
 use tracing::warn;
@@ -18,18 +18,19 @@ pub async fn hmac_verification_middleware(
     headers: HeaderMap,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     // Allow internal requests (with X-Internal-Buyer-ID) to bypass HMAC verification
     if headers.get("X-Internal-Buyer-ID").is_some() {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     // Get publisher from request extensions (set by api_key_auth_middleware)
-    let publisher = request
-        .extensions()
-        .get::<Publisher>()
-        .cloned()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let publisher = match request.extensions().get::<Publisher>().cloned() {
+        Some(p) => p,
+        None => {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     // Check if HMAC is required
     if publisher.require_hmac() {
@@ -38,7 +39,7 @@ pub async fn hmac_verification_middleware(
             .and_then(|h| h.to_str().ok());
 
         if hmac_header.is_none() {
-            return Err(StatusCode::UNAUTHORIZED);
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     }
 
@@ -49,18 +50,23 @@ pub async fn hmac_verification_middleware(
     {
         // Get request body
         let (parts, body) = request.into_parts();
-        let body_bytes = axum::body::to_bytes(body, usize::MAX)
-            .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
 
         // Get HMAC secret from publisher (for now, use shared secret from env)
         // TODO: Support per-publisher HMAC secrets
-        let hmac_secret = std::env::var("HMAC_SECRET")
-            .or_else(|_| std::env::var("CARINA_HMAC_SECRET"))
-            .map_err(|_| {
-                warn!("HMAC header present but secret not configured");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let hmac_secret =
+            match std::env::var("HMAC_SECRET").or_else(|_| std::env::var("CARINA_HMAC_SECRET")) {
+                Ok(secret) => secret,
+                Err(_) => {
+                    warn!("HMAC header present but secret not configured");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
 
         // Parse signature (support "sha256=<hex>" or just "<hex>")
         let provided_signature = hmac_header
@@ -73,14 +79,18 @@ pub async fn hmac_verification_middleware(
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
-        let mut mac = HmacSha256::new_from_slice(hmac_secret.as_bytes())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut mac = match HmacSha256::new_from_slice(hmac_secret.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
         mac.update(&body_bytes);
         let expected_signature = hex::encode(mac.finalize().into_bytes());
 
         // Constant-time comparison
         if expected_signature.len() != provided_signature.len() {
-            return Err(StatusCode::UNAUTHORIZED);
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
         let mut equal = 0u8;
@@ -93,14 +103,14 @@ pub async fn hmac_verification_middleware(
         }
 
         if equal != 0 {
-            return Err(StatusCode::UNAUTHORIZED);
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
         // Reconstruct request with body
         let body = Body::from(body_bytes);
         let request = Request::from_parts(parts, body);
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
-    Ok(next.run(request).await)
+    next.run(request).await
 }

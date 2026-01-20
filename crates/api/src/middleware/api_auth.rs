@@ -7,7 +7,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use leadsnebula_core::models::publisher::Publisher;
 
@@ -16,7 +16,7 @@ pub async fn api_key_auth_middleware(
     headers: HeaderMap,
     mut request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     let api_key = headers
         .get("X-API-Key")
         .and_then(|h| h.to_str().ok())
@@ -26,7 +26,7 @@ pub async fn api_key_auth_middleware(
         Some(key) => key,
         None => {
             tracing::warn!("Missing X-API-Key header");
-            return Err(StatusCode::UNAUTHORIZED);
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     };
 
@@ -34,11 +34,11 @@ pub async fn api_key_auth_middleware(
         Ok(Some(p)) => p,
         Ok(None) => {
             tracing::warn!("Invalid API key provided");
-            return Err(StatusCode::UNAUTHORIZED);
+            return StatusCode::UNAUTHORIZED.into_response();
         }
         Err(e) => {
             tracing::error!("Database error during API key lookup: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
@@ -48,7 +48,7 @@ pub async fn api_key_auth_middleware(
             publisher.id,
             publisher.status
         );
-        return Err(StatusCode::UNAUTHORIZED);
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     // Record request (non-blocking, ignore errors)
@@ -56,6 +56,5 @@ pub async fn api_key_auth_middleware(
 
     // Attach publisher to request extensions
     request.extensions_mut().insert(publisher);
-
-    Ok(next.run(request).await)
+    next.run(request).await
 }
