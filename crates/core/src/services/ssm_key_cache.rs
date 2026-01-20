@@ -12,9 +12,9 @@ struct CachedKey {
 static ENCRYPTION_KEY_CACHE: Lazy<Mutex<HashMap<String, CachedKey>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-const CACHE_TTL_SECONDS: u64 = 3600; // 1 hour
+const CACHE_TTL_SECONDS: u64 = 21600; // 6 hours
 
-/// Get SSM parameter with in-memory caching (1 hour TTL)
+/// Get SSM parameter with in-memory caching (6 hours TTL)
 /// This provides a fast in-memory cache layer on top of SSM service's Redis cache
 pub async fn get_ssm_parameter_cached(
     ssm: &SsmService,

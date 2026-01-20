@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::AppState;
+use leadsnebula_core::services::auction_timing::AuctionTiming;
+use leadsnebula_core::services::diagnostic_metrics::DiagnosticMetrics;
 use leadsnebula_core::services::ssm_key_cache::get_ssm_parameter_cached;
 
 fn map_error_to_user(err_text: &str) -> (String, String) {
@@ -164,6 +166,11 @@ async fn create_lead(
     Extension(publisher): Extension<Publisher>,
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
+    // Initialize timing and metrics
+    let mut timing = AuctionTiming::new();
+    let metrics = DiagnosticMetrics::new();
+
+    let stage_lead_received = timing.start_stage("lead_received", serde_json::json!({}));
     let request_level_verbose = payload.verbose.unwrap_or(false);
     let lead_data = payload.lead;
     let request_type = lead_data
@@ -177,14 +184,28 @@ async fn create_lead(
     } else {
         lead_data.verbose.unwrap_or(false)
     };
+    timing.complete_stage(
+        stage_lead_received,
+        Some(serde_json::json!({"request_type": request_type.clone()})),
+    );
+
+    // Publisher validation (already done via Extension middleware)
+    let stage_publisher = timing.start_stage("publisher_validation", serde_json::json!({}));
+    timing.complete_stage(
+        stage_publisher,
+        Some(serde_json::json!({"publisher_id": publisher.id})),
+    );
 
     // Validate vertical (CACHED - 24h TTL, verticals rarely change)
+    let stage_vertical = timing.start_stage("vertical_lookup", serde_json::json!({}));
+    let vertical_start = std::time::Instant::now();
     let cache_key = format!("vertical:slug:{}", lead_data.vertical);
 
-    let vertical_result = if let Some(cache) = &state.cache {
+    let (vertical_result, cache_hit) = if let Some(cache) = &state.cache {
         // Use cached lookup with 24h TTL
         // Cache stores Option<Vertical> - serialize None as "null"
-        match cache
+        let cache_check_start = std::time::Instant::now();
+        let result = match cache
             .get_or_insert_with(
                 &cache_key,
                 86400, // 24 hours
@@ -201,25 +222,46 @@ async fn create_lead(
             )
             .await
         {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                let cache_hit = cache_check_start.elapsed().as_millis() < 10; // Very fast = cache hit
+                if cache_hit {
+                    metrics.record_cache_hit();
+                } else {
+                    metrics.record_cache_miss();
+                }
+                (Ok(v), cache_hit)
+            }
             Err(e) => {
                 tracing::warn!("Cache lookup failed, falling back to DB: {}", e);
+                metrics.record_cache_miss();
                 // Fallback to direct DB query
-                leadsnebula_core::models::vertical::Vertical::find_by_slug(
+                let db_start = std::time::Instant::now();
+                let result = leadsnebula_core::models::vertical::Vertical::find_by_slug(
                     &state.db_pool,
                     &lead_data.vertical,
                 )
-                .await
+                .await;
+                metrics.record_query(db_start.elapsed().as_millis() as u64);
+                (result, false)
             }
-        }
+        };
+        result
     } else {
         // No cache available, use direct DB query
-        leadsnebula_core::models::vertical::Vertical::find_by_slug(
+        let db_start = std::time::Instant::now();
+        let result = leadsnebula_core::models::vertical::Vertical::find_by_slug(
             &state.db_pool,
             &lead_data.vertical,
         )
-        .await
+        .await;
+        metrics.record_query(db_start.elapsed().as_millis() as u64);
+        (result, false)
     };
+    let vertical_duration = vertical_start.elapsed().as_millis() as u64;
+    timing.complete_stage(
+        stage_vertical,
+        Some(serde_json::json!({"cache_hit": cache_hit, "duration_ms": vertical_duration})),
+    );
 
     let vertical = match vertical_result {
         Ok(Some(v)) => v,
@@ -558,6 +600,7 @@ async fn create_lead(
             publisher.id,
             vertical.slug.clone(),
             request_type.clone(),
+            state.cache.clone(),
         );
         match router
             .route(
@@ -845,6 +888,8 @@ async fn create_lead(
     // Pre-insert checks: determine buyer_id and campaign_id to satisfy NOT NULL constraints
     // OPTIMIZED: Single query combining all pre-checks (reduces 4-6 queries to 1)
     // CACHED: Short TTL (300s) since campaigns can change
+    let stage_prechecks = timing.start_stage("pre_checks", serde_json::json!({}));
+    let prechecks_start = std::time::Instant::now();
     let mut preproblems: Vec<String> = Vec::new();
     let mut buyer_id_opt: Option<uuid::Uuid> = None;
     let mut campaign_id_opt: Option<uuid::Uuid> = None;
@@ -857,7 +902,7 @@ async fn create_lead(
 
     // Enhanced single query combining all pre-checks (avoids fallback query)
     // CACHED: Short TTL (300s) since campaigns can change
-    let result = if let Some(cache) = &state.cache {
+    let (result, prechecks_cache_hit) = if let Some(cache) = &state.cache {
         // Use cached lookup with 300s TTL
         match cache
             .get_or_insert_with(
@@ -894,11 +939,21 @@ async fn create_lead(
             )
             .await
         {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                let cache_hit = prechecks_start.elapsed().as_millis() < 10; // Very fast = cache hit
+                if cache_hit {
+                    metrics.record_cache_hit();
+                } else {
+                    metrics.record_cache_miss();
+                }
+                (Ok(r), cache_hit)
+            }
             Err(e) => {
                 tracing::warn!("Cache lookup failed for prechecks, falling back to DB: {}", e);
+                metrics.record_cache_miss();
                 // Fallback to direct DB query
-                sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+                let db_start = std::time::Instant::now();
+                let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
                     r#"
                     SELECT 
                         c.id AS campaign_id,
@@ -922,12 +977,15 @@ async fn create_lead(
                 .bind(campaign_token)
                 .bind(vertical.id)
                 .fetch_optional(&*state.db_pool)
-                .await
+                .await;
+                metrics.record_query(db_start.elapsed().as_millis() as u64);
+                (result, false)
             }
         }
     } else {
         // No cache available, use direct DB query
-        sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+        let db_start = std::time::Instant::now();
+        let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
             r#"
             SELECT 
                 c.id AS campaign_id,
@@ -951,8 +1009,12 @@ async fn create_lead(
         .bind(campaign_token)
         .bind(vertical.id)
         .fetch_optional(&*state.db_pool)
-        .await
+        .await;
+        metrics.record_query(db_start.elapsed().as_millis() as u64);
+        (result, false)
     };
+    let prechecks_duration = prechecks_start.elapsed().as_millis() as u64;
+    timing.complete_stage(stage_prechecks, Some(serde_json::json!({"cache_hit": prechecks_cache_hit, "duration_ms": prechecks_duration})));
 
     match result {
         Ok(Some((campaign_id, effective_buyer_id, has_ping_tree))) => {
@@ -1065,6 +1127,7 @@ async fn create_lead(
     };
 
     // Encrypt PII fields using SSM deterministic key
+    let stage_encryption = timing.start_stage("encryption_setup", serde_json::json!({}));
     let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
     let det_path = format!(
         "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
@@ -1133,7 +1196,12 @@ async fn create_lead(
     let zip_encrypted = encrypt_pii(lead_data.zip.clone());
     let ip_address_encrypted = encrypt_pii(lead_data.ip_address.clone());
 
+    // Complete encryption stage
+    timing.complete_stage(stage_encryption, Some(serde_json::json!({})));
+
     // Insert lead into database
+    let stage_lead_insertion = timing.start_stage("lead_insertion", serde_json::json!({}));
+    let lead_insert_start = std::time::Instant::now();
     tracing::info!(
         "Creating lead: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}",
         event_id,
@@ -1193,6 +1261,12 @@ async fn create_lead(
     .bind(ip_address_encrypted)
     .fetch_one(&*state.db_pool)
     .await;
+    let lead_insert_duration = lead_insert_start.elapsed().as_millis() as u64;
+    metrics.record_query(lead_insert_duration);
+    timing.complete_stage(
+        stage_lead_insertion,
+        Some(serde_json::json!({"duration_ms": lead_insert_duration})),
+    );
 
     let lead_uuid = match result {
         Ok(row) => row.get::<uuid::Uuid, _>(0),
@@ -1361,20 +1435,25 @@ async fn create_lead(
     };
 
     // Route the lead through ping tree
+    let stage_routing_start = timing.start_stage("routing_start", serde_json::json!({}));
     let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
         lead,
         publisher.id,
         vertical.slug.clone(),
         request_type.clone(),
+        state.cache.clone(),
     );
 
-    match router
+    let routing_result = router
         .route(
             state.db_pool.clone(),
             std::sync::Arc::new(state.config.encryption_key.clone()),
         )
-        .await
-    {
+        .await;
+    timing.complete_stage(stage_routing_start, Some(serde_json::json!({})));
+    let stage_routing_complete = timing.start_stage("routing_complete", serde_json::json!({}));
+
+    match routing_result {
         Ok(routing_result) => {
             // Determine a clearer message and include price when available
             // Helper to round to 2 decimals
@@ -1655,6 +1734,12 @@ async fn create_lead(
             }
 
             // Log diagnostic summary and timing before returning
+            timing.complete_stage(
+                stage_routing_complete,
+                Some(serde_json::json!({"status": routing_result.status.clone()})),
+            );
+            timing.log_summary(&lead_uuid.to_string());
+            metrics.log_summary("carina");
 
             Ok(Json(LeadResponse {
                 status: StatusNode {
@@ -1678,6 +1763,12 @@ async fn create_lead(
         }
         Err(e) => {
             tracing::error!("Routing error: {}", e);
+            timing.complete_stage(
+                stage_routing_complete,
+                Some(serde_json::json!({"error": e.to_string()})),
+            );
+            timing.log_summary(&lead_uuid.to_string());
+            metrics.log_summary("carina");
             let (message, technical) = map_error_to_user(&e.to_string());
             Ok(Json(LeadResponse {
                 status: StatusNode {

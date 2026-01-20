@@ -37,19 +37,39 @@ impl CacheService {
             match &result {
                 Ok(Some(_)) => {
                     self.hits.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("Cache hit: {}", key);
+                    tracing::debug!(
+                        cache_key = %key,
+                        cache_result = "hit",
+                        "Cache hit"
+                    );
                 }
                 Ok(None) => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("Cache miss: {}", key);
+                    tracing::debug!(
+                        cache_key = %key,
+                        cache_result = "miss",
+                        "Cache miss"
+                    );
                 }
-                Err(_) => {
+                Err(e) => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        cache_key = %key,
+                        cache_result = "error",
+                        error = %e,
+                        "Cache get error"
+                    );
                 }
             }
             result
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                cache_key = %key,
+                cache_result = "miss",
+                reason = "redis_not_configured",
+                "Cache miss (Redis not configured)"
+            );
             Ok(None)
         }
     }
@@ -103,15 +123,38 @@ impl CacheService {
         // Try cache first
         if let Some(cached) = self.get(key).await? {
             if let Ok(value) = serde_json::from_str::<T>(&cached) {
+                tracing::debug!(
+                    cache_key = %key,
+                    cache_result = "hit",
+                    ttl_seconds = ttl_seconds,
+                    "Cache get_or_insert_with: hit"
+                );
                 return Ok(value);
             }
             // If deserialization fails, treat as cache miss and continue
+            tracing::warn!(
+                cache_key = %key,
+                cache_result = "deserialization_failed",
+                "Cache hit but deserialization failed, treating as miss"
+            );
         }
 
         // Cache miss - fetch from DB
+        tracing::debug!(
+            cache_key = %key,
+            cache_result = "miss",
+            ttl_seconds = ttl_seconds,
+            "Cache get_or_insert_with: miss, fetching from source"
+        );
         let value = f().await?;
         let serialized = serde_json::to_string(&value)?;
         self.set_with_ttl(key, &serialized, ttl_seconds).await?;
+        tracing::debug!(
+            cache_key = %key,
+            cache_result = "set",
+            ttl_seconds = ttl_seconds,
+            "Cache get_or_insert_with: value cached"
+        );
         Ok(value)
     }
 

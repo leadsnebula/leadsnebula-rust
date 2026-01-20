@@ -307,6 +307,7 @@ mod ping_tree_router_db_integration_tests {
             publisher_id,
             vertical_slug,
             "ping".to_string(),
+            None,
         );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
@@ -375,6 +376,7 @@ mod ping_tree_router_db_integration_tests {
             publisher_id,
             vertical_slug,
             "ping".to_string(),
+            None,
         );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
@@ -441,6 +443,7 @@ mod ping_tree_router_db_integration_tests {
             publisher_id,
             vertical_slug,
             "fullpost".to_string(),
+            None,
         );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests

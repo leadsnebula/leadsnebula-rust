@@ -250,6 +250,7 @@ async fn test_e2e_ping_request_flow() {
         publisher_id,
         vertical_slug.clone(),
         "ping".to_string(),
+        None,
     );
 
     let pool_arc = Arc::new(pool.clone());

@@ -5,6 +5,7 @@ use crate::models::{
     campaign::Campaign,
     lead::Lead,
 };
+use crate::services::{auction_timing::AuctionTiming, diagnostic_metrics::DiagnosticMetrics};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use reqwest::header::HeaderMap;
@@ -46,6 +47,8 @@ pub struct BuyerRouter {
     pool: Arc<PgPool>,
     #[allow(dead_code)] // May be used in future for external buyer encryption
     encryption_key: Arc<Vec<u8>>,
+    timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
+    metrics: Option<Arc<DiagnosticMetrics>>,
 }
 
 impl BuyerRouter {
@@ -62,7 +65,19 @@ impl BuyerRouter {
             request_type,
             pool,
             encryption_key,
+            timing: None,
+            metrics: None,
         }
+    }
+
+    pub fn with_timing_and_metrics(
+        mut self,
+        timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
+        metrics: Option<Arc<DiagnosticMetrics>>,
+    ) -> Self {
+        self.timing = timing;
+        self.metrics = metrics;
+        self
     }
 
     pub async fn route(&self) -> Result<BuyerResponse> {
@@ -99,9 +114,71 @@ impl BuyerRouter {
 
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
+            tracing::info!(
+                "Using direct Pulsar call (NO HTTP) for campaign {}",
+                campaign.id
+            );
+            if integration.slug != "pulsar" {
+                tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
+                return Err(anyhow::anyhow!(
+                    "Invalid internal buyer configuration: {}",
+                    integration.slug
+                ));
+            }
+            // Start buyer_ping_sent stage
+            let stage_ping_sent = if let Some(ref t) = self.timing {
+                let mut timing_guard = t.lock().unwrap();
+                Some(timing_guard.start_stage(
+                    "buyer_ping_sent",
+                    serde_json::json!({"campaign_id": campaign.id, "method": "direct"}),
+                ))
+            } else {
+                None
+            };
             use crate::services::pulsar::PulsarService;
+            let ping_start = std::time::Instant::now();
             let result =
                 PulsarService::route_ping_direct(self.pool.clone(), &self.lead, campaign).await;
+            let ping_duration = ping_start.elapsed().as_millis() as u64;
+
+            // Complete buyer_ping_sent and start buyer_ping_response
+            if let Some(ref t) = self.timing {
+                if let Some(stage) = stage_ping_sent {
+                    let mut timing_guard = t.lock().unwrap();
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({"duration_ms": ping_duration})),
+                    );
+                }
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard.start_stage(
+                    "buyer_ping_response",
+                    serde_json::json!({"campaign_id": campaign.id}),
+                );
+            }
+            if let Some(ref m) = self.metrics {
+                m.record_query(ping_duration);
+            }
+
+            // Complete buyer_ping_response
+            if let Some(ref t) = self.timing {
+                let mut timing_guard = t.lock().unwrap();
+                if let Some(stage) = timing_guard
+                    .stages
+                    .iter()
+                    .position(|s| s.name == "buyer_ping_response" && s.completed_at.is_none())
+                {
+                    let success = result.is_ok();
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({
+                            "success": success,
+                            "duration_ms": ping_duration
+                        })),
+                    );
+                }
+            }
+
             return result;
         }
 
@@ -120,6 +197,17 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
+        // Start buyer_ping_sent stage
+        let stage_ping_sent = if let Some(ref t) = self.timing {
+            let mut timing_guard = t.lock().unwrap();
+            Some(timing_guard.start_stage(
+                "buyer_ping_sent",
+                serde_json::json!({"campaign_id": campaign.id, "endpoint": endpoint}),
+            ))
+        } else {
+            None
+        };
+
         // Send HTTP request
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
@@ -130,6 +218,7 @@ impl BuyerRouter {
                 .map_err(|e| anyhow::anyhow!("Invalid content type: {}", e))?,
         );
 
+        let ping_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -138,9 +227,52 @@ impl BuyerRouter {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        let ping_duration = ping_start.elapsed().as_millis() as u64;
+
+        // Complete buyer_ping_sent and start buyer_ping_response
+        if let Some(ref t) = self.timing {
+            if let Some(stage) = stage_ping_sent {
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard.complete_stage(
+                    stage,
+                    Some(serde_json::json!({"duration_ms": ping_duration})),
+                );
+            }
+            let mut timing_guard = t.lock().unwrap();
+            timing_guard.start_stage(
+                "buyer_ping_response",
+                serde_json::json!({"campaign_id": campaign.id}),
+            );
+        }
+        if let Some(ref m) = self.metrics {
+            m.record_query(ping_duration);
+        }
 
         // Parse response
-        self.parse_buyer_response(response, "ping").await
+        let parse_start = std::time::Instant::now();
+        let result = self.parse_buyer_response(response, "ping").await;
+        let parse_duration = parse_start.elapsed().as_millis() as u64;
+
+        // Complete buyer_ping_response
+        if let Some(ref t) = self.timing {
+            let mut timing_guard = t.lock().unwrap();
+            if let Some(stage) = timing_guard
+                .stages
+                .iter()
+                .position(|s| s.name == "buyer_ping_response" && s.completed_at.is_none())
+            {
+                let success = result.is_ok();
+                timing_guard.complete_stage(
+                    stage,
+                    Some(serde_json::json!({
+                        "success": success,
+                        "duration_ms": parse_duration
+                    })),
+                );
+            }
+        }
+
+        result
     }
 
     async fn route_post(&self, campaign: &Campaign) -> Result<BuyerResponse> {
@@ -155,14 +287,77 @@ impl BuyerRouter {
 
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
+            tracing::info!(
+                "Using direct Pulsar call (NO HTTP) for campaign {}",
+                campaign.id
+            );
+            if integration.slug != "pulsar" {
+                tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
+                return Err(anyhow::anyhow!(
+                    "Invalid internal buyer configuration: {}",
+                    integration.slug
+                ));
+            }
+            // Start buyer_post_sent stage
+            let stage_post_sent = if let Some(ref t) = self.timing {
+                let mut timing_guard = t.lock().unwrap();
+                Some(timing_guard.start_stage(
+                    "buyer_post_sent",
+                    serde_json::json!({"campaign_id": campaign.id, "method": "direct"}),
+                ))
+            } else {
+                None
+            };
             use crate::services::pulsar::PulsarService;
-            return PulsarService::route_post_direct(
+            let post_start = std::time::Instant::now();
+            let result = PulsarService::route_post_direct(
                 self.pool.clone(),
                 &self.lead,
                 campaign,
                 promise_id,
             )
             .await;
+            let post_duration = post_start.elapsed().as_millis() as u64;
+
+            // Complete buyer_post_sent and start buyer_post_response
+            if let Some(ref t) = self.timing {
+                if let Some(stage) = stage_post_sent {
+                    let mut timing_guard = t.lock().unwrap();
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({"duration_ms": post_duration})),
+                    );
+                }
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard.start_stage(
+                    "buyer_post_response",
+                    serde_json::json!({"campaign_id": campaign.id}),
+                );
+            }
+            if let Some(ref m) = self.metrics {
+                m.record_query(post_duration);
+            }
+
+            // Complete buyer_post_response
+            if let Some(ref t) = self.timing {
+                let mut timing_guard = t.lock().unwrap();
+                if let Some(stage) = timing_guard
+                    .stages
+                    .iter()
+                    .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
+                {
+                    let success = result.is_ok();
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({
+                            "success": success,
+                            "duration_ms": post_duration
+                        })),
+                    );
+                }
+            }
+
+            return result;
         }
 
         // For external buyers, use HTTP
@@ -182,6 +377,17 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
+        // Start buyer_post_sent stage
+        let stage_post_sent = if let Some(ref t) = self.timing {
+            let mut timing_guard = t.lock().unwrap();
+            Some(timing_guard.start_stage(
+                "buyer_post_sent",
+                serde_json::json!({"campaign_id": campaign.id, "endpoint": endpoint}),
+            ))
+        } else {
+            None
+        };
+
         // Send HTTP request
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
@@ -200,6 +406,7 @@ impl BuyerRouter {
                 .map_err(|e| anyhow::anyhow!("Invalid buyer ID format: {}", e))?,
         );
 
+        let post_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -208,9 +415,52 @@ impl BuyerRouter {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        let post_duration = post_start.elapsed().as_millis() as u64;
+
+        // Complete buyer_post_sent and start buyer_post_response
+        if let Some(ref t) = self.timing {
+            if let Some(stage) = stage_post_sent {
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard.complete_stage(
+                    stage,
+                    Some(serde_json::json!({"duration_ms": post_duration})),
+                );
+            }
+            let mut timing_guard = t.lock().unwrap();
+            timing_guard.start_stage(
+                "buyer_post_response",
+                serde_json::json!({"campaign_id": campaign.id}),
+            );
+        }
+        if let Some(ref m) = self.metrics {
+            m.record_query(post_duration);
+        }
 
         // Parse response
-        self.parse_buyer_response(response, "post").await
+        let parse_start = std::time::Instant::now();
+        let result = self.parse_buyer_response(response, "post").await;
+        let parse_duration = parse_start.elapsed().as_millis() as u64;
+
+        // Complete buyer_post_response
+        if let Some(ref t) = self.timing {
+            let mut timing_guard = t.lock().unwrap();
+            if let Some(stage) = timing_guard
+                .stages
+                .iter()
+                .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
+            {
+                let success = result.is_ok();
+                timing_guard.complete_stage(
+                    stage,
+                    Some(serde_json::json!({
+                        "success": success,
+                        "duration_ms": parse_duration
+                    })),
+                );
+            }
+        }
+
+        result
     }
 
     async fn route_fullpost(&self, campaign: &Campaign) -> Result<BuyerResponse> {
@@ -219,9 +469,69 @@ impl BuyerRouter {
 
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
+            tracing::info!(
+                "Using direct Pulsar call (NO HTTP) for campaign {}",
+                campaign.id
+            );
+            if integration.slug != "pulsar" {
+                tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
+                return Err(anyhow::anyhow!(
+                    "Invalid internal buyer configuration: {}",
+                    integration.slug
+                ));
+            }
+            // Start buyer_post_sent stage (fullpost uses post stages)
+            let stage_post_sent = if let Some(ref t) = self.timing {
+                let mut timing_guard = t.lock().unwrap();
+                Some(timing_guard.start_stage("buyer_post_sent", serde_json::json!({"campaign_id": campaign.id, "method": "direct", "request_type": "fullpost"})))
+            } else {
+                None
+            };
             use crate::services::pulsar::PulsarService;
-            return PulsarService::route_fullpost_direct(self.pool.clone(), &self.lead, campaign)
-                .await;
+            let post_start = std::time::Instant::now();
+            let result =
+                PulsarService::route_fullpost_direct(self.pool.clone(), &self.lead, campaign).await;
+            let post_duration = post_start.elapsed().as_millis() as u64;
+
+            // Complete buyer_post_sent and start buyer_post_response
+            if let Some(ref t) = self.timing {
+                if let Some(stage) = stage_post_sent {
+                    let mut timing_guard = t.lock().unwrap();
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({"duration_ms": post_duration})),
+                    );
+                }
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard.start_stage(
+                    "buyer_post_response",
+                    serde_json::json!({"campaign_id": campaign.id}),
+                );
+            }
+            if let Some(ref m) = self.metrics {
+                m.record_query(post_duration);
+            }
+
+            // Complete buyer_post_response
+            if let Some(ref t) = self.timing {
+                let mut timing_guard = t.lock().unwrap();
+                if let Some(stage) = timing_guard
+                    .stages
+                    .iter()
+                    .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
+                {
+                    let success = result.is_ok();
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({
+                            "success": success,
+                            "duration_ms": post_duration
+                        })),
+                    );
+                }
+            }
+
+            return result;
         }
 
         // For external buyers, use HTTP
@@ -239,6 +549,14 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
+        // Start buyer_post_sent stage
+        let stage_post_sent = if let Some(ref t) = self.timing {
+            let mut timing_guard = t.lock().unwrap();
+            Some(timing_guard.start_stage("buyer_post_sent", serde_json::json!({"campaign_id": campaign.id, "endpoint": endpoint, "request_type": "fullpost"})))
+        } else {
+            None
+        };
+
         // Send HTTP request
         let client = &*HTTP_CLIENT;
         let mut headers = HeaderMap::new();
@@ -257,6 +575,7 @@ impl BuyerRouter {
                 .map_err(|e| anyhow::anyhow!("Invalid buyer ID format: {}", e))?,
         );
 
+        let post_start = std::time::Instant::now();
         let response = client
             .post(&endpoint)
             .json(&payload)
@@ -265,9 +584,52 @@ impl BuyerRouter {
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        let post_duration = post_start.elapsed().as_millis() as u64;
+
+        // Complete buyer_post_sent and start buyer_post_response
+        if let Some(ref t) = self.timing {
+            if let Some(stage) = stage_post_sent {
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard.complete_stage(
+                    stage,
+                    Some(serde_json::json!({"duration_ms": post_duration})),
+                );
+            }
+            let mut timing_guard = t.lock().unwrap();
+            timing_guard.start_stage(
+                "buyer_post_response",
+                serde_json::json!({"campaign_id": campaign.id}),
+            );
+        }
+        if let Some(ref m) = self.metrics {
+            m.record_query(post_duration);
+        }
 
         // Parse response
-        self.parse_buyer_response(response, "fullpost").await
+        let parse_start = std::time::Instant::now();
+        let result = self.parse_buyer_response(response, "fullpost").await;
+        let parse_duration = parse_start.elapsed().as_millis() as u64;
+
+        // Complete buyer_post_response
+        if let Some(ref t) = self.timing {
+            let mut timing_guard = t.lock().unwrap();
+            if let Some(stage) = timing_guard
+                .stages
+                .iter()
+                .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
+            {
+                let success = result.is_ok();
+                timing_guard.complete_stage(
+                    stage,
+                    Some(serde_json::json!({
+                        "success": success,
+                        "duration_ms": parse_duration
+                    })),
+                );
+            }
+        }
+
+        result
     }
 
     /// Get buyer integration (and optionally credentials) for a campaign

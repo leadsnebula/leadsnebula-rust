@@ -1,13 +1,17 @@
+use crate::cache::CacheService;
 use crate::models::{
     buyer_qualification_config::BuyerQualificationConfig, campaign::Campaign, enums::LeadStatus,
     lead::Lead, ping_tree::PingTree, ping_tree_campaign::PingTreeCampaign,
 };
+use crate::services::auction_timing::AuctionTiming;
 use crate::services::buyer_router::BuyerResponse;
+use crate::services::diagnostic_metrics::DiagnosticMetrics;
 use anyhow::Result;
 use hex;
 use rand;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -49,16 +53,38 @@ pub struct PingTreeRouter {
     publisher_id: Uuid,
     vertical: String,
     request_type: String,
+    cache: Option<Arc<CacheService>>,
+    timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
+    metrics: Option<Arc<DiagnosticMetrics>>,
 }
 
 impl PingTreeRouter {
-    pub fn new(lead: Lead, publisher_id: Uuid, vertical: String, request_type: String) -> Self {
+    pub fn new(
+        lead: Lead,
+        publisher_id: Uuid,
+        vertical: String,
+        request_type: String,
+        cache: Option<Arc<CacheService>>,
+    ) -> Self {
         Self {
             lead,
             publisher_id,
             vertical,
             request_type,
+            cache,
+            timing: None,
+            metrics: None,
         }
+    }
+
+    pub fn with_timing_and_metrics(
+        mut self,
+        timing: Arc<std::sync::Mutex<AuctionTiming>>,
+        metrics: Arc<DiagnosticMetrics>,
+    ) -> Self {
+        self.timing = Some(timing);
+        self.metrics = Some(metrics);
+        self
     }
 
     pub async fn route(
@@ -66,36 +92,100 @@ impl PingTreeRouter {
         pool: Arc<PgPool>,
         encryption_key: Arc<Vec<u8>>,
     ) -> Result<RoutingResult> {
-        // Find active ping tree for publisher and vertical with revshare info
-        let (ping_tree, _revshare_percentage, _revshare_flat_amount) =
-            match PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
+        // Initialize timing and metrics (create locally if not provided)
+        let local_timing = AuctionTiming::new();
+        let local_metrics = Arc::new(DiagnosticMetrics::new());
+        let timing = self
+            .timing
+            .as_ref()
+            .map(|t| t.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(local_timing)));
+        let metrics = self
+            .metrics
+            .as_ref()
+            .map(|m| m.clone())
+            .unwrap_or_else(|| local_metrics);
+
+        // Find active ping tree for publisher and vertical with revshare info (CACHED - 6h TTL)
+        let stage_ping_tree_lookup = {
+            let mut t = timing.lock().unwrap();
+            t.start_stage("ping_tree_lookup", serde_json::json!({}))
+        };
+        let ping_tree_start = std::time::Instant::now();
+        let cache_key = format!("pingtree:pub:{}:vert:{}", self.publisher_id, self.vertical);
+        let cache_stats_before = self.cache.as_ref().map(|cache| cache.get_stats());
+        let ping_tree_result = if let Some(cache) = &self.cache {
+            cache
+                .get_or_insert_with(&cache_key, 21600, || async {
+                    PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                })
                 .await?
-            {
-                Some((pt, revshare_pct, revshare_flat)) => (pt, revshare_pct, revshare_flat),
-                None => {
-                    // Update lead status to error
-                    self.update_lead_status(
-                        pool.as_ref(),
-                        LeadStatus::Error,
-                        Some("Publisher not assigned to any ping tree"),
-                    )
-                    .await?;
-                    return Ok(RoutingResult {
-                        success: false,
-                        status: "error".to_string(),
-                        error: Some(format!(
-                            "Publisher not assigned to any ping tree for vertical: {}",
-                            self.vertical
-                        )),
-                        promise_id: None,
-                        ping_id: None,
-                        post_id: None,
-                        price: None,
-                        campaign_id: None,
-                        buyer_id: None,
-                    });
-                }
+        } else {
+            PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical).await?
+        };
+        let ping_tree_duration = ping_tree_start.elapsed().as_millis() as u64;
+        let cache_stats_after = self.cache.as_ref().map(|cache| cache.get_stats());
+        let was_cache_hit =
+            if let (Some(before), Some(after)) = (cache_stats_before, cache_stats_after) {
+                // If hits increased, it was a cache hit
+                after.hits > before.hits
+            } else {
+                false
             };
+        if was_cache_hit {
+            metrics.record_cache_hit();
+        } else if ping_tree_duration > 0 {
+            metrics.record_cache_miss();
+        }
+
+        let (ping_tree, _revshare_percentage, _revshare_flat_amount) = match ping_tree_result {
+            Some((pt, revshare_pct, revshare_flat)) => {
+                {
+                    let mut t = timing.lock().unwrap();
+                    t.complete_stage(
+                        stage_ping_tree_lookup,
+                        Some(serde_json::json!({
+                            "ping_tree_id": pt.id,
+                            "duration_ms": ping_tree_duration,
+                            "cache_hit": was_cache_hit
+                        })),
+                    );
+                }
+                (pt, revshare_pct, revshare_flat)
+            }
+            None => {
+                {
+                    let mut t = timing.lock().unwrap();
+                    t.complete_stage(
+                        stage_ping_tree_lookup,
+                        Some(serde_json::json!({"error": "not_found"})),
+                    );
+                }
+                // Update lead status to error
+                self.update_lead_status(
+                    pool.as_ref(),
+                    LeadStatus::Error,
+                    Some("Publisher not assigned to any ping tree"),
+                )
+                .await?;
+                return Ok(RoutingResult {
+                    success: false,
+                    status: "error".to_string(),
+                    error: Some(format!(
+                        "Publisher not assigned to any ping tree for vertical: {}",
+                        self.vertical
+                    )),
+                    promise_id: None,
+                    ping_id: None,
+                    post_id: None,
+                    price: None,
+                    campaign_id: None,
+                    buyer_id: None,
+                });
+            }
+        };
 
         // Check ping tree status
         if !ping_tree.is_active() {
@@ -121,9 +211,55 @@ impl PingTreeRouter {
             });
         }
 
-        // Get enabled campaigns from ping tree
-        let ping_tree_campaigns =
-            PingTreeCampaign::find_enabled_for_ping_tree(pool.as_ref(), &ping_tree.id).await?;
+        // Get enabled campaigns from ping tree (CACHED - 6h TTL)
+        let stage_campaigns_loaded = {
+            let mut t = timing.lock().unwrap();
+            t.start_stage("campaigns_loaded", serde_json::json!({}))
+        };
+        let campaigns_start = std::time::Instant::now();
+        let campaigns_cache_key = format!("campaigns:pingtree:{}", ping_tree.id);
+        let cache_hit_before = if let Some(cache) = &self.cache {
+            let stats = cache.get_stats();
+            stats.hits + stats.misses
+        } else {
+            0
+        };
+        let ping_tree_campaigns = if let Some(cache) = &self.cache {
+            cache
+                .get_or_insert_with(&campaigns_cache_key, 21600, || async {
+                    PingTreeCampaign::find_enabled_for_ping_tree(pool.as_ref(), &ping_tree.id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                })
+                .await?
+        } else {
+            PingTreeCampaign::find_enabled_for_ping_tree(pool.as_ref(), &ping_tree.id).await?
+        };
+        let campaigns_duration = campaigns_start.elapsed().as_millis() as u64;
+        let cache_hit_after = if let Some(cache) = &self.cache {
+            let stats = cache.get_stats();
+            stats.hits + stats.misses
+        } else {
+            0
+        };
+        let was_cache_hit = cache_hit_after > cache_hit_before;
+        if was_cache_hit {
+            metrics.record_cache_hit();
+        } else if campaigns_duration > 0 {
+            metrics.record_cache_miss();
+        }
+        {
+            let mut t = timing.lock().unwrap();
+            t.complete_stage(
+                stage_campaigns_loaded,
+                Some(serde_json::json!({
+                    "campaign_count": ping_tree_campaigns.len(),
+                    "duration_ms": campaigns_duration,
+                    "cache_hit": was_cache_hit
+                })),
+            );
+        }
+        metrics.record_query(campaigns_duration);
 
         if ping_tree_campaigns.is_empty() {
             self.update_lead_status(
@@ -172,18 +308,29 @@ impl PingTreeRouter {
         }
 
         // Preload qualification configs for all unique buyers before spawning ping tasks
+        let stage_qualification_configs = {
+            let mut t = timing.lock().unwrap();
+            t.start_stage("qualification_configs_loaded", serde_json::json!({}))
+        };
         let unique_buyer_ids: Vec<Uuid> = campaigns
             .iter()
             .map(|c| c.buyer_id)
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        let qual_configs_query_start = std::time::Instant::now();
         let _qualification_configs: std::collections::HashMap<
             Uuid,
             Option<BuyerQualificationConfig>,
         > = BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
             .await
             .unwrap_or_default();
+        let qual_configs_duration = qual_configs_query_start.elapsed().as_millis() as u64;
+        metrics.record_query(qual_configs_duration);
+        {
+            let mut t = timing.lock().unwrap();
+            t.complete_stage(stage_qualification_configs, Some(serde_json::json!({"buyer_count": unique_buyer_ids.len(), "duration_ms": qual_configs_duration})));
+        }
         // Note: qualification_configs are preloaded and ready for use in buyer router tasks
 
         if campaigns.is_empty() {
@@ -214,12 +361,20 @@ impl PingTreeRouter {
                     &campaigns,
                     &priority_map,
                     encryption_key.clone(),
+                    timing.clone(),
+                    metrics.clone(),
                 )
                 .await
             }
             "post" => {
-                self.route_post(pool.clone(), &campaigns, encryption_key.clone())
-                    .await
+                self.route_post(
+                    pool.clone(),
+                    &campaigns,
+                    encryption_key.clone(),
+                    Some(timing.clone()),
+                    Some(metrics.clone()),
+                )
+                .await
             }
             "fullpost" => {
                 self.route_fullpost(
@@ -228,6 +383,8 @@ impl PingTreeRouter {
                     &ping_tree,
                     &priority_map,
                     encryption_key.clone(),
+                    timing.clone(),
+                    metrics.clone(),
                 )
                 .await
             }
@@ -259,11 +416,22 @@ impl PingTreeRouter {
         campaigns: &[Campaign],
         priority_map: &std::collections::HashMap<Uuid, Option<i32>>,
         encryption_key: Arc<Vec<u8>>,
+        timing: Arc<std::sync::Mutex<AuctionTiming>>,
+        metrics: Arc<DiagnosticMetrics>,
     ) -> Result<RoutingResult> {
         use crate::services::buyer_router::BuyerRouter;
         use futures::future::join_all;
         use tokio::time::{timeout, Duration};
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
+
+        // Start ping auction stage
+        let stage_ping_auction = {
+            let mut t = timing.lock().unwrap();
+            t.start_stage(
+                "ping_auction_start",
+                serde_json::json!({"campaign_count": campaigns.len()}),
+            )
+        };
 
         // Send concurrent pings to all campaigns
         let mut task_futures = Vec::new();
@@ -295,7 +463,10 @@ impl PingTreeRouter {
         }
 
         // Wait for all responses concurrently (instead of sequentially)
+        let ping_auction_start = std::time::Instant::now();
         let task_results = join_all(task_futures).await;
+        let ping_auction_duration = ping_auction_start.elapsed().as_millis() as u64;
+        metrics.record_query(ping_auction_duration); // Track ping auction duration
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
 
         for (result, campaign_id) in task_results {
@@ -431,11 +602,31 @@ impl PingTreeRouter {
 
         // Batch insert all responses in one query
         if !batch_responses.is_empty() {
+            let stage_buyer_responses_persisted = {
+                let mut t = timing.lock().unwrap();
+                t.start_stage(
+                    "buyer_responses_persisted",
+                    serde_json::json!({"response_count": batch_responses.len()}),
+                )
+            };
             let pool_clone = pool.as_ref().clone();
+            let timing_clone = timing.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    PingTreeRouter::batch_insert_buyer_responses(&pool_clone, batch_responses).await
+                let insert_start = std::time::Instant::now();
+                let result =
+                    PingTreeRouter::batch_insert_buyer_responses(&pool_clone, batch_responses)
+                        .await;
+                let insert_duration = insert_start.elapsed().as_millis() as u64;
                 {
+                    let mut t = timing_clone.lock().unwrap();
+                    t.complete_stage(
+                        stage_buyer_responses_persisted,
+                        Some(serde_json::json!({
+                            "duration_ms": insert_duration
+                        })),
+                    );
+                }
+                if let Err(e) = result {
                     tracing::error!("Failed to batch insert buyer responses: {}", e);
                     #[cfg(feature = "sentry")]
                     {
@@ -446,6 +637,24 @@ impl PingTreeRouter {
                     }
                 }
             });
+        }
+
+        // Complete ping auction stage with timing
+        {
+            let mut t = timing.lock().unwrap();
+            t.complete_stage(
+                stage_ping_auction,
+                Some(serde_json::json!({
+                    "total_responses": responses.len(),
+                    "duration_ms": ping_auction_duration,
+                    "responses": responses.iter().map(|(resp, id, _)| serde_json::json!({
+                        "campaign_id": id,
+                        "status": resp.status,
+                        "bid": resp.bid,
+                        "success": resp.success
+                    })).collect::<Vec<_>>()
+                })),
+            );
         }
 
         // Filter valid responses
@@ -541,9 +750,29 @@ impl PingTreeRouter {
             });
         }
 
-        // Select winner: highest price, then priority, then random
+        // Select winner: highest bid, then priority, then random
+        let stage_winner_selection = {
+            let mut t = timing.lock().unwrap();
+            t.start_stage(
+                "winner_selection",
+                serde_json::json!({"valid_responses": valid_responses.len()}),
+            )
+        };
+        let winner_selection_start = std::time::Instant::now();
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
+        let winner_selection_duration = winner_selection_start.elapsed().as_millis() as u64;
+        {
+            let mut t = timing.lock().unwrap();
+            t.complete_stage(
+                stage_winner_selection,
+                Some(serde_json::json!({
+                    "winner_campaign_id": winner_campaign_id,
+                    "winner_bid": winner_response.bid,
+                    "duration_ms": winner_selection_duration
+                })),
+            );
+        }
 
         // Find winning campaign
         let winner_campaign = campaigns
@@ -605,6 +834,8 @@ impl PingTreeRouter {
         pool: Arc<PgPool>,
         campaigns: &[Campaign],
         encryption_key: Arc<Vec<u8>>,
+        timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
+        metrics: Option<Arc<DiagnosticMetrics>>,
     ) -> Result<RoutingResult> {
         use crate::services::buyer_router::BuyerRouter;
 
@@ -644,6 +875,17 @@ impl PingTreeRouter {
         };
 
         if let Some(campaign) = campaign_opt {
+            // Start post preparation stage
+            let stage_post_preparation = if let Some(ref t) = timing {
+                let mut timing_guard = t.lock().unwrap();
+                Some(timing_guard.start_stage(
+                    "post_preparation",
+                    serde_json::json!({"campaign_id": campaign.id}),
+                ))
+            } else {
+                None
+            };
+
             // Delegate to BuyerRouter for post handling
             let pool_clone = pool.clone();
             let encryption_key_clone = encryption_key.clone();
@@ -654,8 +896,65 @@ impl PingTreeRouter {
                 pool_clone,
                 encryption_key_clone,
             );
-            match buyer_router.route().await {
+
+            // Complete post preparation and start post sent
+            if let Some(ref t) = timing {
+                if let Some(stage) = stage_post_preparation {
+                    let mut timing_guard = t.lock().unwrap();
+                    timing_guard.complete_stage(stage, None);
+                }
+                let mut timing_guard = t.lock().unwrap();
+                timing_guard
+                    .start_stage("post_sent", serde_json::json!({"campaign_id": campaign.id}));
+            }
+
+            let post_start = std::time::Instant::now();
+            let post_result = buyer_router.route().await;
+            let post_duration = post_start.elapsed().as_millis() as u64;
+            if let Some(ref m) = metrics {
+                m.record_query(post_duration);
+            }
+
+            // Complete post sent and start post response
+            if let Some(ref t) = timing {
+                let mut timing_guard = t.lock().unwrap();
+                if let Some(stage) = timing_guard
+                    .stages
+                    .iter()
+                    .position(|s| s.name == "post_sent" && s.completed_at.is_none())
+                {
+                    timing_guard.complete_stage(
+                        stage,
+                        Some(serde_json::json!({"duration_ms": post_duration})),
+                    );
+                }
+                timing_guard.start_stage(
+                    "post_response",
+                    serde_json::json!({"campaign_id": campaign.id}),
+                );
+            }
+
+            match post_result {
                 Ok(bresp) => {
+                    // Complete post response stage
+                    if let Some(ref t) = timing {
+                        let mut timing_guard = t.lock().unwrap();
+                        if let Some(stage) = timing_guard
+                            .stages
+                            .iter()
+                            .position(|s| s.name == "post_response" && s.completed_at.is_none())
+                        {
+                            timing_guard.complete_stage(
+                                stage,
+                                Some(serde_json::json!({
+                                    "success": bresp.success,
+                                    "status": bresp.status.clone(),
+                                    "price": bresp.price,
+                                    "duration_ms": post_duration
+                                })),
+                            );
+                        }
+                    }
                     // Persist buyer response for this post attempt (with retry logic)
                     let bresp_json =
                         serde_json::to_value(&bresp).unwrap_or_else(|_| serde_json::json!({}));
@@ -798,6 +1097,7 @@ impl PingTreeRouter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn route_fullpost(
         &self,
         pool: Arc<PgPool>,
@@ -805,6 +1105,8 @@ impl PingTreeRouter {
         ping_tree: &PingTree,
         priority_map: &std::collections::HashMap<Uuid, Option<i32>>,
         encryption_key: Arc<Vec<u8>>,
+        timing: Arc<std::sync::Mutex<AuctionTiming>>,
+        metrics: Arc<DiagnosticMetrics>,
     ) -> Result<RoutingResult> {
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
@@ -814,6 +1116,7 @@ impl PingTreeRouter {
                 self.publisher_id,
                 self.vertical.clone(),
                 "ping".to_string(), // Force "ping" request_type for ping auction
+                self.cache.clone(),
             );
             let ping_result = ping_router
                 .route_ping_auction(
@@ -821,6 +1124,8 @@ impl PingTreeRouter {
                     campaigns,
                     priority_map,
                     encryption_key.clone(),
+                    timing.clone(),
+                    metrics.clone(),
                 )
                 .await?;
             if !ping_result.success {
@@ -840,11 +1145,18 @@ impl PingTreeRouter {
                 self.publisher_id,
                 self.vertical.clone(),
                 "post".to_string(),
+                self.cache.clone(),
             );
 
             // Route post using the updated lead (which now has promise_id and campaign_id)
             let post_result = post_router
-                .route_post(pool.clone(), campaigns, encryption_key.clone())
+                .route_post(
+                    pool.clone(),
+                    campaigns,
+                    encryption_key.clone(),
+                    Some(timing.clone()),
+                    Some(metrics.clone()),
+                )
                 .await?;
 
             // Log performance metrics to Sentry for monitoring
@@ -1087,8 +1399,15 @@ impl PingTreeRouter {
             return Ok(());
         }
 
-        let lead_ids: Vec<Uuid> = responses.iter().map(|r| r.0).collect();
+        // Validate no duplicate ping_ids before batch insert
         let ping_ids: Vec<Option<String>> = responses.iter().map(|r| r.1.clone()).collect();
+        let unique_ping_ids: HashSet<Option<String>> = ping_ids.iter().cloned().collect();
+        if ping_ids.len() != unique_ping_ids.len() {
+            tracing::error!("Duplicate ping_ids detected - aborting insert");
+            return Err(anyhow::anyhow!("Duplicate ping_ids in responses"));
+        }
+
+        let lead_ids: Vec<Uuid> = responses.iter().map(|r| r.0).collect();
         let post_ids: Vec<Option<String>> = responses.iter().map(|r| r.2.clone()).collect();
         let buyer_ids: Vec<Option<Uuid>> = responses.iter().map(|r| r.3).collect();
         let campaign_ids: Vec<Uuid> = responses.iter().map(|r| r.4).collect();
@@ -1322,15 +1641,13 @@ fn select_winner(
         }
     });
 
-    // Get highest price
-    let highest_price = sorted[0].0.price.unwrap_or(0.0);
+    // Get highest bid
+    let highest_bid = sorted[0].0.bid.unwrap_or(0.0);
 
-    // Find all candidates with highest price (within epsilon tolerance)
+    // Find all candidates with highest bid (within epsilon tolerance)
     let candidates: Vec<_> = sorted
         .iter()
-        .take_while(|(resp, _, _)| {
-            (resp.price.unwrap_or(0.0) - highest_price).abs() < PRICE_EPSILON
-        })
+        .take_while(|(resp, _, _)| (resp.bid.unwrap_or(0.0) - highest_bid).abs() < PRICE_EPSILON)
         .collect();
 
     // If only one, return it
@@ -1351,7 +1668,7 @@ fn select_winner(
         return (resp.clone(), *id, *pri);
     }
 
-    // Random selection from candidates with same price
+    // Random selection from candidates with same bid
     let winner = candidates[rand::random::<usize>() % candidates.len()];
     let (resp, id, pri) = winner;
     (resp.clone(), *id, *pri)
