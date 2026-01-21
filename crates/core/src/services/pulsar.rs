@@ -2,9 +2,11 @@
 // Provides direct function calls for internal Pulsar buyers (bypasses HTTP overhead)
 // This matches the Ruby implementation's direct method calls
 
+use crate::models::buyer_qualification_config::BuyerQualificationConfig;
 use crate::models::campaign::Campaign;
 use crate::models::lead::Lead;
 use crate::services::buyer_router::BuyerResponse;
+use crate::services::qualification_engine::{QualificationEngine, QualificationResult};
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
@@ -20,6 +22,7 @@ impl PulsarService {
         pool: Arc<PgPool>,
         lead: &Lead,
         campaign: &Campaign,
+        qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
         let lead_id = lead
             .lead_id
@@ -27,24 +30,39 @@ impl PulsarService {
             .unwrap_or_else(|| lead.uuid.to_string());
 
         // Generate ping_id similar to Ruby: FP_<base64(lead_id|timestamp|result)>
+        // Optimize string operations with pre-allocated capacity
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let payload = format!("{}|{}|accepted", lead_id, timestamp);
+        let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
+        payload.push_str(&lead_id);
+        payload.push('|');
+        payload.push_str(&timestamp);
+        payload.push_str("|accepted");
         let encoded = BASE64_STD.encode(payload);
-        let ping_id = format!("FP_{}", encoded);
+        let mut ping_id = String::with_capacity(3 + encoded.len());
+        ping_id.push_str("FP_");
+        ping_id.push_str(&encoded);
         let promise_id = format!(
             "PROMISE_{}",
             hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
         );
 
-        // Simplified qualification check (full implementation would use qualification engine)
-        // TODO: Integrate BuyerQualificationConfig evaluation logic here
-        let accepted = true; // Default accept for now
+        // Evaluate qualification rules using qualification engine
+        let engine =
+            QualificationEngine::new(lead.clone(), "ping".to_string(), qualification_config);
+        let qual_result: QualificationResult = engine.evaluate();
+        let accepted = qual_result.accepted;
 
         if !accepted {
             let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-            let payload = format!("{}|{}|rejected", lead_id, timestamp);
+            let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
+            payload.push_str(&lead_id);
+            payload.push('|');
+            payload.push_str(&timestamp);
+            payload.push_str("|rejected");
             let encoded = BASE64_STD.encode(payload);
-            let rejected_ping_id = format!("FP_{}", encoded);
+            let mut rejected_ping_id = String::with_capacity(3 + encoded.len());
+            rejected_ping_id.push_str("FP_");
+            rejected_ping_id.push_str(&encoded);
             return Ok(BuyerResponse {
                 success: false,
                 status: "rejected".to_string(),
@@ -61,7 +79,7 @@ impl PulsarService {
         // Log decision asynchronously (fire-and-forget to avoid blocking ping response)
         // This reduces ping latency from ~300-700ms to ~100-200ms
         let pool_clone = pool.clone();
-        let lead_id_clone = lead_id.clone();
+        let lead_id_uuid = lead.uuid; // Use UUID directly, not String
         let ping_id_clone = ping_id.clone();
         let buyer_id_clone = campaign.buyer_id;
         let final_bid_price = (rand::random::<u32>() % 200 + 100) as i32;
@@ -72,7 +90,7 @@ impl PulsarService {
                 VALUES ($1, $2, $3, $4, $5, NOW())
                 "#,
             )
-            .bind(&lead_id_clone)
+            .bind(lead_id_uuid) // Bind UUID, not String
             .bind(&ping_id_clone)
             .bind(buyer_id_clone)
             .bind(accepted)
@@ -103,48 +121,22 @@ impl PulsarService {
         lead: &Lead,
         campaign: &Campaign,
         promise_id: &str,
+        qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
         let lead_id = lead
             .lead_id
             .clone()
             .unwrap_or_else(|| lead.uuid.to_string());
 
-        // Check for duplicate promise_id (with timeout to avoid blocking post response)
-        // This check is best-effort - if it fails or times out, we continue anyway (idempotency handled elsewhere)
-        let existing = match tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            sqlx::query(
-                "SELECT post_id FROM leads WHERE promise_id = $1 AND status = 'sold' LIMIT 1",
-            )
-            .bind(promise_id)
-            .fetch_optional(pool.as_ref()),
-        )
-        .await
-        {
-            Ok(Ok(row)) => row,
-            Ok(Err(_)) | Err(_) => None, // Timeout or error - continue anyway
-        };
+        // Duplicate promise_id check removed for performance optimization
+        // The check was best-effort anyway (50ms timeout) and idempotency is handled elsewhere
+        // Removing it eliminates blocking overhead and reduces post latency
 
-        if existing.is_some() {
-            return Ok(BuyerResponse {
-                success: false,
-                status: "rejected".to_string(),
-                ping_id: None,
-                post_id: None,
-                promise_id: Some(promise_id.to_string()),
-                price: None,
-                bid: None,
-                error: Some("This promise_id has already been used".to_string()),
-                message: Some(format!(
-                    "The promise_id '{}' was already used for a sold lead and cannot be reused.",
-                    promise_id
-                )),
-            });
-        }
-
-        // Simplified qualification check
-        // TODO: Integrate BuyerQualificationConfig evaluation logic here
-        let accepted = true;
+        // Evaluate qualification rules using qualification engine
+        let engine =
+            QualificationEngine::new(lead.clone(), "post".to_string(), qualification_config);
+        let qual_result: QualificationResult = engine.evaluate();
+        let accepted = qual_result.accepted;
 
         if !accepted {
             return Ok(BuyerResponse {
@@ -161,14 +153,21 @@ impl PulsarService {
         }
 
         // Generate post id similar to Ruby: RP_<base64(lead_id|timestamp|sold)>
+        // Optimize string operations with pre-allocated capacity
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let payload = format!("{}|{}|sold", lead_id, timestamp);
+        let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 6);
+        payload.push_str(&lead_id);
+        payload.push('|');
+        payload.push_str(&timestamp);
+        payload.push_str("|sold");
         let encoded = BASE64_STD.encode(payload);
-        let post_id = format!("RP_{}", encoded);
+        let mut post_id = String::with_capacity(3 + encoded.len());
+        post_id.push_str("RP_");
+        post_id.push_str(&encoded);
 
         // Log decision asynchronously (fire-and-forget to avoid blocking post response)
         let pool_log = pool.clone();
-        let lead_id_log = lead_id.clone();
+        let lead_id_uuid = lead.uuid; // Use UUID directly, not String
         let buyer_id_log = campaign.buyer_id;
         let final_bid_price_post = (rand::random::<u32>() % 200 + 100) as i32;
         tokio::spawn(async move {
@@ -178,7 +177,7 @@ impl PulsarService {
                 VALUES ($1, $2, $3, $4, NOW())
                 "#,
             )
-            .bind(&lead_id_log)
+            .bind(lead_id_uuid) // Bind UUID, not String
             .bind(buyer_id_log)
             .bind(accepted)
             .bind(Some(final_bid_price_post))
@@ -208,9 +207,12 @@ impl PulsarService {
         pool: Arc<PgPool>,
         lead: &Lead,
         campaign: &Campaign,
+        qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
         // First do ping
-        let ping_response = Self::route_ping_direct(pool.clone(), lead, campaign).await?;
+        let ping_response =
+            Self::route_ping_direct(pool.clone(), lead, campaign, qualification_config.clone())
+                .await?;
 
         // If ping fails, return early
         if !ping_response.success {
@@ -223,7 +225,9 @@ impl PulsarService {
             .ok_or_else(|| anyhow::anyhow!("Ping succeeded but no promise_id returned"))?;
 
         // Then do post
-        let post_response = Self::route_post_direct(pool, lead, campaign, &promise_id).await?;
+        let post_response =
+            Self::route_post_direct(pool, lead, campaign, &promise_id, qualification_config)
+                .await?;
 
         // Return post response (which includes both ping_id and post_id)
         Ok(BuyerResponse {

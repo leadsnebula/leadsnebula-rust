@@ -1,11 +1,14 @@
 use crate::redis::RedisClient;
+use moka::future::Cache;
 use redis::{cmd, AsyncCommands};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct CacheService {
     redis: Option<Arc<RedisClient>>,
+    l1_cache: Cache<String, String>, // moka in-memory L1 cache
     env: String,
     // Cache operation tracking
     hits: Arc<AtomicU64>,
@@ -14,8 +17,14 @@ pub struct CacheService {
 
 impl CacheService {
     pub fn new(redis: Option<Arc<RedisClient>>, env: String) -> Self {
+        // Create moka L1 cache with 10,000 entries max and 1 hour TTL
+        let l1_cache = Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(Duration::from_secs(3600))
+            .build();
         Self {
             redis,
+            l1_cache,
             env,
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
@@ -211,6 +220,7 @@ impl CacheService {
     }
 
     /// Typed cache get-or-insert pattern with automatic serialization
+    /// Uses hybrid cache: moka L1 (in-memory, <1ms) + Redis L2 (2-5ms)
     pub async fn get_or_insert_with<T, F, Fut>(
         &self,
         key: &str,
@@ -222,26 +232,41 @@ impl CacheService {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
-        // Try cache first
-        if let Some(cached) = self.get(key).await? {
+        // Check L1 (moka) first - <1ms
+        if let Some(cached) = self.l1_cache.get(key).await {
             if let Ok(value) = serde_json::from_str::<T>(&cached) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(
                     cache_key = %key,
                     cache_result = "hit",
+                    cache_level = "L1",
                     ttl_seconds = ttl_seconds,
-                    "Cache get_or_insert_with: hit"
+                    "Cache get_or_insert_with: L1 hit"
                 );
                 return Ok(value);
             }
-            // If deserialization fails, treat as cache miss and continue
-            tracing::warn!(
-                cache_key = %key,
-                cache_result = "deserialization_failed",
-                "Cache hit but deserialization failed, treating as miss"
-            );
         }
 
-        // Cache miss - fetch from DB
+        // Check L2 (Redis) - 2-5ms
+        // self.get() already handles None case for redis
+        if let Some(cached) = self.get(key).await? {
+            if let Ok(value) = serde_json::from_str::<T>(&cached) {
+                // Store in L1 for next time
+                self.l1_cache.insert(key.to_string(), cached.clone()).await;
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    cache_key = %key,
+                    cache_result = "hit",
+                    cache_level = "L2",
+                    ttl_seconds = ttl_seconds,
+                    "Cache get_or_insert_with: L2 hit"
+                );
+                return Ok(value);
+            }
+        }
+
+        // Cache miss - fetch from source
+        self.misses.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             cache_key = %key,
             cache_result = "miss",
@@ -250,12 +275,17 @@ impl CacheService {
         );
         let value = f().await?;
         let serialized = serde_json::to_string(&value)?;
+
+        // Store in both L1 and L2
+        self.l1_cache
+            .insert(key.to_string(), serialized.clone())
+            .await;
         self.set_with_ttl(key, &serialized, ttl_seconds).await?;
         tracing::info!(
             cache_key = %key,
             cache_result = "set",
             ttl_seconds = ttl_seconds,
-            "Cache get_or_insert_with: value cached"
+            "Cache get_or_insert_with: value cached in L1 and L2"
         );
         Ok(value)
     }

@@ -52,6 +52,11 @@ pub struct BuyerRouter {
     encryption_key: Arc<Vec<u8>>,
     timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
     metrics: Option<Arc<DiagnosticMetrics>>,
+    // Pre-loaded buyer/integration data to avoid redundant DB lookups
+    preloaded_integration: Option<crate::models::buyer_integration::BuyerIntegration>,
+    // Pre-loaded qualification config to avoid redundant DB lookups
+    preloaded_qual_config:
+        Option<crate::models::buyer_qualification_config::BuyerQualificationConfig>,
 }
 
 impl BuyerRouter {
@@ -70,7 +75,27 @@ impl BuyerRouter {
             encryption_key,
             timing: None,
             metrics: None,
+            preloaded_integration: None,
+            preloaded_qual_config: None,
         }
+    }
+
+    /// Create BuyerRouter with pre-loaded integration data (optimizes DB lookups)
+    pub fn with_preloaded_integration(
+        mut self,
+        integration: Option<crate::models::buyer_integration::BuyerIntegration>,
+    ) -> Self {
+        self.preloaded_integration = integration;
+        self
+    }
+
+    /// Create BuyerRouter with pre-loaded qualification config (optimizes DB lookups)
+    pub fn with_preloaded_qual_config(
+        mut self,
+        qual_config: Option<crate::models::buyer_qualification_config::BuyerQualificationConfig>,
+    ) -> Self {
+        self.preloaded_qual_config = qual_config;
+        self
     }
 
     pub fn with_timing_and_metrics(
@@ -117,7 +142,7 @@ impl BuyerRouter {
 
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
-            tracing::info!(
+            tracing::debug!(
                 campaign_id = %campaign.id,
                 buyer_id = %campaign.buyer_id,
                 method = "direct",
@@ -147,12 +172,17 @@ impl BuyerRouter {
             };
             use crate::services::pulsar::PulsarService;
             let ping_start = std::time::Instant::now();
-            let result =
-                PulsarService::route_ping_direct(self.pool.clone(), &self.lead, campaign).await;
+            let result = PulsarService::route_ping_direct(
+                self.pool.clone(),
+                &self.lead,
+                campaign,
+                self.preloaded_qual_config.clone(),
+            )
+            .await;
             let ping_duration = ping_start.elapsed().as_millis() as u64;
 
             if let Ok(ref resp) = result {
-                tracing::info!(
+                tracing::debug!(
                     campaign_id = %campaign.id,
                     buyer_id = %campaign.buyer_id,
                     status = %resp.status,
@@ -360,7 +390,7 @@ impl BuyerRouter {
 
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
-            tracing::info!(
+            tracing::debug!(
                 "Using direct Pulsar call (NO HTTP) for campaign {}",
                 campaign.id
             );
@@ -392,6 +422,7 @@ impl BuyerRouter {
                 &self.lead,
                 campaign,
                 promise_id,
+                self.preloaded_qual_config.clone(),
             )
             .await;
             let post_duration = post_start.elapsed().as_millis() as u64;
@@ -601,8 +632,13 @@ impl BuyerRouter {
             };
             use crate::services::pulsar::PulsarService;
             let post_start = std::time::Instant::now();
-            let result =
-                PulsarService::route_fullpost_direct(self.pool.clone(), &self.lead, campaign).await;
+            let result = PulsarService::route_fullpost_direct(
+                self.pool.clone(),
+                &self.lead,
+                campaign,
+                self.preloaded_qual_config.clone(),
+            )
+            .await;
             let post_duration = post_start.elapsed().as_millis() as u64;
 
             // Complete buyer_post_sent and start buyer_post_response
@@ -778,7 +814,14 @@ impl BuyerRouter {
 
     /// Get buyer integration (and optionally credentials) for a campaign
     /// For internal buyers, credentials are optional
+    /// Uses pre-loaded integration if available to avoid DB lookup
     async fn get_buyer_integration(&self, campaign: &Campaign) -> Result<BuyerIntegration> {
+        // Use pre-loaded integration if available (Phase 7.1 optimization)
+        if let Some(ref integration) = self.preloaded_integration {
+            return Ok(integration.clone());
+        }
+
+        // Fallback to DB lookup if not pre-loaded
         // Look up buyer to get buyer_integration_id
         let buyer = Buyer::find_by_id(&self.pool, campaign.buyer_id)
             .await?

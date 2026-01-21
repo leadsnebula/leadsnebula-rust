@@ -52,12 +52,14 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-flame = "0.2"  # Optional: for performance profiling
 base64 = "0.22"  # Updated to match transitive dependencies (was 0.21)
 hex = "0.4"
 dotenvy = "0.15"  # Maintained fork of unmaintained dotenv
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 reqwest = { version = "0.12", features = ["json"] }
 futures = "0.3"
+tokio-retry = "0.3"
 
 # Windows dependencies (pinned to latest to reduce duplicates)
 windows-targets = "0.53"

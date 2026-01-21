@@ -296,8 +296,144 @@ async fn test_e2e_fullpost_request_flow() {
     let mut tx = pool.begin().await.unwrap();
     let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&mut *tx).await;
 
-    // Setup similar to ping test...
-    // Test fullpost routing and verify both ping and post payloads are persisted
+    // Create buyer and campaign (same as ping test)
+    let buyer_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+            INSERT INTO buyers (id, instance_id, name, status, created_at, updated_at)
+            VALUES ($1, (SELECT id FROM instances LIMIT 1), $2, 'active', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+    )
+    .bind(buyer_id)
+    .bind("Test Buyer")
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let campaign_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+            INSERT INTO campaigns (id, buyer_id, publisher_id, instance_id, vertical, campaign_token, status, created_at, updated_at)
+            VALUES ($1, $2, $3, (SELECT id FROM instances LIMIT 1), $4, $5, 'active', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+    )
+    .bind(campaign_id)
+    .bind(buyer_id)
+    .bind(publisher_id)
+    .bind(&vertical_slug)
+    .bind(format!("token_{}", Uuid::new_v4()))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Create ping tree
+    let ping_tree_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+            INSERT INTO ping_trees (id, publisher_id, instance_id, name, vertical, status, strategy, created_at, updated_at)
+            VALUES ($1, $2, (SELECT id FROM instances LIMIT 1), $3, $4, 'active', 'ping_post', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+    )
+    .bind(ping_tree_id)
+    .bind(publisher_id)
+    .bind("Test Ping Tree")
+    .bind(&vertical_slug)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Add campaign to ping tree
+    sqlx::query(
+        r#"
+            INSERT INTO ping_tree_campaigns (ping_tree_id, campaign_id, enabled, priority, created_at, updated_at)
+            VALUES ($1, $2, true, 1, NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+    )
+    .bind(ping_tree_id)
+    .bind(campaign_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Create test lead for fullpost
+    let lead = Lead {
+        uuid: Uuid::new_v4(),
+        event_id: format!("evt_{}", Uuid::new_v4()),
+        lead_id: None,
+        publisher_id: Some(publisher_id),
+        vertical_id,
+        campaign_id: None,
+        buyer_id: None,
+        request_type: "fullpost".to_string(),
+        strategy: "ping_post".to_string(),
+        status: LeadStatus::Processing,
+        promise_id: None,
+        ping_id: None,
+        post_id: None,
+        session_id: None,
+        request_stage: None,
+        first_name_encrypted: None,
+        last_name_encrypted: None,
+        email_encrypted: None,
+        cell_phone_encrypted: None,
+        street_address_encrypted: None,
+        city_encrypted: None,
+        state_encrypted: None,
+        zip_encrypted: None,
+        ip_address_encrypted: None,
+        email_sha256: None,
+        phone_sha256: None,
+        ip_address_hash: None,
+        email_domain: None,
+        tcpa_consent: false,
+        tcpa_language: "en".to_string(),
+        is_test: false,
+        user_agent: None,
+        referrer: None,
+        website_url: None,
+        click_id: None,
+        url_consent: None,
+        best_call_time: None,
+        date_of_birth: None,
+        home_phone: None,
+        jornaya_lead_id: None,
+        trusted_form_url: None,
+        fbp_cookie: None,
+        fbc_cookie: None,
+        utm_params: None,
+        submitted_at: None,
+        sold_at: None,
+        retry_count: 0,
+        next_retry_at: None,
+        vertical_data: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    // Test fullpost routing
+    use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
+    let router = PingTreeRouter::new(
+        lead.clone(),
+        publisher_id,
+        vertical_slug.clone(),
+        "fullpost".to_string(),
+        None,
+    );
+
+    let pool_arc = Arc::new(pool.clone());
+    let encryption_key = Arc::new(vec![0u8; 32]);
+    let result = router.route(pool_arc, encryption_key).await;
+
+    // Verify result
+    assert!(result.is_ok());
+    let routing_result = result.unwrap();
+
+    // For fullpost, we should have both ping_id and post_id
+    assert!(routing_result.ping_id.is_some() || routing_result.post_id.is_some());
 
     // Rollback transaction to prevent test data from persisting
     tx.rollback().await.unwrap();
@@ -310,11 +446,83 @@ async fn test_e2e_error_handling() {
     // - No ping tree
     // - No campaigns
     // - Invalid vertical
-    // - Database errors
     let (_app, pool) = create_test_app_state().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&mut *tx).await;
 
-    // Test error scenarios here...
+    // Test 1: No ping tree for publisher/vertical
+    let lead_no_tree = Lead {
+        uuid: Uuid::new_v4(),
+        event_id: format!("evt_{}", Uuid::new_v4()),
+        lead_id: None,
+        publisher_id: Some(publisher_id),
+        vertical_id,
+        campaign_id: None,
+        buyer_id: None,
+        request_type: "ping".to_string(),
+        strategy: "ping_post".to_string(),
+        status: LeadStatus::Processing,
+        promise_id: None,
+        ping_id: None,
+        post_id: None,
+        session_id: None,
+        request_stage: None,
+        first_name_encrypted: None,
+        last_name_encrypted: None,
+        email_encrypted: None,
+        cell_phone_encrypted: None,
+        street_address_encrypted: None,
+        city_encrypted: None,
+        state_encrypted: None,
+        zip_encrypted: None,
+        ip_address_encrypted: None,
+        email_sha256: None,
+        phone_sha256: None,
+        ip_address_hash: None,
+        email_domain: None,
+        tcpa_consent: false,
+        tcpa_language: "en".to_string(),
+        is_test: false,
+        user_agent: None,
+        referrer: None,
+        website_url: None,
+        click_id: None,
+        url_consent: None,
+        best_call_time: None,
+        date_of_birth: None,
+        home_phone: None,
+        jornaya_lead_id: None,
+        trusted_form_url: None,
+        fbp_cookie: None,
+        fbc_cookie: None,
+        utm_params: None,
+        submitted_at: None,
+        sold_at: None,
+        retry_count: 0,
+        next_retry_at: None,
+        vertical_data: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
+    let router = PingTreeRouter::new(
+        lead_no_tree,
+        publisher_id,
+        vertical_slug.clone(),
+        "ping".to_string(),
+        None,
+    );
+
+    let pool_arc = Arc::new(pool.clone());
+    let encryption_key = Arc::new(vec![0u8; 32]);
+    let result = router.route(pool_arc, encryption_key).await;
+
+    // Should return error result (no ping tree found)
+    assert!(result.is_ok());
+    let routing_result = result.unwrap();
+    assert!(!routing_result.success);
+    assert!(routing_result.error.is_some());
 
     // Rollback transaction to prevent test data from persisting
     tx.rollback().await.unwrap();

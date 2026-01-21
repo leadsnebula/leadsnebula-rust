@@ -1,3 +1,4 @@
+mod cache_warmup;
 mod config;
 mod middleware;
 mod routes;
@@ -8,10 +9,15 @@ use routes::{auth_routes, carina_routes, dashboard_routes, health_routes, pulsar
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+
+// Use mimalloc for faster allocations
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Load .env.local file with tolerance for invalid lines
 /// Skips lines that don't match KEY=VALUE format instead of failing completely
@@ -172,6 +178,11 @@ async fn main() -> anyhow::Result<()> {
             // Build full application router with all routes
             // Following the pattern from commit b80b48b: merge routes first, then set state once
             info!("Building application router with all routes...");
+
+            // Clone state for background tasks before moving it into the router
+            let state_for_warmup = state.clone();
+            let state_for_periodic = Arc::new(state.clone());
+
             let app = axum::Router::new()
                 .route("/live", axum::routing::get(routes::health::liveness_check))
                 .merge(health_routes())
@@ -206,6 +217,17 @@ async fn main() -> anyhow::Result<()> {
                 );
 
             info!("All routes are now available, including /api/auth/login");
+
+            // Pre-warm cache on startup (non-blocking, runs in background)
+            tokio::spawn(async move {
+                cache_warmup::pre_warm_cache(&state_for_warmup).await;
+            });
+
+            // Start periodic cache warm-up task (runs every 30 minutes)
+            tokio::spawn(async move {
+                cache_warmup::start_periodic_warmup(state_for_periodic).await;
+            });
+
             // In axum 0.7, Router<AppState> supports into_make_service() when state is set
             axum::serve(listener, app.into_make_service()).await?;
         }

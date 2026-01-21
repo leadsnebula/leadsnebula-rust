@@ -12,7 +12,9 @@ use serde_json::json;
 use crate::AppState;
 
 pub fn health_routes() -> Router<AppState> {
-    Router::new().route("/health", get(health_check))
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/metrics", get(metrics_endpoint))
 }
 
 // Export liveness_check for use in main.rs when AppState is unavailable
@@ -85,4 +87,54 @@ async fn health_check(State(state): State<AppState>) -> Response {
     });
 
     (status_code, axum::Json(body)).into_response()
+}
+
+/// Metrics endpoint for production monitoring (Phase 7.3)
+/// Returns performance metrics in JSON format suitable for Prometheus/Grafana
+async fn metrics_endpoint(State(state): State<AppState>) -> Response {
+    // Get database pool metrics
+    let pool_size = state.db_pool.size() as usize;
+    let num_idle = state.db_pool.num_idle();
+
+    // Get Redis metrics if available
+    let redis_configured = state.redis.is_some();
+    let redis_status = if let Some(redis) = &state.redis {
+        match redis.ping().await {
+            Ok(_) => "connected",
+            Err(_) => "disconnected",
+        }
+    } else {
+        "not_configured"
+    };
+
+    let body = json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "metrics": {
+            "database": {
+                "pool_size": pool_size,
+                "idle_connections": num_idle,
+                "active_connections": pool_size.saturating_sub(num_idle),
+            },
+            "cache": {
+                "configured": redis_configured,
+                "status": redis_status,
+            },
+            "performance": {
+                "note": "Request-level metrics (ping_auction_time, post_time, cache_hit_rate) are tracked per-request via DiagnosticMetrics. Aggregate metrics can be collected from logs or by storing DiagnosticMetrics in AppState."
+            }
+        },
+        "format": "json",
+        "version": "1.0",
+        "monitoring": {
+            "health_endpoint": "/health",
+            "metrics_endpoint": "/metrics",
+            "alerting_thresholds": {
+                "auction_time_ms": 200,
+                "cache_hit_rate_percent": 90.0,
+                "db_query_time_ms": 100
+            }
+        }
+    });
+
+    (StatusCode::OK, axum::Json(body)).into_response()
 }

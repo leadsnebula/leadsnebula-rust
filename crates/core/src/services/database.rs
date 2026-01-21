@@ -6,16 +6,18 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
     info!("Creating database connection pool");
     let pool = PgPoolOptions::new()
         .max_connections(100) // Increase for concurrent auctions
-        .min_connections(10) // Keep connections warm to avoid cold start latency
-        .acquire_timeout(Duration::from_secs(10)) // Increase timeout for initial connection
-        .idle_timeout(Some(Duration::from_secs(600)))
-        .max_lifetime(Some(Duration::from_secs(1800)))
+        .min_connections(20) // Increase warm connections to reduce acquire latency
+        .acquire_timeout(Duration::from_millis(100)) // Fail fast on cold (reduced from 10s)
+        .idle_timeout(Some(Duration::from_secs(300))) // Keep connections alive longer (reduced from 600s)
+        .max_lifetime(Some(Duration::from_secs(3600))) // Longer lifetime (increased from 1800s)
         .test_before_acquire(true) // Verify connections are alive
         .after_connect(|conn, _meta| {
             Box::pin(async move {
+                // Pre-warm with a simple query
+                sqlx::query("SELECT 1").execute(&mut *conn).await?;
                 // Set statement timeout to prevent long-running queries
-                sqlx::query("SET statement_timeout = '8s'")
-                    .execute(conn)
+                sqlx::query("SET statement_timeout = '5s'")
+                    .execute(&mut *conn)
                     .await?;
                 Ok(())
             })

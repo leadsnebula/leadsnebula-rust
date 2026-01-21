@@ -14,7 +14,9 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
+use tokio_retry::{strategy::ExponentialBackoff, Retry};
 use uuid::Uuid;
 
 // Price comparison epsilon: prices within this value are considered equal
@@ -306,11 +308,19 @@ impl PingTreeRouter {
             .collect();
         let campaigns_with_associations =
             Campaign::find_by_ids_with_associations(pool.as_ref(), &campaign_ids).await?;
-        // Extract just the campaigns (buyers/integrations are already loaded, but we don't need them here)
-        let all_campaigns: Vec<Campaign> = campaigns_with_associations
-            .iter()
-            .map(|(c, _, _)| c.clone())
-            .collect();
+
+        // Store buyer/integration data to avoid redundant DB lookups in BuyerRouter (Phase 7.1 optimization)
+        use crate::models::buyer_integration::BuyerIntegration;
+        let mut buyer_integration_map: std::collections::HashMap<Uuid, Option<BuyerIntegration>> =
+            std::collections::HashMap::new();
+
+        // Extract campaigns and store buyer/integration data
+        let mut all_campaigns: Vec<Campaign> = Vec::new();
+        for (campaign, _buyer, integration) in &campaigns_with_associations {
+            all_campaigns.push(campaign.clone());
+            // Store integration for this campaign's buyer_id (we only need integration for routing)
+            buyer_integration_map.insert(campaign.buyer_id, integration.clone());
+        }
 
         let mut campaigns = Vec::new();
         let mut priority_map = std::collections::HashMap::new();
@@ -336,12 +346,33 @@ impl PingTreeRouter {
             .into_iter()
             .collect();
         let qual_configs_query_start = std::time::Instant::now();
-        let _qualification_configs: std::collections::HashMap<
+
+        // Cache qualification configs to avoid 180-203ms DB query every auction
+        let qual_cache_key = format!(
+            "qual:buyers:{}",
+            unique_buyer_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let qualification_configs: std::collections::HashMap<
             Uuid,
             Option<BuyerQualificationConfig>,
-        > = BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
-            .await
-            .unwrap_or_default();
+        > = if let Some(cache) = &self.cache {
+            cache
+                .get_or_insert_with(&qual_cache_key, 3600, || async {
+                    BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                })
+                .await
+                .unwrap_or_default()
+        } else {
+            BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
+                .await
+                .unwrap_or_default()
+        };
         let qual_configs_duration = qual_configs_query_start.elapsed().as_millis() as u64;
         metrics.record_query(qual_configs_duration);
         {
@@ -377,6 +408,8 @@ impl PingTreeRouter {
                     pool.clone(),
                     &campaigns,
                     &priority_map,
+                    &buyer_integration_map,
+                    &qualification_configs,
                     encryption_key.clone(),
                     timing.clone(),
                     metrics.clone(),
@@ -399,6 +432,8 @@ impl PingTreeRouter {
                     &campaigns,
                     &ping_tree,
                     &priority_map,
+                    &buyer_integration_map,
+                    &qualification_configs,
                     encryption_key.clone(),
                     timing.clone(),
                     metrics.clone(),
@@ -427,11 +462,17 @@ impl PingTreeRouter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Complex routing function legitimately needs all parameters
     async fn route_ping_auction(
         &self,
         pool: Arc<PgPool>,
         campaigns: &[Campaign],
         priority_map: &std::collections::HashMap<Uuid, Option<i32>>,
+        buyer_integration_map: &std::collections::HashMap<
+            Uuid,
+            Option<crate::models::buyer_integration::BuyerIntegration>,
+        >,
+        qualification_configs: &std::collections::HashMap<Uuid, Option<BuyerQualificationConfig>>,
         encryption_key: Arc<Vec<u8>>,
         timing: Arc<std::sync::Mutex<AuctionTiming>>,
         metrics: Arc<DiagnosticMetrics>,
@@ -456,7 +497,9 @@ impl PingTreeRouter {
             )
         };
 
-        // Send concurrent pings to all campaigns
+        // Send concurrent pings to all campaigns with semaphore to limit concurrency
+        // This prevents Neon overload and ensures more consistent latency
+        let semaphore = Arc::new(Semaphore::new(10)); // Limit to 10 concurrent pings
         let mut task_futures = Vec::new();
         for campaign in campaigns {
             let lead = self.lead.clone();
@@ -466,24 +509,40 @@ impl PingTreeRouter {
             let pool_clone = pool.clone();
             let encryption_key_clone = encryption_key.clone();
             let campaign_id = campaign.id;
+            let semaphore_clone = semaphore.clone();
+
+            // Get pre-loaded integration for this campaign's buyer (Phase 7.1 optimization)
+            let preloaded_integration = buyer_integration_map
+                .get(&campaign_clone.buyer_id)
+                .and_then(|integration| integration.clone());
+
+            // Get pre-loaded qualification config for this campaign's buyer
+            let preloaded_qual_config = qualification_configs
+                .get(&campaign_clone.buyer_id)
+                .and_then(|config| config.clone());
 
             // Wrap each task with timeout and store campaign_id for result mapping
             // Track individual buyer processing time
+            // Remove inner tokio::spawn - timeout directly on the future to eliminate double-wrapping overhead
             let task_future = async move {
+                let _permit = semaphore_clone.acquire().await.unwrap(); // Hold permit for duration of ping
                 let buyer_start = std::time::Instant::now();
-                let task = tokio::spawn(async move {
-                    let router = BuyerRouter::new(
-                        lead,
-                        vec![campaign_clone],
-                        request_type,
-                        pool_clone,
-                        encryption_key_clone,
-                    );
-                    router.route().await
-                });
-                let result = timeout(PING_AUCTION_TIMEOUT, task).await;
+                let router = BuyerRouter::new(
+                    lead,
+                    vec![campaign_clone],
+                    request_type,
+                    pool_clone,
+                    encryption_key_clone,
+                )
+                .with_preloaded_integration(preloaded_integration)
+                .with_preloaded_qual_config(preloaded_qual_config);
+                let result = timeout(PING_AUCTION_TIMEOUT, router.route()).await;
                 let processing_time_ms = buyer_start.elapsed().as_millis() as u64;
-                (result, campaign_id, processing_time_ms)
+                (
+                    result.map_err(|e| anyhow::anyhow!("Timeout: {}", e)),
+                    campaign_id,
+                    processing_time_ms,
+                )
             };
             task_futures.push(task_future);
         }
@@ -492,14 +551,17 @@ impl PingTreeRouter {
         let ping_auction_start = std::time::Instant::now();
         let task_results = join_all(task_futures).await;
         let ping_auction_duration = ping_auction_start.elapsed().as_millis() as u64;
-        metrics.record_query(ping_auction_duration); // Track ping auction duration
+        metrics.record_ping_auction(ping_auction_duration); // Track ping auction duration
+        metrics.record_stage_timing("ping_auction", ping_auction_duration);
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
         let mut per_buyer_timings: Vec<serde_json::Value> = Vec::new();
 
         for (result, campaign_id, processing_time_ms) in task_results {
             match result {
-                Ok(Ok(Ok(response))) => {
-                    tracing::info!(
+                Ok(Ok(response)) => {
+                    // Success case: timeout OK, router OK
+                    // Moved to debug level to reduce tracing overhead in hot path
+                    tracing::debug!(
                         "Buyer response for campaign {}: success={}, status={}, bid={:?}, price={:?}, promise_id={:?}, error={:?}",
                         campaign_id,
                         response.success,
@@ -523,7 +585,8 @@ impl PingTreeRouter {
                     }
                     responses.push((response, campaign_id, priority));
                 }
-                Ok(Ok(Err(e))) => {
+                Ok(Err(e)) => {
+                    // Router error case: timeout OK, router error
                     tracing::error!("BuyerRouter error for campaign {}: {}", campaign_id, e);
                     // Track per-buyer timing for errors
                     if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
@@ -548,42 +611,6 @@ impl PingTreeRouter {
                             success: false,
                             status: "error".to_string(),
                             error: Some(e.to_string()),
-                            message: None,
-                            promise_id: None,
-                            ping_id,
-                            post_id: None,
-                            price: None,
-                            bid: None,
-                        },
-                        campaign_id,
-                        priority_map.get(&campaign_id).copied().flatten(),
-                    ));
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Task error for campaign {}: {}", campaign_id, e);
-                    // Track per-buyer timing for task errors
-                    if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
-                        per_buyer_timings.push(serde_json::json!({
-                            "campaign_id": campaign_id,
-                            "buyer_id": campaign.buyer_id,
-                            "processing_time_ms": processing_time_ms,
-                            "status": "error",
-                            "bid": null,
-                            "success": false,
-                            "error": format!("Task failed: {}", e)
-                        }));
-                    }
-                    // Add error response to track task failures - generate ping_id for ping requests
-                    let ping_id = if self.request_type == "ping" {
-                        Some(format!("ping_error_{}", uuid::Uuid::new_v4()))
-                    } else {
-                        None
-                    };
-                    responses.push((
-                        BuyerResponse {
-                            success: false,
-                            status: "error".to_string(),
-                            error: Some(format!("Task failed: {}", e)),
                             message: None,
                             promise_id: None,
                             ping_id,
@@ -1024,7 +1051,8 @@ impl PingTreeRouter {
             let post_result = buyer_router.route().await;
             let post_duration = post_start.elapsed().as_millis() as u64;
             if let Some(ref m) = metrics {
-                m.record_query(post_duration);
+                m.record_post(post_duration);
+                m.record_stage_timing("post_sent", post_duration);
             }
 
             // Complete post sent and start post response
@@ -1209,13 +1237,18 @@ impl PingTreeRouter {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Complex routing function legitimately needs all parameters
     async fn route_fullpost(
         &self,
         pool: Arc<PgPool>,
         campaigns: &[Campaign],
         ping_tree: &PingTree,
         priority_map: &std::collections::HashMap<Uuid, Option<i32>>,
+        buyer_integration_map: &std::collections::HashMap<
+            Uuid,
+            Option<crate::models::buyer_integration::BuyerIntegration>,
+        >,
+        qualification_configs: &std::collections::HashMap<Uuid, Option<BuyerQualificationConfig>>,
         encryption_key: Arc<Vec<u8>>,
         timing: Arc<std::sync::Mutex<AuctionTiming>>,
         metrics: Arc<DiagnosticMetrics>,
@@ -1245,6 +1278,8 @@ impl PingTreeRouter {
                     pool.clone(),
                     campaigns,
                     priority_map,
+                    buyer_integration_map,
+                    qualification_configs,
                     encryption_key.clone(),
                     timing.clone(),
                     metrics.clone(),
@@ -1255,44 +1290,22 @@ impl PingTreeRouter {
                 return Ok(ping_result);
             }
 
-            // Reload lead from database to get promise_id and campaign_id set by ping auction
-            let db_query_start = std::time::Instant::now();
-            let updated_lead =
-                match sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
-                    .bind(self.lead.uuid)
-                    .fetch_one(pool.as_ref())
-                    .await
-                {
-                    Ok(lead) => {
-                        let duration_ms = db_query_start.elapsed().as_millis() as u64;
-                        tracing::info!(
-                            operation = "db_query",
-                            query_type = "select",
-                            table = "leads",
-                            query = "SELECT * FROM leads WHERE uuid = $1",
-                            lead_id = %self.lead.uuid,
-                            rows_returned = 1,
-                            duration_ms = duration_ms,
-                            "Database query: reload lead after ping auction"
-                        );
-                        lead
-                    }
-                    Err(e) => {
-                        let duration_ms = db_query_start.elapsed().as_millis() as u64;
-                        tracing::error!(
-                            operation = "db_query",
-                            query_type = "select",
-                            table = "leads",
-                            query = "SELECT * FROM leads WHERE uuid = $1",
-                            lead_id = %self.lead.uuid,
-                            duration_ms = duration_ms,
-                            error = %e,
-                            error_type = %std::any::type_name_of_val(&e),
-                            "Database query error: failed to reload lead"
-                        );
-                        return Err(anyhow::anyhow!("Failed to reload lead: {}", e));
-                    }
-                };
+            // Construct updated lead from ping_result instead of reloading from DB
+            // This eliminates the 421ms DB query overhead
+            let mut updated_lead = self.lead.clone();
+            // Update promise_id and campaign_id from ping_result
+            if let Some(promise_id) = &ping_result.promise_id {
+                updated_lead.promise_id = Some(promise_id.clone());
+            }
+            if let Some(campaign_id) = ping_result.campaign_id {
+                updated_lead.campaign_id = Some(campaign_id);
+            }
+            tracing::info!(
+                lead_id = %self.lead.uuid,
+                promise_id = ?updated_lead.promise_id,
+                campaign_id = ?updated_lead.campaign_id,
+                "Updated lead in-memory from ping_result (skipped DB reload)"
+            );
 
             // Create new router with updated lead for post routing
             let post_router = PingTreeRouter::new(
@@ -1609,21 +1622,83 @@ impl PingTreeRouter {
             .collect();
 
         let db_query_start = std::time::Instant::now();
-        let query_result = sqlx::query(
-            r#"
-            INSERT INTO buyer_responses (lead_id, ping_id, post_id, buyer_id, campaign_id, payload, created_at)
-            SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[], $7::timestamptz[])
-            "#,
-        )
-        .bind(&lead_ids[..])
-        .bind(&ping_ids[..])
-        .bind(&post_ids[..])
-        .bind(&buyer_ids[..])
-        .bind(&campaign_ids[..])
-        .bind(&json_payloads[..])
-        .bind(&created_ats[..])
-        .execute(pool)
-        .await;
+
+        // Use retry with exponential backoff for transient DB errors
+        // Retry strategy: 100ms initial delay, max 3 attempts, exponential backoff with max 1000ms
+        let retry_strategy = ExponentialBackoff::from_millis(100)
+            .max_delay(Duration::from_millis(1000))
+            .take(3);
+
+        // Helper function to check if error is retryable (transient DB errors)
+        fn is_retryable_error(e: &sqlx::Error) -> bool {
+            matches!(
+                e,
+                sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_)
+            ) || e.to_string().contains("connection")
+                || e.to_string().contains("timeout")
+                || e.to_string().contains("pool")
+        }
+
+        // Clone variables for the closure
+        let lead_ids_clone = lead_ids.clone();
+        let ping_ids_clone = ping_ids.clone();
+        let post_ids_clone = post_ids.clone();
+        let buyer_ids_clone = buyer_ids.clone();
+        let campaign_ids_clone = campaign_ids.clone();
+        let json_payloads_clone = json_payloads.clone();
+        let created_ats_clone = created_ats.clone();
+        let pool_clone = pool.clone();
+
+        let query_result = Retry::spawn(retry_strategy, move || {
+            let lead_ids = lead_ids_clone.clone();
+            let ping_ids = ping_ids_clone.clone();
+            let post_ids = post_ids_clone.clone();
+            let buyer_ids = buyer_ids_clone.clone();
+            let campaign_ids = campaign_ids_clone.clone();
+            let json_payloads = json_payloads_clone.clone();
+            let created_ats = created_ats_clone.clone();
+            let pool = pool_clone.clone();
+
+            async move {
+                let result = sqlx::query(
+                    r#"
+                    INSERT INTO buyer_responses (lead_id, ping_id, post_id, buyer_id, campaign_id, payload, created_at)
+                    SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[], $7::timestamptz[])
+                    "#,
+                )
+                .bind(&lead_ids[..])
+                .bind(&ping_ids[..])
+                .bind(&post_ids[..])
+                .bind(&buyer_ids[..])
+                .bind(&campaign_ids[..])
+                .bind(&json_payloads[..])
+                .bind(&created_ats[..])
+                .execute(&pool)
+                .await;
+
+                match result {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        if is_retryable_error(&e) {
+                            tracing::warn!(
+                                error = %e,
+                                "Transient DB error, will retry"
+                            );
+                            Err(e)
+                        } else {
+                            // Non-retryable error (e.g., constraint violation, syntax error)
+                            tracing::error!(
+                                error = %e,
+                                "Non-retryable DB error, aborting"
+                            );
+                            Err(e)
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("DB error after retries: {}", e));
 
         match &query_result {
             Ok(result) => {
