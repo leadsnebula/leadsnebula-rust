@@ -10,6 +10,7 @@ use anyhow::Result;
 use hex;
 use rand;
 use serde::{Deserialize, Serialize};
+use simd_json;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -26,6 +27,19 @@ const PRICE_EPSILON: f64 = 0.01;
 // Retry configuration for persistence operations
 const PERSISTENCE_MAX_RETRIES: u32 = 3;
 const PERSISTENCE_RETRY_DELAY_MS: u64 = 100;
+
+// Chaos mode: inject random delays for testing resilience
+// Set CHAOS=1 environment variable to enable
+fn should_inject_chaos() -> bool {
+    std::env::var("CHAOS").unwrap_or_default() == "1"
+}
+
+async fn inject_chaos_delay() {
+    if should_inject_chaos() {
+        let delay_ms = rand::random::<u64>() % 150 + 50; // 50-200ms
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
 
 // Type alias for buyer response batch insert rows
 type BuyerResponseRow = (
@@ -144,7 +158,7 @@ impl PingTreeRouter {
 
         let (ping_tree, _revshare_percentage, _revshare_flat_amount) = match ping_tree_result {
             Some((pt, revshare_pct, revshare_flat)) => {
-                tracing::info!(
+                tracing::debug!(
                     lead_id = %self.lead.uuid,
                     ping_tree_id = %pt.id,
                     publisher_id = %self.publisher_id,
@@ -259,7 +273,7 @@ impl PingTreeRouter {
         } else if campaigns_duration > 0 {
             metrics.record_cache_miss();
         }
-        tracing::info!(
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             ping_tree_id = %ping_tree.id,
             campaign_count = ping_tree_campaigns.len(),
@@ -483,7 +497,7 @@ impl PingTreeRouter {
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
 
         // Start ping auction stage
-        tracing::info!(
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             campaign_count = campaigns.len(),
             request_type = %self.request_type,
@@ -526,6 +540,8 @@ impl PingTreeRouter {
             // Remove inner tokio::spawn - timeout directly on the future to eliminate double-wrapping overhead
             let task_future = async move {
                 let _permit = semaphore_clone.acquire().await.unwrap(); // Hold permit for duration of ping
+                                                                        // Inject chaos delay if enabled (for testing)
+                inject_chaos_delay().await;
                 let buyer_start = std::time::Instant::now();
                 let router = BuyerRouter::new(
                     lead,
@@ -661,7 +677,7 @@ impl PingTreeRouter {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             total_responses = responses.len(),
             accepted_count = responses.iter().filter(|(r, _, _)| r.status == "accepted").count(),
@@ -726,7 +742,7 @@ impl PingTreeRouter {
 
         // Batch insert all responses in one query
         if !batch_responses.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 lead_id = %self.lead.uuid,
                 response_count = batch_responses.len(),
                 "Batch inserting buyer responses"
@@ -752,7 +768,7 @@ impl PingTreeRouter {
                 );
             }
             if result.is_ok() {
-                tracing::info!(
+                tracing::debug!(
                     lead_id = %self.lead.uuid,
                     duration_ms = insert_duration,
                     "Buyer responses batch inserted successfully"
@@ -877,7 +893,7 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest bid, then priority, then random
-        tracing::info!(
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             total_responses = responses.len(),
             valid_responses = valid_responses.len(),
@@ -893,7 +909,7 @@ impl PingTreeRouter {
         let winner_selection_start = std::time::Instant::now();
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
-        tracing::info!(
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             winner_campaign_id = %winner_campaign_id,
             winner_bid = ?winner_response.bid,
@@ -1440,7 +1456,7 @@ impl PingTreeRouter {
                     timeout_count = timeout_count,
                     rejected_count = rejected_count,
                     error_count = error_count,
-                    invalid_responses = %serde_json::to_string(&invalid_details).unwrap_or_default(),
+                    invalid_responses = %simd_json::to_string(&invalid_details).unwrap_or_else(|_| serde_json::to_string(&invalid_details).unwrap_or_default()),
                     "No valid buyer responses for fullpost - all responses were invalid"
                 );
 
@@ -1517,7 +1533,8 @@ impl PingTreeRouter {
                 ))
             });
 
-            // Update lead in database
+            // Update lead in database (inject chaos delay if enabled)
+            inject_chaos_delay().await;
             sqlx::query(
                 "UPDATE leads SET campaign_id = $1, buyer_id = $2, promise_id = $3, post_id = $4, status = $5, updated_at = now() WHERE uuid = $6",
             )
@@ -1620,6 +1637,9 @@ impl PingTreeRouter {
             .iter()
             .map(|p| sqlx::types::Json(p.clone()))
             .collect();
+
+        // Inject chaos delay if enabled (for testing)
+        inject_chaos_delay().await;
 
         let db_query_start = std::time::Instant::now();
 

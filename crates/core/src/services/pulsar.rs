@@ -13,6 +13,21 @@ use base64::Engine;
 use chrono::Utc;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
+
+// Chaos mode: inject random delays for testing resilience
+// Set CHAOS=1 environment variable to enable
+fn should_inject_chaos() -> bool {
+    std::env::var("CHAOS").unwrap_or_default() == "1"
+}
+
+async fn inject_chaos_delay() {
+    if should_inject_chaos() {
+        let delay_ms = rand::random::<u64>() % 150 + 50; // 50-200ms
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
 
 pub struct PulsarService;
 
@@ -45,6 +60,9 @@ impl PulsarService {
             "PROMISE_{}",
             hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
         );
+
+        // Inject chaos delay if enabled (for testing)
+        inject_chaos_delay().await;
 
         // Evaluate qualification rules using qualification engine
         let engine =
@@ -132,6 +150,9 @@ impl PulsarService {
         // Duplicate promise_id check removed for performance optimization
         // The check was best-effort anyway (50ms timeout) and idempotency is handled elsewhere
         // Removing it eliminates blocking overhead and reduces post latency
+
+        // Inject chaos delay if enabled (for testing)
+        inject_chaos_delay().await;
 
         // Evaluate qualification rules using qualification engine
         let engine =

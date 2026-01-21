@@ -235,6 +235,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Failed to initialize application state: {}", e);
             tracing::warn!("Application starting in minimal mode - only /live endpoint available");
             tracing::warn!("Full functionality will be unavailable until configuration is fixed");
+
+            // Alert to Sentry if configured
+            #[cfg(feature = "sentry")]
+            {
+                sentry::capture_message(
+                    &format!("DB pool init failed - running in minimal mode: {}", e),
+                    sentry::Level::Fatal,
+                );
+            }
             // Serve minimal app with just /live endpoint for health checks
             // This ensures health checks pass even if AppState initialization fails
             let minimal_app = axum::Router::new()

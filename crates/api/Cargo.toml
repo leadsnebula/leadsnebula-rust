@@ -28,6 +28,7 @@ tracing-opentelemetry = "0.22"
 opentelemetry = "0.23"
 opentelemetry-otlp = "0.16"
 mimalloc = "0.1"
+tokio-retry = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 dotenvy = { workspace = true }

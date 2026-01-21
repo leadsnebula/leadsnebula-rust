@@ -21,6 +21,8 @@ use leadsnebula_core::services::auction_timing::AuctionTiming;
 use leadsnebula_core::services::diagnostic_metrics::DiagnosticMetrics;
 use leadsnebula_core::services::ssm_key_cache::get_ssm_parameter_cached;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio_retry::{strategy::ExponentialBackoff, Retry};
 
 fn map_error_to_user(err_text: &str) -> (String, String) {
     let lower = err_text.to_lowercase();
@@ -518,13 +520,20 @@ async fn create_lead(
         // Attempt an atomic conditional claim to prevent double-sell.
         // We set a temporary in-progress token into `post_id` only if it's empty and the promise is not expired.
         let inprog_token = format!("INPROG_{}", uuid::Uuid::new_v4());
-        let claim_result = sqlx::query_scalar::<_, uuid::Uuid>(
-            "UPDATE leads SET post_id = $1 WHERE uuid = $2 AND (post_id IS NULL OR post_id = '') AND promise_id = $3 AND created_at >= NOW() - INTERVAL '10 minutes' RETURNING uuid",
-        )
-        .bind(inprog_token.clone())
-        .bind(lead.uuid)
-        .bind(&promise_id)
-        .fetch_optional(&*state.db_pool)
+        // Wire tokio-retry for transient DB errors
+        let retry_strategy = ExponentialBackoff::from_millis(50)
+            .max_delay(Duration::from_millis(200))
+            .take(3);
+        let claim_result = Retry::spawn(retry_strategy, || async {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "UPDATE leads SET post_id = $1 WHERE uuid = $2 AND (post_id IS NULL OR post_id = '') AND promise_id = $3 AND created_at >= NOW() - INTERVAL '10 minutes' RETURNING uuid",
+            )
+            .bind(inprog_token.clone())
+            .bind(lead.uuid)
+            .bind(&promise_id)
+            .fetch_optional(&*state.db_pool)
+            .await
+        })
         .await;
 
         match claim_result {
