@@ -926,16 +926,15 @@ async fn create_lead(
                         FROM (VALUES (true)) AS dummy
                         LEFT JOIN campaigns c ON (
                             (c.campaign_token = $3 AND $3 != '') OR 
-                            (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = $4 AND deleted_at IS NULL))
+                            (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND deleted_at IS NULL))
                         ) AND c.deleted_at IS NULL
-                        LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = $4 AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+                        LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND c.id IS NULL AND b_vertical.deleted_at IS NULL
                         LIMIT 1
                         "#,
                     )
                     .bind(publisher.id)
                     .bind(vertical.slug.clone())
                     .bind(campaign_token)
-                    .bind(vertical.id)
                     .fetch_optional(&*state.db_pool)
                     .await
                     .map_err(|e| anyhow::anyhow!("Database error: {}", e))
@@ -970,16 +969,15 @@ async fn create_lead(
                     FROM (VALUES (true)) AS dummy
                     LEFT JOIN campaigns c ON (
                         (c.campaign_token = $3 AND $3 != '') OR 
-                        (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = $4 AND deleted_at IS NULL))
+                        (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND deleted_at IS NULL))
                     ) AND c.deleted_at IS NULL
-                    LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = $4 AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+                    LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND c.id IS NULL AND b_vertical.deleted_at IS NULL
                     LIMIT 1
                     "#,
                 )
                 .bind(publisher.id)
                 .bind(vertical.slug.clone())
                 .bind(campaign_token)
-                .bind(vertical.id)
                 .fetch_optional(&*state.db_pool)
                 .await;
                 metrics.record_query(db_start.elapsed().as_millis() as u64);
@@ -1002,16 +1000,15 @@ async fn create_lead(
             FROM (VALUES (true)) AS dummy
             LEFT JOIN campaigns c ON (
                 (c.campaign_token = $3 AND $3 != '') OR 
-                (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = $4 AND deleted_at IS NULL))
+                (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND deleted_at IS NULL))
             ) AND c.deleted_at IS NULL
-            LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = $4 AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+            LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND c.id IS NULL AND b_vertical.deleted_at IS NULL
             LIMIT 1
             "#,
         )
         .bind(publisher.id)
         .bind(vertical.slug.clone())
         .bind(campaign_token)
-        .bind(vertical.id)
         .fetch_optional(&*state.db_pool)
         .await;
         metrics.record_query(db_start.elapsed().as_millis() as u64);
@@ -1043,9 +1040,9 @@ async fn create_lead(
         Ok(None) => {
             // No results - try fallback buyer lookup
             match sqlx::query_scalar::<_, uuid::Uuid>(
-                "SELECT id FROM buyers WHERE vertical_id = $1 AND deleted_at IS NULL LIMIT 1",
+                "SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $1 AND deleted_at IS NULL) AND deleted_at IS NULL LIMIT 1",
             )
-            .bind(vertical.id)
+            .bind(vertical.slug.clone())
             .fetch_optional(&*state.db_pool)
             .await
             {

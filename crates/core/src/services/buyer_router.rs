@@ -121,12 +121,17 @@ impl BuyerRouter {
                 campaign_id = %campaign.id,
                 buyer_id = %campaign.buyer_id,
                 method = "direct",
+                integration_slug = %integration.slug,
                 "Using direct Pulsar call (NO HTTP)"
             );
-            if integration.slug != "pulsar" {
-                tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
+            // Allow any slug starting with "pulsar" (e.g., "pulsar", "pulsar-solar", "pulsar-scalar-test")
+            if !integration.slug.starts_with("pulsar") {
+                tracing::error!(
+                    integration_slug = %integration.slug,
+                    "Unknown internal buyer – failing to prevent HTTP use"
+                );
                 return Err(anyhow::anyhow!(
-                    "Invalid internal buyer configuration: {}",
+                    "Invalid internal buyer configuration: {} (must start with 'pulsar')",
                     integration.slug
                 ));
             }
@@ -359,10 +364,14 @@ impl BuyerRouter {
                 "Using direct Pulsar call (NO HTTP) for campaign {}",
                 campaign.id
             );
-            if integration.slug != "pulsar" {
-                tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
+            // Allow any slug starting with "pulsar" (e.g., "pulsar", "pulsar-solar", "pulsar-scalar-test")
+            if !integration.slug.starts_with("pulsar") {
+                tracing::error!(
+                    integration_slug = %integration.slug,
+                    "Unknown internal buyer – failing to prevent HTTP use"
+                );
                 return Err(anyhow::anyhow!(
-                    "Invalid internal buyer configuration: {}",
+                    "Invalid internal buyer configuration: {} (must start with 'pulsar')",
                     integration.slug
                 ));
             }
@@ -568,13 +577,18 @@ impl BuyerRouter {
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
             tracing::info!(
-                "Using direct Pulsar call (NO HTTP) for campaign {}",
-                campaign.id
+                campaign_id = %campaign.id,
+                integration_slug = %integration.slug,
+                "Using direct Pulsar call (NO HTTP) for fullpost"
             );
-            if integration.slug != "pulsar" {
-                tracing::error!("Unknown internal buyer – failing to prevent HTTP use");
+            // Allow any slug starting with "pulsar" (e.g., "pulsar", "pulsar-solar", "pulsar-scalar-test")
+            if !integration.slug.starts_with("pulsar") {
+                tracing::error!(
+                    integration_slug = %integration.slug,
+                    "Unknown internal buyer – failing to prevent HTTP use"
+                );
                 return Err(anyhow::anyhow!(
-                    "Invalid internal buyer configuration: {}",
+                    "Invalid internal buyer configuration: {} (must start with 'pulsar')",
                     integration.slug
                 ));
             }
