@@ -926,9 +926,21 @@ async fn create_lead(
                         FROM (VALUES (true)) AS dummy
                         LEFT JOIN campaigns c ON (
                             (c.campaign_token = $3 AND $3 != '') OR 
-                            (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND deleted_at IS NULL))
+                            (c.vertical = $2 AND c.buyer_id IN (
+                                SELECT b.id FROM buyers b 
+                                WHERE b.vertical_id = (
+                                    SELECT v.id FROM verticals v 
+                                    WHERE v.slug = $2 AND v.deleted_at IS NULL
+                                ) AND b.deleted_at IS NULL
+                            ))
                         ) AND c.deleted_at IS NULL
-                        LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+                        LEFT JOIN buyers b_vertical ON 
+                            b_vertical.vertical_id = (
+                                SELECT v2.id FROM verticals v2 
+                                WHERE v2.slug = $2 AND v2.deleted_at IS NULL
+                            ) 
+                            AND c.id IS NULL 
+                            AND b_vertical.deleted_at IS NULL
                         LIMIT 1
                         "#,
                     )
@@ -969,9 +981,21 @@ async fn create_lead(
                     FROM (VALUES (true)) AS dummy
                     LEFT JOIN campaigns c ON (
                         (c.campaign_token = $3 AND $3 != '') OR 
-                        (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND deleted_at IS NULL))
+                        (c.vertical = $2 AND c.buyer_id IN (
+                            SELECT b.id FROM buyers b 
+                            WHERE b.vertical_id = (
+                                SELECT v.id FROM verticals v 
+                                WHERE v.slug = $2 AND v.deleted_at IS NULL
+                            ) AND b.deleted_at IS NULL
+                        ))
                     ) AND c.deleted_at IS NULL
-                    LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+                    LEFT JOIN buyers b_vertical ON 
+                        b_vertical.vertical_id = (
+                            SELECT v2.id FROM verticals v2 
+                            WHERE v2.slug = $2 AND v2.deleted_at IS NULL
+                        ) 
+                        AND c.id IS NULL 
+                        AND b_vertical.deleted_at IS NULL
                     LIMIT 1
                     "#,
                 )
@@ -1000,9 +1024,21 @@ async fn create_lead(
             FROM (VALUES (true)) AS dummy
             LEFT JOIN campaigns c ON (
                 (c.campaign_token = $3 AND $3 != '') OR 
-                (c.vertical = $2 AND c.buyer_id IN (SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND deleted_at IS NULL))
+                (c.vertical = $2 AND c.buyer_id IN (
+                    SELECT b.id FROM buyers b 
+                    WHERE b.vertical_id = (
+                        SELECT v.id FROM verticals v 
+                        WHERE v.slug = $2 AND v.deleted_at IS NULL
+                    ) AND b.deleted_at IS NULL
+                ))
             ) AND c.deleted_at IS NULL
-            LEFT JOIN buyers b_vertical ON b_vertical.vertical_id = (SELECT id FROM verticals WHERE slug = $2 AND deleted_at IS NULL) AND c.id IS NULL AND b_vertical.deleted_at IS NULL
+            LEFT JOIN buyers b_vertical ON 
+                b_vertical.vertical_id = (
+                    SELECT v2.id FROM verticals v2 
+                    WHERE v2.slug = $2 AND v2.deleted_at IS NULL
+                ) 
+                AND c.id IS NULL 
+                AND b_vertical.deleted_at IS NULL
             LIMIT 1
             "#,
         )
@@ -1040,7 +1076,7 @@ async fn create_lead(
         Ok(None) => {
             // No results - try fallback buyer lookup
             match sqlx::query_scalar::<_, uuid::Uuid>(
-                "SELECT id FROM buyers WHERE vertical_id = (SELECT id FROM verticals WHERE slug = $1 AND deleted_at IS NULL) AND deleted_at IS NULL LIMIT 1",
+                "SELECT b.id FROM buyers b WHERE b.vertical_id = (SELECT v.id FROM verticals v WHERE v.slug = $1 AND v.deleted_at IS NULL) AND b.deleted_at IS NULL LIMIT 1",
             )
             .bind(vertical.slug.clone())
             .fetch_optional(&*state.db_pool)
