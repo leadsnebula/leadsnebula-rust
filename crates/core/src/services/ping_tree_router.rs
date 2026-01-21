@@ -664,13 +664,28 @@ impl PingTreeRouter {
             // Serialize response - use empty object on error (best-effort persistence)
             let resp_json = serde_json::to_value(resp).unwrap_or_else(|_| serde_json::json!({}));
             // Ensure ping_id is set - if response doesn't have one, generate one for ping requests
-            let ping_id_val = resp.ping_id.clone().or_else(|| {
+            let mut ping_id_val = resp.ping_id.clone().or_else(|| {
                 if self.request_type == "ping" {
                     Some(format!("ping_{}", uuid::Uuid::new_v4()))
                 } else {
                     None
                 }
             });
+
+            // Make ping_id unique per campaign (prevents duplicates when multiple campaigns ping same lead)
+            // Ruby does this: append _C{campaign_id_first_8_chars} if not already present
+            if let Some(ref mut ping_id) = ping_id_val {
+                if !ping_id.contains("_C") {
+                    // Extract first 8 characters of campaign_id (without dashes)
+                    let campaign_suffix = campaign_id
+                        .to_string()
+                        .replace('-', "")
+                        .chars()
+                        .take(8)
+                        .collect::<String>();
+                    *ping_id = format!("{}_C{}", ping_id, campaign_suffix);
+                }
+            }
 
             batch_responses.push((
                 self.lead.uuid,

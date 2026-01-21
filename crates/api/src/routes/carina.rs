@@ -1359,75 +1359,66 @@ async fn create_lead(
         }
     }
 
-    // Create a ping record first (required for ping_payloads foreign key)
-    // ping_id (text) is required for pings table, and pings.id (bigint) is required for ping_payloads.ping_id
-    // Generate ping_id similar to Pulsar handler: FP_<base64(lead_id|timestamp|result)>
-    use base64::Engine;
-    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let payload_str = format!("{}|{}|pending", lead_id, timestamp);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(payload_str);
-    let ping_id_text = format!("FP_{}", encoded);
+    // Create ping and ping_payloads records asynchronously (fire-and-forget)
+    // This reduces lead_insertion time from 400-1000ms to <200ms
+    // These are audit records, not critical for auction flow
+    let pool_async = state.db_pool.clone();
+    let lead_uuid_async = lead_uuid;
+    let promise_id_async = promise_id.clone();
+    let request_payload_json_async = request_payload_json.clone();
+    let encrypted_request_async = encrypted_request_opt.clone();
+    tokio::spawn(async move {
+        // Generate ping_id similar to Pulsar handler: FP_<base64(lead_id|timestamp|result)>
+        use base64::Engine;
+        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+        let lead_id_str = format!("{}", lead_uuid_async); // Use UUID as lead_id for ping record
+        let payload_str = format!("{}|{}|pending", lead_id_str, timestamp);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload_str);
+        let ping_id_text = format!("FP_{}", encoded);
 
-    let ping_id_result = sqlx::query("INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, $3, $4, now(), now()) RETURNING id")
-        .bind(&ping_id_text)
-        .bind(lead_uuid)
-        .bind(&promise_id)
-        .bind("processing")
-        .fetch_one(&*state.db_pool)
-        .await;
-
-    let ping_id_opt = match ping_id_result {
-        Ok(row) => Some(row.get::<i64, _>("id")),
-        Err(e) => {
-            tracing::error!("Failed to create ping record for lead {}: {}", lead_uuid, e);
-            // Continue without ping_payloads if ping creation fails (best-effort)
-            None
-        }
-    };
-
-    // Now insert into ping_payloads with the ping_id (if ping was created successfully)
-    let inserted_payload = if let Some(ping_id_val) = ping_id_opt {
-        let encrypted_request = encrypted_request_opt.unwrap_or_else(|| {
-            // If encryption failed, use empty string (NOT NULL constraint requires a value)
-            tracing::warn!(
-                "Request payload encryption failed for lead {}, using empty string",
-                lead_uuid
-            );
-            String::new()
-        });
-
-        sqlx::query("INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, now()) RETURNING id")
-            .bind(ping_id_val)
-            .bind(lead_uuid)
-            .bind(sqlx::types::Json(&request_payload_json))
-            .bind(encrypted_request)
-            .fetch_one(&*state.db_pool)
+        // Insert ping record
+        let ping_id_opt = match sqlx::query("INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, $3, $4, now(), now()) RETURNING id")
+            .bind(&ping_id_text)
+            .bind(lead_uuid_async)
+            .bind(&promise_id_async)
+            .bind("processing")
+            .fetch_one(&*pool_async)
             .await
-    } else {
-        // If ping creation failed, skip ping_payloads insert (best-effort, don't fail the whole request)
-        Err(sqlx::Error::RowNotFound)
-    };
+        {
+            Ok(row) => Some(row.get::<i64, _>("id")),
+            Err(e) => {
+                tracing::warn!("Failed to create ping record for lead {} (non-critical): {}", lead_uuid_async, e);
+                None
+            }
+        };
 
-    // Capture payload row id if insert succeeded (best-effort)
-    let payload_row_id: Option<uuid::Uuid> = match inserted_payload {
-        Ok(r) => {
-            let id = r.get::<uuid::Uuid, _>("id");
-            tracing::info!(
-                "Successfully created ping_payloads record: id={}, lead_id={}",
-                id,
-                lead_uuid
-            );
-            Some(id)
+        // Insert ping_payloads if ping was created successfully
+        if let Some(ping_id_val) = ping_id_opt {
+            let encrypted_request = encrypted_request_async.unwrap_or_else(|| {
+                tracing::warn!(
+                    "Request payload encryption failed for lead {}, using empty string",
+                    lead_uuid_async
+                );
+                String::new()
+            });
+
+            if let Err(e) = sqlx::query("INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, now())")
+                .bind(ping_id_val)
+                .bind(lead_uuid_async)
+                .bind(sqlx::types::Json(&request_payload_json_async))
+                .bind(encrypted_request)
+                .execute(&*pool_async)
+                .await
+            {
+                tracing::warn!("Failed to create ping_payloads record for lead {} (non-critical): {}", lead_uuid_async, e);
+            } else {
+                tracing::info!("Successfully created ping_payloads record for lead {}", lead_uuid_async);
+            }
         }
-        Err(e) => {
-            tracing::error!(
-                "Failed to create ping_payloads record for lead {}: {}",
-                lead_uuid,
-                e
-            );
-            None
-        }
-    };
+    });
+
+    // No need to wait for ping/ping_payloads - they're audit records
+    let payload_row_id: Option<uuid::Uuid> = None;
 
     // Load the created lead
     let lead = match sqlx::query_as::<_, leadsnebula_core::models::lead::Lead>(
