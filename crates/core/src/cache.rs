@@ -234,34 +234,74 @@ impl CacheService {
     {
         // Check L1 (moka) first - <1ms
         if let Some(cached) = self.l1_cache.get(key).await {
-            if let Ok(value) = serde_json::from_str::<T>(&cached) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    cache_key = %key,
-                    cache_result = "hit",
-                    cache_level = "L1",
-                    ttl_seconds = ttl_seconds,
-                    "Cache get_or_insert_with: L1 hit"
-                );
-                return Ok(value);
+            // Use simd-json for faster deserialization (requires mutable bytes)
+            let mut bytes = cached.clone().into_bytes();
+            match simd_json::from_slice::<T>(&mut bytes) {
+                Ok(value) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        cache_key = %key,
+                        cache_result = "hit",
+                        cache_level = "L1",
+                        ttl_seconds = ttl_seconds,
+                        "Cache get_or_insert_with: L1 hit"
+                    );
+                    return Ok(value);
+                }
+                Err(_) => {
+                    // Fallback to serde_json if simd-json fails (e.g., invalid JSON)
+                    let bytes = cached.into_bytes();
+                    if let Ok(value) = serde_json::from_slice::<T>(&bytes) {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            cache_key = %key,
+                            cache_result = "hit",
+                            cache_level = "L1",
+                            ttl_seconds = ttl_seconds,
+                            "Cache get_or_insert_with: L1 hit (fallback)"
+                        );
+                        return Ok(value);
+                    }
+                }
             }
         }
 
         // Check L2 (Redis) - 2-5ms
         // self.get() already handles None case for redis
         if let Some(cached) = self.get(key).await? {
-            if let Ok(value) = serde_json::from_str::<T>(&cached) {
-                // Store in L1 for next time
-                self.l1_cache.insert(key.to_string(), cached.clone()).await;
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    cache_key = %key,
-                    cache_result = "hit",
-                    cache_level = "L2",
-                    ttl_seconds = ttl_seconds,
-                    "Cache get_or_insert_with: L2 hit"
-                );
-                return Ok(value);
+            // Use simd-json for faster deserialization (requires mutable bytes)
+            let mut bytes = cached.clone().into_bytes();
+            match simd_json::from_slice::<T>(&mut bytes) {
+                Ok(value) => {
+                    // Store in L1 for next time
+                    self.l1_cache.insert(key.to_string(), cached.clone()).await;
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        cache_key = %key,
+                        cache_result = "hit",
+                        cache_level = "L2",
+                        ttl_seconds = ttl_seconds,
+                        "Cache get_or_insert_with: L2 hit"
+                    );
+                    return Ok(value);
+                }
+                Err(_) => {
+                    // Fallback to serde_json if simd-json fails
+                    let bytes = cached.clone().into_bytes();
+                    if let Ok(value) = serde_json::from_slice::<T>(&bytes) {
+                        // Store in L1 for next time
+                        self.l1_cache.insert(key.to_string(), cached.clone()).await;
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            cache_key = %key,
+                            cache_result = "hit",
+                            cache_level = "L2",
+                            ttl_seconds = ttl_seconds,
+                            "Cache get_or_insert_with: L2 hit (fallback)"
+                        );
+                        return Ok(value);
+                    }
+                }
             }
         }
 
@@ -274,7 +314,13 @@ impl CacheService {
             "Cache get_or_insert_with: miss, fetching from source"
         );
         let value = f().await?;
-        let serialized = serde_json::to_string(&value)?;
+        // Use simd-json for faster serialization
+        let serialized = match simd_json::to_vec(&value) {
+            Ok(bytes) => {
+                String::from_utf8(bytes).unwrap_or_else(|_| serde_json::to_string(&value).unwrap())
+            }
+            Err(_) => serde_json::to_string(&value)?, // Fallback to serde_json
+        };
 
         // Store in both L1 and L2
         self.l1_cache

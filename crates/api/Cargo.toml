@@ -24,6 +24,9 @@ simd-json = "0.13"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-flame = { workspace = true }
+tracing-opentelemetry = "0.22"
+opentelemetry = "0.23"
+opentelemetry-otlp = "0.16"
 mimalloc = "0.1"
 chrono = { workspace = true }
 uuid = { workspace = true }

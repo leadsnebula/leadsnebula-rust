@@ -797,17 +797,24 @@ async fn create_lead(
                 // Update lead final state: if sold, set post_id and status sold; if not, clear in-progress placeholder
                 if routing_result.success && routing_result.status == "sold" {
                     // Set final post_id and mark sold only if our in-progress token is still present
-                    let _ = sqlx::query("UPDATE leads SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW() WHERE uuid = $3 AND post_id = $4")
-                        .bind(routing_result.post_id.clone())
-                        .bind(leadsnebula_core::models::enums::LeadStatus::Sold)
-                        .bind(lead.uuid)
-                        .bind(inprog_token.clone())
-                        .execute(&*state.db_pool)
-                        .await;
+                    let _ = sqlx::query(
+                        r#"
+                        UPDATE leads SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW() 
+                        WHERE uuid = $3 AND post_id = $4
+                        "#,
+                    )
+                    .bind(routing_result.post_id.clone())
+                    .bind(leadsnebula_core::models::enums::LeadStatus::Sold)
+                    .bind(lead.uuid)
+                    .bind(inprog_token.clone())
+                    .execute(&*state.db_pool)
+                    .await;
                 } else {
                     // Reset placeholder so another post attempt may try
                     let _ = sqlx::query(
-                        "UPDATE leads SET post_id = '' WHERE uuid = $1 AND post_id = $2",
+                        r#"
+                        UPDATE leads SET post_id = '' WHERE uuid = $1 AND post_id = $2
+                        "#,
                     )
                     .bind(lead.uuid)
                     .bind(inprog_token.clone())
@@ -907,11 +914,25 @@ async fn create_lead(
         publisher.id, vertical.slug, campaign_token
     );
 
+    // Prepare SSM paths for parallel fetching with pre-checks query
+    let env_norm = state.config.environment.to_lowercase();
+    let det_path = format!(
+        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
+        env_norm
+    );
+    let salt_path = format!(
+        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
+        env_norm
+    );
+
+    // Parallelize pre-checks query with SSM key fetching (they're independent)
     // Enhanced single query combining all pre-checks (avoids fallback query)
     // CACHED: Short TTL (300s) since campaigns can change
-    let (result, prechecks_cache_hit) = if let Some(cache) = &state.cache {
-        // Use cached lookup with 300s TTL
-        match cache
+    let (prechecks_result, ssm_results) = tokio::join!(
+        async {
+            if let Some(cache) = &state.cache {
+                // Use cached lookup with 300s TTL
+                match cache
             .get_or_insert_with(
                 &prechecks_cache_key,
                 300, // 5 minutes
@@ -1011,11 +1032,11 @@ async fn create_lead(
                 (result, false)
             }
         }
-    } else {
-        // No cache available, use direct DB query
-        let db_start = std::time::Instant::now();
-        let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
-            r#"
+            } else {
+                // No cache available, use direct DB query
+                let db_start = std::time::Instant::now();
+                let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+                    r#"
             SELECT 
                 c.id AS campaign_id,
                 COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
@@ -1044,15 +1065,29 @@ async fn create_lead(
                 AND b_vertical.deleted_at IS NULL
             LIMIT 1
             "#,
-        )
-        .bind(publisher.id)
-        .bind(vertical.slug.clone())
-        .bind(campaign_token)
-        .fetch_optional(&*state.db_pool)
-        .await;
-        metrics.record_query(db_start.elapsed().as_millis() as u64);
-        (result, false)
-    };
+                )
+                .bind(publisher.id)
+                .bind(vertical.slug.clone())
+                .bind(campaign_token)
+                .fetch_optional(&*state.db_pool)
+                .await;
+                metrics.record_query(db_start.elapsed().as_millis() as u64);
+                (result, false)
+            }
+        },
+        async {
+            // Fetch SSM keys in parallel with pre-checks query
+            (
+                get_ssm_parameter_cached(&state.ssm, &det_path, true).await,
+                get_ssm_parameter_cached(&state.ssm, &salt_path, true).await,
+            )
+        }
+    );
+
+    // Extract results
+    let (result, prechecks_cache_hit) = prechecks_result;
+    let (det_key_result, salt_result) = ssm_results;
+
     let prechecks_duration = prechecks_start.elapsed().as_millis() as u64;
     timing.complete_stage(stage_prechecks, Some(serde_json::json!({"cache_hit": prechecks_cache_hit, "duration_ms": prechecks_duration})));
 
@@ -1167,40 +1202,26 @@ async fn create_lead(
     };
 
     // Encrypt PII fields using SSM deterministic key
+    // Note: SSM keys were already fetched in parallel with pre-checks query above
     let stage_encryption = timing.start_stage("encryption_setup", serde_json::json!({}));
-    let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
-    let det_path = format!(
-        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
-        env_norm
-    );
-    let salt_path = format!(
-        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
-        env_norm
-    );
 
-    // Get deterministic key and salt from SSM for PII encryption (parallelized)
-    let (det_key_result, salt_result) = tokio::join!(
-        get_ssm_parameter_cached(&state.ssm, &det_path, true),
-        get_ssm_parameter_cached(&state.ssm, &salt_path, true)
-    );
-
-    let pii_encryption_key = if let Ok(Some(det_key)) = det_key_result {
-        if let Ok(Some(salt)) = salt_result {
-            Some(
-                leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
-                    &det_key, &salt,
-                ),
-            )
-        } else {
+    let pii_encryption_key = match (det_key_result, salt_result) {
+        (Ok(Some(det_key)), Ok(Some(salt))) => Some(
+            leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
+                &det_key, &salt,
+            ),
+        ),
+        (Ok(Some(_)), Ok(None)) | (Ok(Some(_)), Err(_)) => {
             tracing::warn!("Failed to get key derivation salt from SSM at {} - PII fields will not be encrypted", salt_path);
             None
         }
-    } else {
-        tracing::warn!(
-            "Failed to get deterministic key from SSM at {} - PII fields will not be encrypted",
-            det_path
-        );
-        None
+        (Ok(None), _) | (Err(_), _) => {
+            tracing::warn!(
+                "Failed to get deterministic key from SSM at {} - PII fields will not be encrypted",
+                det_path
+            );
+            None
+        }
     };
 
     // Encrypt PII fields

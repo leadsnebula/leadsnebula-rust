@@ -82,7 +82,8 @@ impl PulsarService {
         let lead_id_uuid = lead.uuid; // Use UUID directly, not String
         let ping_id_clone = ping_id.clone();
         let buyer_id_clone = campaign.buyer_id;
-        let final_bid_price = (rand::random::<u32>() % 200 + 100) as i32;
+        let final_bid_price =
+            rust_decimal::Decimal::from((rand::random::<u32>() % 200 + 100) as i32);
         tokio::spawn(async move {
             if let Err(e) = sqlx::query(
                 r#"
@@ -91,7 +92,7 @@ impl PulsarService {
                 "#,
             )
             .bind(lead_id_uuid) // Bind UUID, not String
-            .bind(&ping_id_clone)
+            .bind(ping_id_clone)
             .bind(buyer_id_clone)
             .bind(accepted)
             .bind(Some(final_bid_price))
@@ -169,7 +170,8 @@ impl PulsarService {
         let pool_log = pool.clone();
         let lead_id_uuid = lead.uuid; // Use UUID directly, not String
         let buyer_id_log = campaign.buyer_id;
-        let final_bid_price_post = (rand::random::<u32>() % 200 + 100) as i32;
+        let final_bid_price_post =
+            rust_decimal::Decimal::from((rand::random::<u32>() % 200 + 100) as i32);
         tokio::spawn(async move {
             if let Err(e) = sqlx::query(
                 r#"

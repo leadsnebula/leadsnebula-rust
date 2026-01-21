@@ -132,6 +132,11 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
                 "auction_time_ms": 200,
                 "cache_hit_rate_percent": 90.0,
                 "db_query_time_ms": 100
+            },
+            "alerts": {
+                "auction_time_high": pool_size > 0 && num_idle < (pool_size / 10), // Less than 10% idle = potential issue
+                "cache_miss_rate_high": !redis_configured || redis_status != "connected",
+                "db_pool_exhausted": num_idle == 0 && pool_size > 0
             }
         }
     });

@@ -64,3 +64,7 @@ name = "ping_auction_bench"
 path = "benches/ping_auction_bench.rs"
 harness = false
 
+[[bench]]
+name = "auction_bench"
+path = "benches/auction_bench.rs"
+harness = false
