@@ -112,13 +112,31 @@ async fn main() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
     }
 
-    // Initialize tracing
-    tracing_subscriber::fmt()
+    // Initialize tracing with comprehensive logging
+    // Default to INFO level for all crates to ensure logs work in Fly.io/Grafana
+    // RUST_LOG can override this if set (e.g., RUST_LOG=debug for verbose)
+    let default_filter = "leadsnebula_api=info,leadsnebula_core=info,leadsnebula_utils=info,tower_http=info,sqlx=warn,redis=info";
+
+    // Use JSON format by default for production (works better with Grafana/Fly.io)
+    // Set RUST_LOG_JSON=0 to disable JSON and use pretty format
+    let use_json = std::env::var("RUST_LOG_JSON")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true); // Default to JSON
+
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "leadsnebula_api=debug,tower_http=info".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
-        .init();
+        .with_target(true) // Include module path
+        .with_file(true) // Include file name
+        .with_line_number(true); // Include line numbers
+
+    if use_json {
+        subscriber.json().init();
+    } else {
+        subscriber.init();
+    }
 
     info!("Starting LeadsNebula API server...");
 

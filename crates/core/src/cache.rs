@@ -75,21 +75,87 @@ impl CacheService {
     }
 
     pub async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         if let Some(redis) = &self.redis {
             let cache_key = format!("cache:{}", key);
             let is_dev = self.env == "dev" || self.env == "development";
             let ttl = self.get_ttl(is_dev);
-            redis.set_with_ttl(&cache_key, value, ttl).await
+            let result = redis.set_with_ttl(&cache_key, value, ttl).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(_) => {
+                    tracing::info!(
+                        operation = "cache_set",
+                        cache_key = %key,
+                        full_key = %cache_key,
+                        value_length = value.len(),
+                        ttl_seconds = ttl,
+                        duration_ms = duration_ms,
+                        "Cache SET operation"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        operation = "cache_set",
+                        cache_key = %key,
+                        full_key = %cache_key,
+                        value_length = value.len(),
+                        ttl_seconds = ttl,
+                        duration_ms = duration_ms,
+                        error = %e,
+                        "Cache SET error"
+                    );
+                }
+            }
+            result
         } else {
+            tracing::debug!(
+                operation = "cache_set",
+                cache_key = %key,
+                reason = "redis_not_configured",
+                duration_ms = start.elapsed().as_millis() as u64,
+                "Cache SET skipped (Redis not configured)"
+            );
             Ok(())
         }
     }
 
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         if let Some(redis) = &self.redis {
             let cache_key = format!("cache:{}", key);
-            redis.delete(&cache_key).await
+            let result = redis.delete(&cache_key).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(_) => {
+                    tracing::info!(
+                        operation = "cache_delete",
+                        cache_key = %key,
+                        full_key = %cache_key,
+                        duration_ms = duration_ms,
+                        "Cache DELETE operation"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        operation = "cache_delete",
+                        cache_key = %key,
+                        full_key = %cache_key,
+                        duration_ms = duration_ms,
+                        error = %e,
+                        "Cache DELETE error"
+                    );
+                }
+            }
+            result
         } else {
+            tracing::debug!(
+                operation = "cache_delete",
+                cache_key = %key,
+                reason = "redis_not_configured",
+                duration_ms = start.elapsed().as_millis() as u64,
+                "Cache DELETE skipped (Redis not configured)"
+            );
             Ok(())
         }
     }
@@ -100,10 +166,46 @@ impl CacheService {
         value: &str,
         ttl_seconds: u64,
     ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         if let Some(redis) = &self.redis {
             let cache_key = format!("cache:{}", key);
-            redis.set_with_ttl(&cache_key, value, ttl_seconds).await
+            let result = redis.set_with_ttl(&cache_key, value, ttl_seconds).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(_) => {
+                    tracing::info!(
+                        operation = "cache_set_with_ttl",
+                        cache_key = %key,
+                        full_key = %cache_key,
+                        value_length = value.len(),
+                        ttl_seconds = ttl_seconds,
+                        duration_ms = duration_ms,
+                        "Cache SET with TTL operation"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        operation = "cache_set_with_ttl",
+                        cache_key = %key,
+                        full_key = %cache_key,
+                        value_length = value.len(),
+                        ttl_seconds = ttl_seconds,
+                        duration_ms = duration_ms,
+                        error = %e,
+                        "Cache SET with TTL error"
+                    );
+                }
+            }
+            result
         } else {
+            tracing::debug!(
+                operation = "cache_set_with_ttl",
+                cache_key = %key,
+                reason = "redis_not_configured",
+                ttl_seconds = ttl_seconds,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "Cache SET with TTL skipped (Redis not configured)"
+            );
             Ok(())
         }
     }

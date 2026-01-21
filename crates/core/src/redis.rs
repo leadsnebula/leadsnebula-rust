@@ -169,12 +169,35 @@ impl RedisClient {
 
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
         let prefixed_key = self.prefix_key(key);
+        let start = std::time::Instant::now();
         let mut conn = self.pool.get().await?;
 
         match conn.get::<_, Option<String>>(&prefixed_key).await {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let value_len = value.as_ref().map(|v| v.len()).unwrap_or(0);
+                tracing::info!(
+                    operation = "redis_get",
+                    key = %key,
+                    prefixed_key = %prefixed_key,
+                    found = value.is_some(),
+                    value_length = value_len,
+                    duration_ms = duration_ms,
+                    "Redis GET operation"
+                );
+                Ok(value)
+            }
             Err(e) => {
-                error!("Redis GET error for {}: {}", prefixed_key, e);
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "redis_get",
+                    key = %key,
+                    prefixed_key = %prefixed_key,
+                    duration_ms = duration_ms,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "Redis GET error"
+                );
                 Err(anyhow::anyhow!("Redis error: {}", e))
             }
         }
@@ -191,23 +214,79 @@ impl RedisClient {
         ttl_seconds: u64,
     ) -> anyhow::Result<()> {
         let prefixed_key = self.prefix_key(key);
+        let start = std::time::Instant::now();
         let mut conn = self.pool.get().await?;
 
-        if ttl_seconds > 0 {
+        let result = if ttl_seconds > 0 {
             conn.set_ex::<_, _, ()>(&prefixed_key, value, ttl_seconds)
-                .await?;
+                .await
         } else {
-            conn.set::<_, _, ()>(&prefixed_key, value).await?;
-        }
+            conn.set::<_, _, ()>(&prefixed_key, value).await
+        };
 
-        Ok(())
+        match result {
+            Ok(_) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    operation = "redis_set",
+                    key = %key,
+                    prefixed_key = %prefixed_key,
+                    value_length = value.len(),
+                    ttl_seconds = ttl_seconds,
+                    duration_ms = duration_ms,
+                    "Redis SET operation"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "redis_set",
+                    key = %key,
+                    prefixed_key = %prefixed_key,
+                    value_length = value.len(),
+                    ttl_seconds = ttl_seconds,
+                    duration_ms = duration_ms,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "Redis SET error"
+                );
+                Err(anyhow::anyhow!("Redis SET error: {}", e))
+            }
+        }
     }
 
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let prefixed_key = self.prefix_key(key);
+        let start = std::time::Instant::now();
         let mut conn = self.pool.get().await?;
-        conn.del::<_, ()>(&prefixed_key).await?;
-        Ok(())
+
+        match conn.del::<_, ()>(&prefixed_key).await {
+            Ok(_) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    operation = "redis_delete",
+                    key = %key,
+                    prefixed_key = %prefixed_key,
+                    duration_ms = duration_ms,
+                    "Redis DELETE operation"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "redis_delete",
+                    key = %key,
+                    prefixed_key = %prefixed_key,
+                    duration_ms = duration_ms,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "Redis DELETE error"
+                );
+                Err(anyhow::anyhow!("Redis DELETE error: {}", e))
+            }
+        }
     }
 
     pub async fn exists(&self, key: &str) -> anyhow::Result<bool> {

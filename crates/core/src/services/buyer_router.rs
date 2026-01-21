@@ -245,14 +245,44 @@ impl BuyerRouter {
         );
 
         let ping_start = std::time::Instant::now();
-        let response = client
+        let response = match client
             .post(&endpoint)
             .json(&payload)
-            .headers(headers)
+            .headers(headers.clone())
             .timeout(Duration::from_secs(1))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        {
+            Ok(resp) => {
+                let ping_duration = ping_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    operation = "http_request",
+                    method = "POST",
+                    endpoint = %endpoint,
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    status_code = resp.status().as_u16(),
+                    duration_ms = ping_duration,
+                    "HTTP ping request sent and response received"
+                );
+                resp
+            }
+            Err(e) => {
+                let ping_duration = ping_start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "http_request",
+                    method = "POST",
+                    endpoint = %endpoint,
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    duration_ms = ping_duration,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "HTTP ping request failed"
+                );
+                return Err(anyhow::anyhow!("HTTP request failed: {}", e));
+            }
+        };
         let ping_duration = ping_start.elapsed().as_millis() as u64;
 
         // Complete buyer_ping_sent and start buyer_ping_response
@@ -445,14 +475,44 @@ impl BuyerRouter {
         );
 
         let post_start = std::time::Instant::now();
-        let response = client
+        let response = match client
             .post(&endpoint)
             .json(&payload)
-            .headers(headers)
+            .headers(headers.clone())
             .timeout(Duration::from_secs(3))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        {
+            Ok(resp) => {
+                let post_duration = post_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    operation = "http_request",
+                    method = "POST",
+                    endpoint = %endpoint,
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    status_code = resp.status().as_u16(),
+                    duration_ms = post_duration,
+                    "HTTP post request sent and response received"
+                );
+                resp
+            }
+            Err(e) => {
+                let post_duration = post_start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "http_request",
+                    method = "POST",
+                    endpoint = %endpoint,
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    duration_ms = post_duration,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "HTTP post request failed"
+                );
+                return Err(anyhow::anyhow!("HTTP request failed: {}", e));
+            }
+        };
         let post_duration = post_start.elapsed().as_millis() as u64;
 
         // Complete buyer_post_sent and start buyer_post_response
@@ -614,14 +674,46 @@ impl BuyerRouter {
         );
 
         let post_start = std::time::Instant::now();
-        let response = client
+        let response = match client
             .post(&endpoint)
             .json(&payload)
-            .headers(headers)
+            .headers(headers.clone())
             .timeout(Duration::from_secs(5)) // Fullpost timeout: 5 seconds
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        {
+            Ok(resp) => {
+                let post_duration = post_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    operation = "http_request",
+                    method = "POST",
+                    endpoint = %endpoint,
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    request_type = "fullpost",
+                    status_code = resp.status().as_u16(),
+                    duration_ms = post_duration,
+                    "HTTP fullpost request sent and response received"
+                );
+                resp
+            }
+            Err(e) => {
+                let post_duration = post_start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "http_request",
+                    method = "POST",
+                    endpoint = %endpoint,
+                    campaign_id = %campaign.id,
+                    buyer_id = %campaign.buyer_id,
+                    request_type = "fullpost",
+                    duration_ms = post_duration,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "HTTP fullpost request failed"
+                );
+                return Err(anyhow::anyhow!("HTTP request failed: {}", e));
+            }
+        };
         let post_duration = post_start.elapsed().as_millis() as u64;
 
         // Complete buyer_post_sent and start buyer_post_response

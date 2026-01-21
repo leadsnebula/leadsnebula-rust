@@ -750,10 +750,8 @@ impl PingTreeRouter {
                 // For ping auctions, check for bid (not price)
                 let has_bid = resp.bid.is_some() && resp.bid.unwrap_or(0.0) > 0.0;
                 let has_promise_id = resp.promise_id.is_some();
-                let is_valid = resp.success
-                    && has_bid
-                    && has_promise_id
-                    && resp.status != "timeout";
+                let is_valid =
+                    resp.success && has_bid && has_promise_id && resp.status != "timeout";
 
                 if !is_valid {
                     let reason = if !resp.success {
@@ -769,14 +767,16 @@ impl PingTreeRouter {
                     };
 
                     tracing::warn!(
-                        "Invalid buyer ping response for campaign {}: {} (success={}, bid={:?}, promise_id={:?}, status={}, error={:?})",
-                        campaign_id,
-                        reason,
-                        resp.success,
-                        resp.bid,
-                        resp.promise_id,
-                        resp.status,
-                        resp.error
+                        lead_id = %self.lead.uuid,
+                        campaign_id = %campaign_id,
+                        invalid_reason = %reason,
+                        success = resp.success,
+                        bid = ?resp.bid,
+                        promise_id = ?resp.promise_id,
+                        status = %resp.status,
+                        error = ?resp.error,
+                        ping_id = ?resp.ping_id,
+                        "Invalid buyer ping response - response does not meet validation criteria"
                     );
                 }
 
@@ -1207,14 +1207,24 @@ impl PingTreeRouter {
     ) -> Result<RoutingResult> {
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
+            tracing::info!(
+                lead_id = %self.lead.uuid,
+                strategy = %ping_tree.strategy,
+                campaign_count = campaigns.len(),
+                "Starting fullpost routing with ping_post strategy"
+            );
+
             // Create a temporary router with "ping" request_type for the ping auction phase
-            let ping_router = PingTreeRouter::new(
+            let mut ping_router = PingTreeRouter::new(
                 self.lead.clone(),
                 self.publisher_id,
                 self.vertical.clone(),
                 "ping".to_string(), // Force "ping" request_type for ping auction
                 self.cache.clone(),
             );
+            // Connect timing and metrics to the ping router
+            ping_router = ping_router.with_timing_and_metrics(timing.clone(), metrics.clone());
+
             let ping_result = ping_router
                 .route_ping_auction(
                     pool.clone(),
@@ -1231,10 +1241,43 @@ impl PingTreeRouter {
             }
 
             // Reload lead from database to get promise_id and campaign_id set by ping auction
-            let updated_lead = sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
-                .bind(self.lead.uuid)
-                .fetch_one(pool.as_ref())
-                .await?;
+            let db_query_start = std::time::Instant::now();
+            let updated_lead =
+                match sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
+                    .bind(self.lead.uuid)
+                    .fetch_one(pool.as_ref())
+                    .await
+                {
+                    Ok(lead) => {
+                        let duration_ms = db_query_start.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            operation = "db_query",
+                            query_type = "select",
+                            table = "leads",
+                            query = "SELECT * FROM leads WHERE uuid = $1",
+                            lead_id = %self.lead.uuid,
+                            rows_returned = 1,
+                            duration_ms = duration_ms,
+                            "Database query: reload lead after ping auction"
+                        );
+                        lead
+                    }
+                    Err(e) => {
+                        let duration_ms = db_query_start.elapsed().as_millis() as u64;
+                        tracing::error!(
+                            operation = "db_query",
+                            query_type = "select",
+                            table = "leads",
+                            query = "SELECT * FROM leads WHERE uuid = $1",
+                            lead_id = %self.lead.uuid,
+                            duration_ms = duration_ms,
+                            error = %e,
+                            error_type = %std::any::type_name_of_val(&e),
+                            "Database query error: failed to reload lead"
+                        );
+                        return Err(anyhow::anyhow!("Failed to reload lead: {}", e));
+                    }
+                };
 
             // Create new router with updated lead for post routing
             let post_router = PingTreeRouter::new(
@@ -1339,11 +1382,38 @@ impl PingTreeRouter {
                     .filter(|(r, _, _)| !r.success && r.status != "timeout")
                     .count();
 
+                let error_count = responses
+                    .iter()
+                    .filter(|(r, _, _)| r.status == "error")
+                    .count();
+                let invalid_details: Vec<serde_json::Value> = responses
+                    .iter()
+                    .filter(|(resp, _, _)| {
+                        !resp.success
+                            || resp.price.is_none()
+                            || resp.price.unwrap_or(0.0) <= 0.0
+                            || resp.status == "timeout"
+                    })
+                    .map(|(resp, campaign_id, _)| {
+                        serde_json::json!({
+                            "campaign_id": campaign_id,
+                            "success": resp.success,
+                            "price": resp.price,
+                            "status": resp.status,
+                            "error": resp.error,
+                            "post_id": resp.post_id
+                        })
+                    })
+                    .collect();
+
                 tracing::warn!(
-                    "No valid buyer responses for fullpost. Total responses: {}, timeouts: {}, rejected: {}",
-                    responses.len(),
-                    timeout_count,
-                    rejected_count
+                    lead_id = %self.lead.uuid,
+                    total_responses = responses.len(),
+                    timeout_count = timeout_count,
+                    rejected_count = rejected_count,
+                    error_count = error_count,
+                    invalid_responses = %serde_json::to_string(&invalid_details).unwrap_or_default(),
+                    "No valid buyer responses for fullpost - all responses were invalid"
                 );
 
                 let final_status = if timeout_count == responses.len() {
@@ -1523,7 +1593,8 @@ impl PingTreeRouter {
             .map(|p| sqlx::types::Json(p.clone()))
             .collect();
 
-        sqlx::query(
+        let db_query_start = std::time::Instant::now();
+        let query_result = sqlx::query(
             r#"
             INSERT INTO buyer_responses (lead_id, ping_id, post_id, buyer_id, campaign_id, payload, created_at)
             SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[], $7::timestamptz[])
@@ -1537,7 +1608,39 @@ impl PingTreeRouter {
         .bind(&json_payloads[..])
         .bind(&created_ats[..])
         .execute(pool)
-        .await?;
+        .await;
+
+        match &query_result {
+            Ok(result) => {
+                let duration_ms = db_query_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    operation = "db_query",
+                    query_type = "insert",
+                    table = "buyer_responses",
+                    query = "INSERT INTO buyer_responses ... UNNEST",
+                    rows_affected = result.rows_affected(),
+                    batch_size = responses.len(),
+                    duration_ms = duration_ms,
+                    "Database query: batch insert buyer responses"
+                );
+            }
+            Err(e) => {
+                let duration_ms = db_query_start.elapsed().as_millis() as u64;
+                tracing::error!(
+                    operation = "db_query",
+                    query_type = "insert",
+                    table = "buyer_responses",
+                    query = "INSERT INTO buyer_responses ... UNNEST",
+                    batch_size = responses.len(),
+                    duration_ms = duration_ms,
+                    error = %e,
+                    error_type = %std::any::type_name_of_val(&e),
+                    "Database query error: batch insert buyer responses failed"
+                );
+            }
+        }
+
+        query_result?;
 
         tracing::info!(
             response_count = responses.len(),
