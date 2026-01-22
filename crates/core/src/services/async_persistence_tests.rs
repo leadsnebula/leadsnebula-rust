@@ -212,6 +212,7 @@ mod async_persistence_tests {
             vertical_slug,
             "ping".to_string(),
             None,
+            None,
         );
 
         // Measure routing time (should not be blocked by persistence)
@@ -323,6 +324,7 @@ mod async_persistence_tests {
             publisher_id,
             vertical_slug,
             "ping".to_string(),
+            None,
             None,
         );
 

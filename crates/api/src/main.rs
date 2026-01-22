@@ -299,16 +299,18 @@ async fn main() -> anyhow::Result<()> {
                     _ = terminate => {},
                 }
 
+                #[cfg(feature = "tracing")]
                 tracing::info!("Shutdown signal received, flushing write-behind queue...");
-                // Flush with 5s timeout
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    write_behind_queue_for_shutdown.flush(),
-                )
-                .await
-                {
-                    Ok(_) => tracing::info!("Write-behind queue flushed successfully"),
-                    Err(_) => tracing::warn!("Write-behind queue flush timed out after 5s"),
+                // Flush with timeout (flush() has internal 5s timeout)
+                match write_behind_queue_for_shutdown.flush().await {
+                    Ok(_) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::info!("Write-behind queue flushed successfully");
+                    }
+                    Err(_e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("Write-behind queue flush failed: {}", _e);
+                    }
                 }
 
                 // Signal shutdown complete

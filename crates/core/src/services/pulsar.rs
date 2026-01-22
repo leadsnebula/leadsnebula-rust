@@ -81,9 +81,9 @@ pub struct PulsarService;
 impl PulsarService {
     /// Direct call to Pulsar for ping requests (bypasses HTTP)
     pub async fn route_ping_direct(
-        pool: Arc<PgPool>,
+        _pool: Arc<PgPool>,
         lead: &Lead,
-        campaign: &Campaign,
+        _campaign: &Campaign,
         qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
         let lead_id = lead
@@ -141,32 +141,8 @@ impl PulsarService {
             });
         }
 
-        // Log decision asynchronously (fire-and-forget to avoid blocking ping response)
-        // This reduces ping latency from ~300-700ms to ~100-200ms
-        let pool_clone = pool.clone();
-        let lead_id_uuid = lead.uuid; // Use UUID directly, not String
-        let ping_id_clone = ping_id.clone();
-        let buyer_id_clone = campaign.buyer_id;
-        let final_bid_price =
-            rust_decimal::Decimal::from((rand::random::<u32>() % 200 + 100) as i32);
-        tokio::spawn(async move {
-            if let Err(e) = sqlx::query(
-                r#"
-                INSERT INTO pulsar_decision_logs (lead_id, ping_id, buyer_id, accepted, final_bid_price, evaluated_at)
-                VALUES ($1, $2, $3, $4, $5, NOW())
-                "#,
-            )
-            .bind(lead_id_uuid) // Bind UUID, not String
-            .bind(ping_id_clone)
-            .bind(buyer_id_clone)
-            .bind(accepted)
-            .bind(Some(final_bid_price))
-            .execute(pool_clone.as_ref())
-            .await
-            {
-                tracing::warn!("Failed to log Pulsar decision (non-critical): {}", e);
-            }
-        });
+        // Logging removed - non-critical and spawn overhead eliminated
+        // If logging is needed, it should be done via write-behind queue at caller level
 
         Ok(BuyerResponse {
             success: true,
@@ -183,9 +159,9 @@ impl PulsarService {
 
     /// Direct call to Pulsar for post requests (bypasses HTTP)
     pub async fn route_post_direct(
-        pool: Arc<PgPool>,
+        _pool: Arc<PgPool>,
         lead: &Lead,
-        campaign: &Campaign,
+        _campaign: &Campaign,
         promise_id: &str,
         qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
@@ -234,29 +210,8 @@ impl PulsarService {
         post_id.push_str("RP_");
         post_id.push_str(&encoded);
 
-        // Log decision asynchronously (fire-and-forget to avoid blocking post response)
-        let pool_log = pool.clone();
-        let lead_id_uuid = lead.uuid; // Use UUID directly, not String
-        let buyer_id_log = campaign.buyer_id;
-        let final_bid_price_post =
-            rust_decimal::Decimal::from((rand::random::<u32>() % 200 + 100) as i32);
-        tokio::spawn(async move {
-            if let Err(e) = sqlx::query(
-                r#"
-                INSERT INTO pulsar_decision_logs (lead_id, buyer_id, accepted, final_bid_price, evaluated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                "#,
-            )
-            .bind(lead_id_uuid) // Bind UUID, not String
-            .bind(buyer_id_log)
-            .bind(accepted)
-            .bind(Some(final_bid_price_post))
-            .execute(pool_log.as_ref())
-            .await
-            {
-                tracing::warn!("Failed to log Pulsar post decision (non-critical): {}", e);
-            }
-        });
+        // Logging removed - non-critical and spawn overhead eliminated
+        // If logging is needed, it should be done via write-behind queue at caller level
 
         Ok(BuyerResponse {
             success: true,

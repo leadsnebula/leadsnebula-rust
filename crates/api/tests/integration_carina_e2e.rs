@@ -251,6 +251,7 @@ async fn test_e2e_ping_request_flow() {
         vertical_slug.clone(),
         "ping".to_string(),
         None,
+        None,
     );
 
     let pool_arc = Arc::new(pool.clone());
@@ -422,6 +423,7 @@ async fn test_e2e_fullpost_request_flow() {
         vertical_slug.clone(),
         "fullpost".to_string(),
         None,
+        None,
     );
 
     let pool_arc = Arc::new(pool.clone());
@@ -511,6 +513,7 @@ async fn test_e2e_error_handling() {
         publisher_id,
         vertical_slug.clone(),
         "ping".to_string(),
+        None,
         None,
     );
 

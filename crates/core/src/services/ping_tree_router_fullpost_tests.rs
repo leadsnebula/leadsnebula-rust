@@ -128,6 +128,7 @@ mod ping_tree_router_fullpost_tests {
             price: Some(100.0),
             campaign_id: Some(Uuid::new_v4()),
             buyer_id: Some(Uuid::new_v4()),
+            per_buyer_timings: None,
         };
 
         let post_result = RoutingResult {
@@ -140,6 +141,7 @@ mod ping_tree_router_fullpost_tests {
             price: Some(100.0),
             campaign_id: Some(Uuid::new_v4()),
             buyer_id: Some(Uuid::new_v4()),
+            per_buyer_timings: None,
         };
 
         // Merged result should have both ping_id and post_id
@@ -161,6 +163,7 @@ mod ping_tree_router_fullpost_tests {
             price: None,
             campaign_id: None,
             buyer_id: None,
+            per_buyer_timings: None,
         };
 
         // Fullpost should not proceed to post if ping fails
@@ -181,6 +184,7 @@ mod ping_tree_router_fullpost_tests {
             price: Some(100.0),
             campaign_id: Some(Uuid::new_v4()),
             buyer_id: Some(Uuid::new_v4()),
+            per_buyer_timings: None,
         };
 
         // Post requires promise_id

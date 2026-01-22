@@ -25,10 +25,13 @@ pub async fn pre_warm_cache(state: &AppState) {
     // Pre-warm active ping trees (limit to top 100 to avoid excessive DB load)
     let ping_trees_warmed = pre_warm_ping_trees(cache, pool).await;
 
+    // Pre-warm SSM encryption keys (eliminates ~300ms delays on first request)
+    let ssm_keys_warmed = pre_warm_ssm_keys(&state.ssm, &state.config.environment).await;
+
     let duration_ms = start.elapsed().as_millis();
     info!(
-        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees",
-        duration_ms, verticals_warmed, ping_trees_warmed
+        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys",
+        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed
     );
 }
 
@@ -108,6 +111,59 @@ async fn pre_warm_ping_trees(
         }
         Err(e) => {
             warn!("Failed to pre-warm ping trees: {}", e);
+        }
+    }
+
+    warmed
+}
+
+/// Pre-warm SSM encryption keys
+async fn pre_warm_ssm_keys(
+    ssm: &std::sync::Arc<leadsnebula_core::ssm::SsmService>,
+    environment: &str,
+) -> usize {
+    let mut warmed = 0;
+
+    // Normalize environment name for SSM paths (same as carina.rs)
+    let env_norm = leadsnebula_core::normalize_env_for_ssm(environment).to_string();
+
+    // Pre-warm deterministic key
+    let det_path = format!(
+        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
+        env_norm
+    );
+    match ssm.get_parameter(&det_path, true).await {
+        Ok(Some(_)) => {
+            warmed += 1;
+        }
+        Ok(None) => {
+            warn!(
+                "SSM parameter not found (expected for warmup): {}",
+                det_path
+            );
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm SSM key {}: {}", det_path, e);
+        }
+    }
+
+    // Pre-warm key derivation salt
+    let salt_path = format!(
+        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
+        env_norm
+    );
+    match ssm.get_parameter(&salt_path, true).await {
+        Ok(Some(_)) => {
+            warmed += 1;
+        }
+        Ok(None) => {
+            warn!(
+                "SSM parameter not found (expected for warmup): {}",
+                salt_path
+            );
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm SSM key {}: {}", salt_path, e);
         }
     }
 

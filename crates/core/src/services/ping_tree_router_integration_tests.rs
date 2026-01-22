@@ -278,8 +278,14 @@ mod ping_tree_router_integration_tests {
         let (publisher_id, instance_id, vertical_id, vertical_slug) = setup_test_data(&pool).await;
         let lead = create_test_lead(&pool, publisher_id, vertical_id, instance_id, "ping").await;
 
-        let router =
-            PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string(), None);
+        let router = PingTreeRouter::new(
+            lead,
+            publisher_id,
+            vertical_slug,
+            "ping".to_string(),
+            None,
+            None,
+        );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
         let result = router
@@ -314,8 +320,14 @@ mod ping_tree_router_integration_tests {
         // Create inactive ping tree
         create_ping_tree(&pool, publisher_id, instance_id, &vertical_slug, "paused").await;
 
-        let router =
-            PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string(), None);
+        let router = PingTreeRouter::new(
+            lead,
+            publisher_id,
+            vertical_slug,
+            "ping".to_string(),
+            None,
+            None,
+        );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
         let result = router
@@ -347,8 +359,14 @@ mod ping_tree_router_integration_tests {
         // Create active ping tree but no campaigns
         create_ping_tree(&pool, publisher_id, instance_id, &vertical_slug, "active").await;
 
-        let router =
-            PingTreeRouter::new(lead, publisher_id, vertical_slug, "ping".to_string(), None);
+        let router = PingTreeRouter::new(
+            lead,
+            publisher_id,
+            vertical_slug,
+            "ping".to_string(),
+            None,
+            None,
+        );
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
         let result = router
@@ -389,6 +407,7 @@ mod ping_tree_router_integration_tests {
             publisher_id,
             vertical_slug,
             "unknown".to_string(),
+            None,
             None,
         );
         let pool_arc = Arc::new(pool.clone());

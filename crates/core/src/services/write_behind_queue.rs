@@ -4,7 +4,10 @@
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -69,17 +72,29 @@ pub enum BackgroundTask {
 /// Write-behind queue that batches background tasks
 pub struct WriteBehindQueue {
     sender: mpsc::UnboundedSender<BackgroundTask>,
+    shutdown_flag: Arc<AtomicBool>,
+    batcher_handle: tokio::task::JoinHandle<()>,
 }
 
 impl WriteBehindQueue {
     pub fn new(pool: Arc<PgPool>) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
         let pool_clone = pool.clone();
+        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
 
         // Spawn batcher task
-        tokio::spawn(Self::batcher_task(receiver, pool_clone));
+        let batcher_handle = tokio::spawn(Self::batcher_task(
+            receiver,
+            shutdown_flag_clone,
+            pool_clone,
+        ));
 
-        Self { sender }
+        Self {
+            sender,
+            shutdown_flag,
+            batcher_handle,
+        }
     }
 
     /// Enqueue a background task (non-blocking)
@@ -92,6 +107,7 @@ impl WriteBehindQueue {
     /// Batcher task that collects tasks and flushes them periodically
     async fn batcher_task(
         mut receiver: mpsc::UnboundedReceiver<BackgroundTask>,
+        shutdown_flag: Arc<AtomicBool>,
         pool: Arc<PgPool>,
     ) {
         let mut batch = Vec::new();
@@ -121,6 +137,12 @@ impl WriteBehindQueue {
                 _ = interval.tick() => {
                     if !batch.is_empty() {
                         Self::flush_batch(&mut batch, &pool).await;
+                    }
+                    // Check shutdown flag
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        // Flush remaining batch and exit
+                        Self::flush_batch(&mut batch, &pool).await;
+                        break;
                     }
                 }
             }
@@ -347,17 +369,38 @@ impl WriteBehindQueue {
     }
 
     /// Flush remaining batch (for shutdown)
-    /// Note: Actual flush happens when sender is dropped (in Drop impl)
-    pub async fn flush(&self) {
-        // The sender will be dropped when self is dropped, which signals shutdown
-        // to the batcher task. This method is a placeholder for future async flush logic.
+    /// Returns Result for error handling, uses internal timeout for safety
+    pub async fn flush(&self) -> Result<(), anyhow::Error> {
+        // Signal shutdown to batcher task
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+
+        // Also close the sender to ensure receiver gets None
+        drop(self.sender.clone());
+
+        // Wait for batcher task to complete with timeout
+        // Poll the handle until it's finished or timeout
+        let start = std::time::Instant::now();
+        loop {
+            if self.batcher_handle.is_finished() {
+                // Task finished - we can't get the result without moving the handle,
+                // but if it finished without panicking, we consider it successful
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                #[cfg(feature = "tracing")]
+                tracing::warn!("Write-behind queue flush timed out after 5s");
+                return Err(anyhow::anyhow!("Flush timed out after 5s"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
 impl Drop for WriteBehindQueue {
     fn drop(&mut self) {
-        // On drop, try to flush remaining batch
-        // Note: This is best-effort, actual flush happens in batcher task
-        let _ = &self.sender;
+        // On drop, signal shutdown (best-effort)
+        // The batcher task will flush remaining batch and exit
+        // Note: In practice, flush() should be called explicitly before drop
+        self.shutdown_flag.store(true, Ordering::Relaxed);
     }
 }

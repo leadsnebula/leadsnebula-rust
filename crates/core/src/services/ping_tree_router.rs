@@ -10,7 +10,6 @@ use anyhow::Result;
 use hex;
 use rand;
 use serde::{Deserialize, Serialize};
-use simd_json;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -62,6 +61,7 @@ pub struct RoutingResult {
     pub price: Option<f64>,
     pub campaign_id: Option<Uuid>,
     pub buyer_id: Option<Uuid>,
+    pub per_buyer_timings: Option<Vec<serde_json::Value>>,
 }
 
 pub struct PingTreeRouter {
@@ -72,6 +72,7 @@ pub struct PingTreeRouter {
     cache: Option<Arc<CacheService>>,
     timing: Option<Arc<AtomicAuctionTiming>>,
     metrics: Option<Arc<DiagnosticMetrics>>,
+    write_behind_queue: Option<Arc<crate::services::write_behind_queue::WriteBehindQueue>>,
 }
 
 impl PingTreeRouter {
@@ -81,6 +82,7 @@ impl PingTreeRouter {
         vertical: String,
         request_type: String,
         cache: Option<Arc<CacheService>>,
+        write_behind_queue: Option<Arc<crate::services::write_behind_queue::WriteBehindQueue>>,
     ) -> Self {
         Self {
             lead,
@@ -90,6 +92,7 @@ impl PingTreeRouter {
             cache,
             timing: None,
             metrics: None,
+            write_behind_queue,
         }
     }
 
@@ -190,6 +193,7 @@ impl PingTreeRouter {
                     price: None,
                     campaign_id: None,
                     buyer_id: None,
+                    per_buyer_timings: None,
                 });
             }
         };
@@ -215,6 +219,7 @@ impl PingTreeRouter {
                 price: None,
                 campaign_id: None,
                 buyer_id: None,
+                per_buyer_timings: None,
             });
         }
 
@@ -280,6 +285,7 @@ impl PingTreeRouter {
                 price: None,
                 campaign_id: None,
                 buyer_id: None,
+                per_buyer_timings: None,
             });
         }
 
@@ -374,6 +380,7 @@ impl PingTreeRouter {
                 price: None,
                 campaign_id: None,
                 buyer_id: None,
+                per_buyer_timings: None,
             });
         }
 
@@ -433,6 +440,7 @@ impl PingTreeRouter {
                     price: None,
                     campaign_id: None,
                     buyer_id: None,
+                    per_buyer_timings: None,
                 })
             }
         }
@@ -561,6 +569,7 @@ impl PingTreeRouter {
                 }
                 Ok(Err(e)) => {
                     // Router error case: timeout OK, router error
+                    #[cfg(feature = "tracing")]
                     tracing::error!("BuyerRouter error for campaign {}: {}", campaign_id, e);
                     // Track per-buyer timing for errors
                     if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
@@ -597,6 +606,7 @@ impl PingTreeRouter {
                     ));
                 }
                 Err(_) => {
+                    #[cfg(feature = "tracing")]
                     tracing::warn!("Ping auction timeout for campaign {}", campaign_id);
                     // Track per-buyer timing for timeouts
                     if let Some(campaign) = campaigns.iter().find(|c| c.id == campaign_id) {
@@ -717,12 +727,13 @@ impl PingTreeRouter {
                         "Buyer responses batch inserted successfully"
                     );
                 }
-            } else if let Err(e) = &result {
-                tracing::error!("Failed to batch insert buyer responses: {}", e);
+            } else if let Err(_e) = &result {
+                #[cfg(feature = "tracing")]
+                tracing::error!("Failed to batch insert buyer responses: {}", _e);
                 #[cfg(feature = "sentry")]
                 {
                     sentry::capture_message(
-                        &format!("Batch insert buyer responses failed: {}", e),
+                        &format!("Batch insert buyer responses failed: {}", _e),
                         sentry::Level::Error,
                     );
                 }
@@ -737,7 +748,7 @@ impl PingTreeRouter {
         // For post requests: success=true, price > 0, status != timeout
         let valid_responses: Vec<_> = responses
             .iter()
-            .filter(|(resp, campaign_id, _)| {
+            .filter(|(resp, _campaign_id, _)| {
                 // For ping auctions, check for bid (not price)
                 let has_bid = resp.bid.is_some() && resp.bid.unwrap_or(0.0) > 0.0;
                 let has_promise_id = resp.promise_id.is_some();
@@ -745,7 +756,8 @@ impl PingTreeRouter {
                     resp.success && has_bid && has_promise_id && resp.status != "timeout";
 
                 if !is_valid {
-                    let reason = if !resp.success {
+                    #[cfg(feature = "tracing")]
+                    let _reason = if !resp.success {
                         "success=false".to_string()
                     } else if !has_bid {
                         format!("missing or invalid bid (bid={:?})", resp.bid)
@@ -757,10 +769,11 @@ impl PingTreeRouter {
                         format!("status={}", resp.status)
                     };
 
+                    #[cfg(feature = "tracing")]
                     tracing::warn!(
                         lead_id = %self.lead.uuid,
-                        campaign_id = %campaign_id,
-                        invalid_reason = %reason,
+                        campaign_id = %_campaign_id,
+                        invalid_reason = %_reason,
                         success = resp.success,
                         bid = ?resp.bid,
                         promise_id = ?resp.promise_id,
@@ -785,6 +798,7 @@ impl PingTreeRouter {
                 .filter(|(r, _, _)| r.status == "rejected")
                 .count();
 
+            #[cfg(feature = "tracing")]
             tracing::error!(
                 "No valid buyer responses. Total responses: {}, timeouts: {}, rejected: {}, errors: {}",
                 responses.len(),
@@ -822,6 +836,11 @@ impl PingTreeRouter {
                 price: None,
                 campaign_id: None,
                 buyer_id: None,
+                per_buyer_timings: if per_buyer_timings.is_empty() {
+                    None
+                } else {
+                    Some(per_buyer_timings)
+                },
             });
         }
 
@@ -876,6 +895,11 @@ impl PingTreeRouter {
             price: winner_response.price,
             campaign_id: Some(winner_campaign_id),
             buyer_id: Some(winner_campaign.buyer_id),
+            per_buyer_timings: if per_buyer_timings.is_empty() {
+                None
+            } else {
+                Some(per_buyer_timings)
+            },
         })
     }
 
@@ -936,6 +960,7 @@ impl PingTreeRouter {
                     price: None,
                     campaign_id: None,
                     buyer_id: None,
+                    per_buyer_timings: None,
                 });
             }
         }
@@ -977,45 +1002,40 @@ impl PingTreeRouter {
                     // Persist buyer response for this post attempt (with retry logic)
                     let bresp_json =
                         serde_json::to_value(&bresp).unwrap_or_else(|_| serde_json::json!({}));
-                    // Persist asynchronously
-                    let pool_clone = pool.as_ref().clone();
-                    let lead_id_val = self.lead.uuid;
-                    let campaign_id_val = campaign.id;
-                    let payload_owned = bresp_json; // Move instead of clone
-                    let ping_owned: Option<String> = None;
-                    let post_owned = bresp.post_id.clone(); // Clone since bresp is used later
-                    let buyer_id_owned = Some(campaign.buyer_id);
-
-                    let handle = tokio::spawn(async move {
-                        PingTreeRouter::persist_buyer_response_with_retry(
-                            pool_clone,
-                            lead_id_val,
-                            ping_owned,
-                            post_owned,
-                            buyer_id_owned,
-                            campaign_id_val,
-                            payload_owned,
-                        )
-                        .await;
-                    });
-                    // Log errors if task panics (fire-and-forget, but log for observability)
-                    tokio::spawn(async move {
-                        if let Err(e) = handle.await {
-                            tracing::error!(
-                                "Post persistence task panicked for lead {} campaign {}: {:?}",
+                    // Persist via write-behind queue (eliminates spawn overhead)
+                    if let Some(queue) = &self.write_behind_queue {
+                        queue.enqueue(
+                            crate::services::write_behind_queue::BackgroundTask::BuyerResponse {
+                                lead_id: self.lead.uuid,
+                                campaign_id: campaign.id,
+                                ping_id: None,
+                                post_id: bresp.post_id.clone(),
+                                buyer_id: Some(campaign.buyer_id),
+                                payload: bresp_json,
+                            },
+                        );
+                    } else {
+                        // Fallback: spawn if queue not available (shouldn't happen in production)
+                        let pool_clone = pool.as_ref().clone();
+                        let lead_id_val = self.lead.uuid;
+                        let campaign_id_val = campaign.id;
+                        let payload_owned = bresp_json;
+                        let ping_owned: Option<String> = None;
+                        let post_owned = bresp.post_id.clone();
+                        let buyer_id_owned = Some(campaign.buyer_id);
+                        tokio::spawn(async move {
+                            PingTreeRouter::persist_buyer_response_with_retry(
+                                pool_clone,
                                 lead_id_val,
+                                ping_owned,
+                                post_owned,
+                                buyer_id_owned,
                                 campaign_id_val,
-                                e
-                            );
-                            #[cfg(feature = "sentry")]
-                            {
-                                sentry::capture_message(
-                                    &format!("Post persistence task panicked: {:?}", e),
-                                    sentry::Level::Error,
-                                );
-                            }
-                        }
-                    });
+                                payload_owned,
+                            )
+                            .await;
+                        });
+                    }
 
                     // Validate post response: must have success=true, post_id, and price > 0
                     if bresp.success
@@ -1039,6 +1059,7 @@ impl PingTreeRouter {
                             price: bresp.price,
                             campaign_id: Some(campaign.id),
                             buyer_id: Some(campaign.buyer_id),
+                            per_buyer_timings: None,
                         })
                     } else {
                         // Log performance metrics to Sentry for monitoring (even on rejection)
@@ -1069,10 +1090,12 @@ impl PingTreeRouter {
                             price: bresp.price,
                             campaign_id: Some(campaign.id),
                             buyer_id: Some(campaign.buyer_id),
+                            per_buyer_timings: None,
                         })
                     }
                 }
                 Err(e) => {
+                    #[cfg(feature = "tracing")]
                     tracing::error!("BuyerRouter error during post: {}", e);
                     self.update_lead_status(
                         pool.as_ref(),
@@ -1090,6 +1113,7 @@ impl PingTreeRouter {
                         price: None,
                         campaign_id: Some(campaign.id),
                         buyer_id: Some(campaign.buyer_id),
+                        per_buyer_timings: None,
                     })
                 }
             }
@@ -1112,6 +1136,7 @@ impl PingTreeRouter {
                 price: None,
                 campaign_id: None,
                 buyer_id: None,
+                per_buyer_timings: None,
             })
         }
     }
@@ -1149,6 +1174,7 @@ impl PingTreeRouter {
                 self.vertical.clone(),
                 "ping".to_string(), // Force "ping" request_type for ping auction
                 self.cache.clone(),
+                self.write_behind_queue.clone(),
             );
             // Connect timing and metrics to the ping router
             ping_router = ping_router.with_timing_and_metrics(timing.clone(), metrics.clone());
@@ -1195,6 +1221,7 @@ impl PingTreeRouter {
                 self.vertical.clone(),
                 "post".to_string(),
                 self.cache.clone(),
+                self.write_behind_queue.clone(),
             );
 
             // Route post using the updated lead (which now has promise_id and campaign_id)
@@ -1221,6 +1248,9 @@ impl PingTreeRouter {
                 price: post_result.price.or(ping_result.price),
                 campaign_id: post_result.campaign_id.or(ping_result.campaign_id),
                 buyer_id: post_result.buyer_id.or(ping_result.buyer_id),
+                per_buyer_timings: ping_result
+                    .per_buyer_timings
+                    .or(post_result.per_buyer_timings),
             })
         } else {
             // Fullpost strategy: send single request with all lead data to all buyers
@@ -1261,11 +1291,13 @@ impl PingTreeRouter {
                         let priority = priority_map.get(&campaign_id).copied().flatten();
                         responses.push((bresp, campaign_id, priority));
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Buyer router error for campaign {}: {}", campaign_id, e);
+                    Ok(Err(_e)) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("Buyer router error for campaign {}: {}", campaign_id, _e);
                     }
-                    Err(e) => {
-                        tracing::warn!("Task panicked for campaign {}: {:?}", campaign_id, e);
+                    Err(_e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("Task panicked for campaign {}: {:?}", campaign_id, _e);
                     }
                 }
             }
@@ -1291,11 +1323,13 @@ impl PingTreeRouter {
                     .filter(|(r, _, _)| !r.success && r.status != "timeout")
                     .count();
 
-                let error_count = responses
+                #[cfg(feature = "tracing")]
+                let _error_count = responses
                     .iter()
                     .filter(|(r, _, _)| r.status == "error")
                     .count();
-                let invalid_details: Vec<serde_json::Value> = responses
+                #[cfg(feature = "tracing")]
+                let _invalid_details: Vec<serde_json::Value> = responses
                     .iter()
                     .filter(|(resp, _, _)| {
                         !resp.success
@@ -1315,13 +1349,14 @@ impl PingTreeRouter {
                     })
                     .collect();
 
+                #[cfg(feature = "tracing")]
                 tracing::warn!(
                     lead_id = %self.lead.uuid,
                     total_responses = responses.len(),
                     timeout_count = timeout_count,
                     rejected_count = rejected_count,
-                    error_count = error_count,
-                    invalid_responses = %simd_json::to_string(&invalid_details).unwrap_or_else(|_| serde_json::to_string(&invalid_details).unwrap_or_default()),
+                    error_count = _error_count,
+                    invalid_responses = %simd_json::to_string(&_invalid_details).unwrap_or_else(|_| serde_json::to_string(&_invalid_details).unwrap_or_default()),
                     "No valid buyer responses for fullpost - all responses were invalid"
                 );
 
@@ -1354,6 +1389,7 @@ impl PingTreeRouter {
                     price: None,
                     campaign_id: None,
                     buyer_id: None,
+                    per_buyer_timings: None,
                 });
             }
 
@@ -1432,24 +1468,46 @@ impl PingTreeRouter {
                 ));
             }
 
-            // Batch insert all responses in one query
+            // Enqueue all responses to write-behind queue (will be batched automatically)
             if !batch_responses.is_empty() {
-                let pool_clone = pool.as_ref().clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        PingTreeRouter::batch_insert_buyer_responses(&pool_clone, batch_responses)
-                            .await
+                if let Some(queue) = &self.write_behind_queue {
+                    for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload) in
+                        batch_responses
                     {
-                        tracing::error!("Failed to batch insert buyer responses: {}", e);
-                        #[cfg(feature = "sentry")]
-                        {
-                            sentry::capture_message(
-                                &format!("Batch insert buyer responses failed: {}", e),
-                                sentry::Level::Error,
-                            );
-                        }
+                        queue.enqueue(
+                            crate::services::write_behind_queue::BackgroundTask::BuyerResponse {
+                                lead_id,
+                                campaign_id,
+                                ping_id,
+                                post_id,
+                                buyer_id,
+                                payload,
+                            },
+                        );
                     }
-                });
+                } else {
+                    // Fallback: spawn if queue not available (shouldn't happen in production)
+                    let pool_clone = pool.as_ref().clone();
+                    let batch_responses_clone = batch_responses.clone();
+                    tokio::spawn(async move {
+                        if let Err(_e) = PingTreeRouter::batch_insert_buyer_responses(
+                            &pool_clone,
+                            batch_responses_clone,
+                        )
+                        .await
+                        {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!("Failed to batch insert buyer responses: {}", _e);
+                            #[cfg(feature = "sentry")]
+                            {
+                                sentry::capture_message(
+                                    &format!("Batch insert buyer responses failed: {}", _e),
+                                    sentry::Level::Error,
+                                );
+                            }
+                        }
+                    });
+                }
             }
 
             Ok(RoutingResult {
@@ -1462,6 +1520,7 @@ impl PingTreeRouter {
                 price,
                 campaign_id: Some(winner_campaign_id),
                 buyer_id: Some(winner_campaign.buyer_id),
+                per_buyer_timings: None,
             })
         }
     }
@@ -1486,6 +1545,7 @@ impl PingTreeRouter {
         let ping_ids: Vec<Option<String>> = responses.iter().map(|r| r.1.clone()).collect();
         let unique_ping_ids: HashSet<Option<String>> = ping_ids.iter().cloned().collect();
         if ping_ids.len() != unique_ping_ids.len() {
+            #[cfg(feature = "tracing")]
             tracing::error!("Duplicate ping_ids detected - aborting insert");
             return Err(anyhow::anyhow!("Duplicate ping_ids in responses"));
         }
@@ -1507,6 +1567,7 @@ impl PingTreeRouter {
         // Inject chaos delay if enabled (for testing)
         inject_chaos_delay().await;
 
+        #[cfg(feature = "tracing")]
         let db_query_start = std::time::Instant::now();
 
         // Use retry with exponential backoff for transient DB errors
@@ -1566,6 +1627,7 @@ impl PingTreeRouter {
                     Ok(r) => Ok(r),
                     Err(e) => {
                         if is_retryable_error(&e) {
+                            #[cfg(feature = "tracing")]
                             tracing::warn!(
                                 error = %e,
                                 "Transient DB error, will retry"
@@ -1573,6 +1635,7 @@ impl PingTreeRouter {
                             Err(e)
                         } else {
                             // Non-retryable error (e.g., constraint violation, syntax error)
+                            #[cfg(feature = "tracing")]
                             tracing::error!(
                                 error = %e,
                                 "Non-retryable DB error, aborting"
@@ -1603,19 +1666,22 @@ impl PingTreeRouter {
                     );
                 }
             }
-            Err(e) => {
-                let duration_ms = db_query_start.elapsed().as_millis() as u64;
-                tracing::error!(
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                {
+                    let duration_ms = db_query_start.elapsed().as_millis() as u64;
+                    tracing::error!(
                     operation = "db_query",
                     query_type = "insert",
                     table = "buyer_responses",
                     query = "INSERT INTO buyer_responses ... UNNEST",
                     batch_size = responses.len(),
                     duration_ms = duration_ms,
-                    error = %e,
-                    error_type = %std::any::type_name_of_val(&e),
+                    error = %_e,
+                    error_type = %std::any::type_name_of_val(&_e),
                     "Database query error: batch insert buyer responses failed"
-                );
+                    );
+                }
             }
         }
 
@@ -1676,6 +1742,7 @@ impl PingTreeRouter {
 
                     if is_retryable && retries > 1 {
                         retries -= 1;
+                        #[cfg(feature = "tracing")]
                         tracing::warn!(
                             "Failed to persist buyer response (retries remaining: {}): {}",
                             retries,
@@ -1685,6 +1752,7 @@ impl PingTreeRouter {
                         continue;
                     } else {
                         // Non-retryable error or out of retries
+                        #[cfg(feature = "tracing")]
                         tracing::error!(
                             "Failed to persist buyer response after {} retries (lead_id: {}, campaign_id: {}): {}",
                             PERSISTENCE_MAX_RETRIES - retries + 1,

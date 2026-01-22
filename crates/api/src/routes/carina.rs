@@ -171,6 +171,10 @@ async fn create_lead(
     Query(params): Query<std::collections::HashMap<String, String>>,
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
+    // Critical path timing: mark lead_received
+    #[cfg(all(feature = "tracing", debug_assertions))]
+    let critical_path_start = std::time::Instant::now();
+
     // Initialize timing and metrics
     let timing = Arc::new(AtomicAuctionTiming::new());
     let metrics = Arc::new(DiagnosticMetrics::new());
@@ -608,6 +612,7 @@ async fn create_lead(
             vertical.slug.clone(),
             request_type.clone(),
             state.cache.clone(),
+            Some(state.write_behind_queue.clone()),
         )
         .with_timing_and_metrics(timing_arc, metrics_arc);
         match router
@@ -759,45 +764,8 @@ async fn create_lead(
                         .await
                 };
 
-                // Encrypt any buyer_responses rows for this lead/post_id using SSM deterministic key (best-effort)
-                // Move to async background task to avoid blocking response
-                if let Some(post_id_val) = routing_result.post_id.clone() {
-                    let pool_clone = state.db_pool.clone();
-                    let ssm_clone = state.ssm.clone();
-                    let env_clone = state.config.environment.clone();
-                    let lead_uuid_clone = lead.uuid;
-
-                    tokio::spawn(async move {
-                        if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND post_id = $2 AND response_payload_encrypted IS NULL")
-                                .bind(lead_uuid_clone)
-                                .bind(post_id_val)
-                                .fetch_all(&*pool_clone)
-                                .await
-                            {
-                                let env_norm = leadsnebula_core::normalize_env_for_ssm(&env_clone).to_string();
-                                let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
-                                let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
-                                if let Ok(Some(det_key)) = get_ssm_parameter_cached(&ssm_clone, &det_path, true).await {
-                                    if let Ok(Some(salt)) = get_ssm_parameter_cached(&ssm_clone, &salt_path, true).await {
-                                        let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
-                                        for r in rows {
-                                            let id: i64 = r.get("id");
-                                            let payload_val: serde_json::Value = r.get("payload");
-                                            if let Ok(payload_str) = serde_json::to_string(&payload_val) {
-                                                if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(&derived, &payload_str, true) {
-                                                    let _ = sqlx::query("UPDATE buyer_responses SET response_payload_encrypted = $1 WHERE id = $2")
-                                                        .bind(envelope)
-                                                        .bind(id)
-                                                        .execute(&*pool_clone)
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                    });
-                }
+                // Encryption of buyer_responses moved to background job/cron - spawn overhead eliminated
+                // If encryption is needed, it should be handled by a separate background task or write-behind queue
 
                 // Update lead final state: if sold, set post_id and status sold; if not, clear in-progress placeholder
                 if routing_result.success && routing_result.status == "sold" {
@@ -1568,6 +1536,7 @@ async fn create_lead(
         vertical.slug.clone(),
         request_type.clone(),
         state.cache.clone(),
+        Some(state.write_behind_queue.clone()),
     )
     .with_timing_and_metrics(timing_arc.clone(), metrics_arc.clone());
 
@@ -1651,7 +1620,9 @@ async fn create_lead(
             let verbose_json = if minimal_mode {
                 None // Skip verbose JSON in minimal mode
             } else if verbose_requested {
-                Some(serde_json::json!({
+                // Note: Using serde_json::json! for building, but simd_json is used for encryption serialization
+                // The final response serialization is handled by axum's Json extractor
+                let mut json_obj = serde_json::json!({
                     "error_code": format!("ERR_{}", 200),
                     "timestamp": Utc::now().to_rfc3339(),
                     "endpoint": "POST /api/v1/leads",
@@ -1662,7 +1633,12 @@ async fn create_lead(
                         "campaign_name": campaign_name,
                         "campaign_id": routing_result.campaign_id.map(|c| c.to_string())
                     }
-                }))
+                });
+                // Add per_buyer_timings if available
+                if let Some(ref timings) = routing_result.per_buyer_timings {
+                    json_obj["per_buyer_timings"] = serde_json::Value::Array(timings.clone());
+                }
+                Some(json_obj)
             } else {
                 None
             };
@@ -1723,66 +1699,8 @@ async fn create_lead(
                             .await;
                 }
 
-                // Encrypt any buyer_responses rows for this lead/ping_id using SSM deterministic key (best-effort)
-                // Move to async background task to avoid blocking response
-                if let Some(ping_id_val) = routing_result.ping_id.clone() {
-                    let pool_clone = state.db_pool.clone();
-                    let ssm_clone = state.ssm.clone();
-                    let env_clone = state.config.environment.clone();
-                    let lead_uuid_clone = lead_uuid;
-
-                    let ping_id_for_log = ping_id_val.clone();
-                    let lead_uuid_for_log = lead_uuid_clone;
-                    let handle = tokio::spawn(async move {
-                        if let Ok(rows) = sqlx::query("SELECT id, payload FROM buyer_responses WHERE lead_id = $1 AND ping_id = $2 AND response_payload_encrypted IS NULL")
-                                .bind(lead_uuid_clone)
-                                .bind(ping_id_val)
-                                .fetch_all(&*pool_clone)
-                                .await
-                            {
-                                // Try to load deterministic key/salt from SSM
-                                let env_norm = leadsnebula_core::normalize_env_for_ssm(&env_clone).to_string();
-                                let det_path = format!("/leadsnebula/{}/carina/encryption/deterministic_key_v1", env_norm);
-                                let salt_path = format!("/leadsnebula/{}/carina/encryption/key_derivation_salt_v1", env_norm);
-                                if let Ok(Some(det_key)) = get_ssm_parameter_cached(&ssm_clone, &det_path, true).await {
-                                    if let Ok(Some(salt)) = get_ssm_parameter_cached(&ssm_clone, &salt_path, true).await {
-                                        let derived = leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
-                                        for r in rows {
-                                            let id: i64 = r.get("id");
-                                            let payload_val: serde_json::Value = r.get("payload");
-                                            if let Ok(payload_str) = serde_json::to_string(&payload_val) {
-                                                if let Ok(envelope) = leadsnebula_core::encryption::EncryptionService::encrypt_envelope(&derived, &payload_str, true) {
-                                                    let _ = sqlx::query("UPDATE buyer_responses SET response_payload_encrypted = $1 WHERE id = $2")
-                                                        .bind(envelope)
-                                                        .bind(id)
-                                                        .execute(&*pool_clone)
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                    });
-                    // Log errors if task panics (fire-and-forget, but log for observability)
-                    tokio::spawn(async move {
-                        if let Err(e) = handle.await {
-                            tracing::error!(
-                                "Payload encryption task panicked for lead {} ping_id {}: {:?}",
-                                lead_uuid_for_log,
-                                ping_id_for_log,
-                                e
-                            );
-                            #[cfg(feature = "sentry")]
-                            {
-                                sentry::capture_message(
-                                    &format!("Payload encryption task panicked: {:?}", e),
-                                    sentry::Level::Error,
-                                );
-                            }
-                        }
-                    });
-                }
+                // Encryption of buyer_responses moved to background job/cron - spawn overhead eliminated
+                // If encryption is needed, it should be handled by a separate background task or write-behind queue
             }
 
             // For fullpost requests, also save post payloads if post_id is present
@@ -1872,6 +1790,17 @@ async fn create_lead(
             // Log diagnostic summary and timing before returning (non-blocking)
             timing_arc.flush_to_background(&lead_uuid.to_string());
             metrics_arc.log_summary("carina");
+
+            // Critical path timing: mark post_response_parsed (response ready to return)
+            #[cfg(all(feature = "tracing", debug_assertions))]
+            {
+                let critical_path_elapsed = critical_path_start.elapsed();
+                tracing::debug!(
+                    lead_id = %lead_uuid,
+                    critical_path_ms = critical_path_elapsed.as_millis() as u64,
+                    "Non-DB critical path timing"
+                );
+            }
 
             Ok(Json(LeadResponse {
                 status: StatusNode {

@@ -202,6 +202,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate zip blacklist (simplified - would need DB lookup for full implementation)
+    #[inline(always)]
     fn evaluate_zip_blacklist(&self) -> QualificationResult {
         let zip = self.get_string_value("zip");
         if zip.is_none() {
@@ -221,6 +222,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate zip whitelist (simplified - would need DB lookup for full implementation)
+    #[inline(always)]
     fn evaluate_zip_whitelist(&self) -> QualificationResult {
         let zip = self.get_string_value("zip");
         if zip.is_none() {
@@ -240,6 +242,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate own_home rule
+    #[inline(always)]
     fn evaluate_own_home(
         &self,
         rule_config: Option<&serde_json::Map<String, Value>>,
@@ -334,6 +337,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate roof_shade rule
+    #[inline(always)]
     fn evaluate_roof_shade(
         &self,
         rule_config: Option<&serde_json::Map<String, Value>>,
@@ -387,6 +391,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate credit_rating rule
+    #[inline(always)]
     fn evaluate_credit_rating(
         &self,
         rule_config: Option<&serde_json::Map<String, Value>>,
@@ -461,6 +466,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate monthly_bill rule
+    #[inline(always)]
     fn evaluate_monthly_bill(
         &self,
         _rule_config: Option<&serde_json::Map<String, Value>>,
@@ -474,6 +480,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate utility_provider rule
+    #[inline(always)]
     fn evaluate_utility_provider(
         &self,
         _rule_config: Option<&serde_json::Map<String, Value>>,
@@ -487,6 +494,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate property_type rule
+    #[inline(always)]
     fn evaluate_property_type(&self, rejected: &[String]) -> QualificationResult {
         if rejected.is_empty() {
             return QualificationResult {
@@ -526,6 +534,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate roof_type rule
+    #[inline(always)]
     fn evaluate_roof_type(&self, rejected: &[String]) -> QualificationResult {
         if rejected.is_empty() {
             return QualificationResult {
