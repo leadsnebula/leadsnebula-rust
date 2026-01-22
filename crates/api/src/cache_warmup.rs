@@ -74,9 +74,10 @@ async fn pre_warm_ping_trees(
     let mut warmed = 0;
 
     // Load active ping trees with their publishers
+    // Note: pt.created_at must be in SELECT list when using DISTINCT with ORDER BY
     match sqlx::query(
         r#"
-        SELECT DISTINCT pt.id, pt.vertical, ptp.publisher_id
+        SELECT DISTINCT pt.id, pt.vertical, ptp.publisher_id, pt.created_at
         FROM ping_trees pt
         INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id
         WHERE pt.deleted_at IS NULL

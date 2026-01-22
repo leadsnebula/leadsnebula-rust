@@ -30,6 +30,8 @@ pub async fn api_key_auth_middleware(
         }
     };
 
+    // Note: test_before_acquire is enabled in pool config to detect stale connections
+    // This should prevent most "expected to read X bytes, got 0" errors from Neon
     let publisher = match Publisher::find_by_api_key(&state.db_pool, &api_key).await {
         Ok(Some(p)) => p,
         Ok(None) => {
@@ -37,7 +39,10 @@ pub async fn api_key_auth_middleware(
             return StatusCode::UNAUTHORIZED.into_response();
         }
         Err(e) => {
-            tracing::error!("Database error during API key lookup: {}", e);
+            tracing::error!(
+                "Database error during API key lookup (after retries): {}",
+                e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };

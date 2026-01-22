@@ -36,9 +36,9 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
                 .max_connections(30) // Reduced from 100 for free-tier compatibility
                 .min_connections(2) // Reduced from 20 - free Neon can't handle 20 at once
                 .acquire_timeout(Duration::from_secs(10)) // Increased from 100ms to allow Neon wake-up
-                .idle_timeout(Some(Duration::from_secs(600))) // Keep connections alive longer
-                .max_lifetime(Some(Duration::from_secs(3600))) // Longer lifetime
-                .test_before_acquire(false) // Disabled to avoid extra queries on cold start
+                .idle_timeout(Some(Duration::from_secs(300))) // Reduced from 600s - Neon free-tier may close idle connections
+                .max_lifetime(Some(Duration::from_secs(1800))) // Reduced from 3600s - rotate connections more frequently
+                .test_before_acquire(true) // Re-enabled to detect stale connections (Neon may close idle connections)
                 .after_connect(|conn, _meta| {
                     Box::pin(async move {
                         // Pre-warm with a simple query
