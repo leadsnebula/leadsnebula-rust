@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-const MAX_RETRIES: u32 = 3;
-const INITIAL_RETRY_DELAY_MS: u64 = 500;
+// Removed: Using hardcoded retry logic (single retry with 100ms backoff)
 
 pub struct SsmService {
     client: SsmClient,
@@ -45,53 +44,142 @@ impl SsmService {
             }
         }
 
-        // Fetch from SSM with retry
-        let mut retries = 0;
-        let mut delay_ms = INITIAL_RETRY_DELAY_MS;
+        // Fetch from SSM with 200ms timeout + single retry (100ms backoff) + graceful fallback
+        let ssm_future = self
+            .client
+            .get_parameter()
+            .name(path)
+            .with_decryption(with_decryption)
+            .send();
 
-        loop {
-            match self
-                .client
-                .get_parameter()
-                .name(path)
-                .with_decryption(with_decryption)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    if let Some(param) = response.parameter() {
-                        let value = param.value().unwrap_or("").to_string();
+        // First attempt with 200ms timeout
+        match tokio::time::timeout(std::time::Duration::from_millis(200), ssm_future).await {
+            Ok(Ok(response)) => {
+                if let Some(param) = response.parameter() {
+                    let value = param.value().unwrap_or("").to_string();
 
-                        // Cache the value
-                        if let Some(redis) = &self.redis {
-                            let cache_key =
-                                format!("{}:ssm:{}:{}", self.env, path, with_decryption);
-                            let ttl = if path.contains("/encryption/") {
-                                604800
-                            } else {
-                                86400
-                            }; // 7 days for encryption keys, 1 day for others
-                            let _ = redis.set_with_ttl(&cache_key, &value, ttl).await;
-                        }
-
-                        return Ok(Some(value));
+                    // Cache the value
+                    if let Some(redis) = &self.redis {
+                        let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
+                        let ttl = if path.contains("/encryption/") {
+                            604800
+                        } else {
+                            86400
+                        }; // 7 days for encryption keys, 1 day for others
+                        let _ = redis.set_with_ttl(&cache_key, &value, ttl).await;
                     }
-                    return Ok(None);
+
+                    Ok(Some(value))
+                } else {
+                    Ok(None)
                 }
-                Err(e) => {
-                    if retries < MAX_RETRIES {
-                        retries += 1;
-                        warn!("SSM retry {}/{} for {}: {}", retries, MAX_RETRIES, path, e);
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms *= 2;
-                        continue;
+            }
+            Ok(Err(e)) => {
+                // Error on first attempt - retry once with 100ms backoff
+                warn!("SSM error for {} (first attempt): {}, retrying...", path, e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                let retry_future = self
+                    .client
+                    .get_parameter()
+                    .name(path)
+                    .with_decryption(with_decryption)
+                    .send();
+
+                match tokio::time::timeout(std::time::Duration::from_millis(200), retry_future)
+                    .await
+                {
+                    Ok(Ok(response)) => {
+                        if let Some(param) = response.parameter() {
+                            let value = param.value().unwrap_or("").to_string();
+
+                            // Cache the value
+                            if let Some(redis) = &self.redis {
+                                let cache_key =
+                                    format!("{}:ssm:{}:{}", self.env, path, with_decryption);
+                                let ttl = if path.contains("/encryption/") {
+                                    604800
+                                } else {
+                                    86400
+                                };
+                                let _ = redis.set_with_ttl(&cache_key, &value, ttl).await;
+                            }
+
+                            Ok(Some(value))
+                        } else {
+                            Ok(None)
+                        }
                     }
-                    error!("SSM error for {}: {}", path, e);
-                    return Err(anyhow::anyhow!(
-                        "Failed to fetch SSM parameter {}: {}",
-                        path,
-                        e
-                    ));
+                    Ok(Err(e)) => {
+                        // Second failure - graceful fallback (return None for non-critical keys)
+                        warn!(
+                            "SSM failed after retry for {}: {}, returning None as fallback",
+                            path, e
+                        );
+                        Ok(None)
+                    }
+                    Err(_) => {
+                        // Timeout on retry - graceful fallback
+                        warn!(
+                            "SSM timeout after retry for {}, returning None as fallback",
+                            path
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+            Err(_) => {
+                // Timeout on first attempt - retry once with 100ms backoff
+                warn!("SSM timeout for {} (first attempt), retrying...", path);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                let retry_future = self
+                    .client
+                    .get_parameter()
+                    .name(path)
+                    .with_decryption(with_decryption)
+                    .send();
+
+                match tokio::time::timeout(std::time::Duration::from_millis(200), retry_future)
+                    .await
+                {
+                    Ok(Ok(response)) => {
+                        if let Some(param) = response.parameter() {
+                            let value = param.value().unwrap_or("").to_string();
+
+                            // Cache the value
+                            if let Some(redis) = &self.redis {
+                                let cache_key =
+                                    format!("{}:ssm:{}:{}", self.env, path, with_decryption);
+                                let ttl = if path.contains("/encryption/") {
+                                    604800
+                                } else {
+                                    86400
+                                };
+                                let _ = redis.set_with_ttl(&cache_key, &value, ttl).await;
+                            }
+
+                            Ok(Some(value))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        // Second failure - graceful fallback
+                        warn!(
+                            "SSM failed after retry for {}: {}, returning None as fallback",
+                            path, e
+                        );
+                        Ok(None)
+                    }
+                    Err(_) => {
+                        // Timeout on retry - graceful fallback
+                        warn!(
+                            "SSM timeout after retry for {}, returning None as fallback",
+                            path
+                        );
+                        Ok(None)
+                    }
                 }
             }
         }

@@ -1,8 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use leadsnebula_core::cache::CacheService;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Benchmark full auction flow (ping + post)
 /// Target: <200ms for full auction (warm cache)
@@ -105,11 +106,231 @@ fn bench_db_query_performance(c: &mut Criterion) {
     });
 }
 
+// Mock SSM service for benchmarks
+struct MockSsmService {
+    params: HashMap<String, String>,
+    latency_ms: u64,
+}
+
+impl MockSsmService {
+    fn new() -> Self {
+        let mut params = HashMap::new();
+        params.insert(
+            "/leadsnebula/dev/encryption/det_key".to_string(),
+            "mock_det_key_123456789012345678901234567890".to_string(),
+        );
+        params.insert(
+            "/leadsnebula/dev/encryption/salt".to_string(),
+            "mock_salt_123456789012345678901234567890".to_string(),
+        );
+        Self {
+            params,
+            latency_ms: 50, // Simulate 50ms SSM latency
+        }
+    }
+
+    async fn get_parameter(&self, path: &str) -> Option<String> {
+        // Simulate network latency
+        tokio::time::sleep(Duration::from_millis(self.latency_ms)).await;
+        self.params.get(path).cloned()
+    }
+}
+
+// Mock Neon DB for benchmarks
+struct MockNeonDb {
+    latency_ms: u64,
+}
+
+impl MockNeonDb {
+    fn new() -> Self {
+        Self {
+            latency_ms: 200, // Simulate 200ms DB latency
+        }
+    }
+
+    async fn query(&self) -> Result<(), ()> {
+        tokio::time::sleep(Duration::from_millis(self.latency_ms)).await;
+        Ok(())
+    }
+}
+
+/// Benchmark with realistic SSM/DB latencies
+fn bench_auction_with_realistic_latencies(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let mut group = c.benchmark_group("auction_realistic");
+    group.sample_size(100); // More samples for P95/P99
+    group.measurement_time(Duration::from_secs(30));
+
+    for campaign_count in [1, 5, 10, 20].iter() {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(campaign_count),
+            campaign_count,
+            |b, &count| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let ssm = MockSsmService::new();
+                        let db = MockNeonDb::new();
+
+                        let start = Instant::now();
+
+                        // Simulate pre-checks (SSM + DB)
+                        let _ssm_result = ssm
+                            .get_parameter("/leadsnebula/dev/encryption/det_key")
+                            .await;
+                        let _db_result = db.query().await;
+
+                        // Simulate ping auction (parallel campaigns)
+                        let mut handles = Vec::new();
+                        for _ in 0..count {
+                            handles.push(tokio::spawn(async {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                // Pulsar ping
+                            }));
+                        }
+                        futures::future::join_all(handles).await;
+
+                        // Simulate post
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+
+                        let duration = start.elapsed();
+                        black_box(duration)
+                    })
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Calculate P50, P95, P99 percentiles
+fn bench_percentiles(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("auction_percentiles", |b| {
+        b.iter_custom(|iters| {
+            let mut durations = Vec::new();
+            rt.block_on(async {
+                let ssm = MockSsmService::new();
+                let db = MockNeonDb::new();
+
+                for _ in 0..iters {
+                    let start = Instant::now();
+
+                    // Simulate full auction
+                    let _ssm_result = ssm
+                        .get_parameter("/leadsnebula/dev/encryption/det_key")
+                        .await;
+                    let _db_result = db.query().await;
+
+                    // Simulate 5 campaigns
+                    let mut handles = Vec::new();
+                    for _ in 0..5 {
+                        handles.push(tokio::spawn(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }));
+                    }
+                    futures::future::join_all(handles).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+
+                    durations.push(start.elapsed());
+                }
+            });
+
+            durations.sort();
+            if !durations.is_empty() {
+                let p50 = durations[durations.len() * 50 / 100];
+                let p95 = durations[durations.len() * 95 / 100];
+                let p99_idx = (durations.len() * 99 / 100).min(durations.len() - 1);
+                let p99 = durations[p99_idx];
+
+                println!("\n=== Percentile Results ===");
+                println!("P50: {:?}", p50);
+                println!("P95: {:?}", p95);
+                println!("P99: {:?}", p99);
+                println!("========================\n");
+            }
+
+            durations.into_iter().sum()
+        });
+    });
+}
+
+/// Benchmark critical path only (lead_received → post_response_parsed)
+/// Excludes DB writes, background tasks, verbose lookups
+/// Runs exactly 10 leads and reports P50/P95/P99 percentiles
+fn bench_critical_path(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    const NUM_LEADS: usize = 10;
+
+    c.bench_function("critical_path_10_leads", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let ssm = MockSsmService::new();
+                let mut durations = Vec::with_capacity(NUM_LEADS);
+
+                // Run exactly 10 leads
+                for _ in 0..NUM_LEADS {
+                    let start = Instant::now();
+
+                    // Critical path only:
+                    // 1. Pre-checks (SSM with timeout)
+                    let _ssm_result = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        ssm.get_parameter("/leadsnebula/dev/encryption/det_key"),
+                    )
+                    .await;
+
+                    // 2. Ping auction (sync Pulsar, no DB)
+                    let mut handles = Vec::new();
+                    for _ in 0..10 {
+                        // Simulate 10 campaigns
+                        handles.push(tokio::spawn(async {
+                            // Sync Pulsar call (instant)
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }));
+                    }
+                    futures::future::join_all(handles).await;
+
+                    // 3. Post (sync Pulsar, no DB)
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+
+                    // 4. Response (minimal, simd-json)
+                    let _response = json!({"status": "sold", "post_id": "RP_test"});
+                    let _ = simd_json::to_string(&_response);
+
+                    durations.push(start.elapsed());
+                }
+
+                // Calculate and report percentiles
+                durations.sort();
+                if !durations.is_empty() {
+                    let p50 = durations[durations.len() * 50 / 100];
+                    let p95 = durations[durations.len() * 95 / 100];
+                    let p99_idx = (durations.len() * 99 / 100).min(durations.len() - 1);
+                    let p99 = durations[p99_idx];
+
+                    println!("\n=== Critical Path Percentiles (10 leads) ===");
+                    println!("P50: {:?} ({:.2} ms)", p50, p50.as_secs_f64() * 1000.0);
+                    println!("P95: {:?} ({:.2} ms)", p95, p95.as_secs_f64() * 1000.0);
+                    println!("P99: {:?} ({:.2} ms)", p99, p99.as_secs_f64() * 1000.0);
+                    println!("============================================\n");
+                }
+
+                black_box(durations.into_iter().sum::<Duration>())
+            })
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_full_auction_flow,
     bench_cache_operations,
     bench_json_serialization,
-    bench_db_query_performance
+    bench_db_query_performance,
+    bench_auction_with_realistic_latencies,
+    bench_percentiles,
+    bench_critical_path
 );
 criterion_main!(benches);

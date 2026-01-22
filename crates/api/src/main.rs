@@ -129,19 +129,61 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(true); // Default to JSON
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .with_target(true) // Include module path
-        .with_file(true) // Include file name
-        .with_line_number(true); // Include line numbers
+    #[cfg(feature = "profiling")]
+    {
+        use tracing_flame::FlameLayer;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
 
-    if use_json {
-        subscriber.json().init();
-    } else {
-        subscriber.init();
+        let (flame_layer, _guard) = FlameLayer::with_file("./traces.folded").unwrap();
+
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| default_filter.into());
+
+        let registry = tracing_subscriber::registry()
+            .with(flame_layer)
+            .with(env_filter);
+
+        if use_json {
+            registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_file(true)
+                        .with_line_number(true),
+                )
+                .init();
+        } else {
+            registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_file(true)
+                        .with_line_number(true),
+                )
+                .init();
+        }
+
+        info!("Tracing-flame profiling enabled - flamegraph will be written to ./traces.folded");
+    }
+
+    #[cfg(not(feature = "profiling"))]
+    {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| default_filter.into()),
+            )
+            .with_target(true) // Include module path
+            .with_file(true) // Include file name
+            .with_line_number(true); // Include line numbers
+
+        if use_json {
+            subscriber.json().init();
+        } else {
+            subscriber.init();
+        }
     }
 
     info!("Starting LeadsNebula API server...");
@@ -182,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
             // Clone state for background tasks before moving it into the router
             let state_for_warmup = state.clone();
             let state_for_periodic = Arc::new(state.clone());
+            let write_behind_queue_for_shutdown = state.write_behind_queue.clone();
 
             let app = axum::Router::new()
                 .route("/live", axum::routing::get(routes::health::liveness_check))
@@ -228,8 +271,56 @@ async fn main() -> anyhow::Result<()> {
                 cache_warmup::start_periodic_warmup(state_for_periodic).await;
             });
 
+            // Setup shutdown signal handler to flush write-behind queue
+            // Create shutdown signal once
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            // Spawn signal handler task
+            tokio::spawn(async move {
+                let ctrl_c = async {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("failed to install Ctrl+C handler");
+                };
+
+                #[cfg(unix)]
+                let terminate = async {
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to install signal handler")
+                        .recv()
+                        .await;
+                };
+
+                #[cfg(not(unix))]
+                let terminate = std::future::pending::<()>();
+
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = terminate => {},
+                }
+
+                tracing::info!("Shutdown signal received, flushing write-behind queue...");
+                // Flush with 5s timeout
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    write_behind_queue_for_shutdown.flush(),
+                )
+                .await
+                {
+                    Ok(_) => tracing::info!("Write-behind queue flushed successfully"),
+                    Err(_) => tracing::warn!("Write-behind queue flush timed out after 5s"),
+                }
+
+                // Signal shutdown complete
+                let _ = shutdown_tx.send(());
+            });
+
             // In axum 0.7, Router<AppState> supports into_make_service() when state is set
-            axum::serve(listener, app.into_make_service()).await?;
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await?;
         }
         Ok(Err(e)) => {
             tracing::error!("Failed to initialize application state: {}", e);

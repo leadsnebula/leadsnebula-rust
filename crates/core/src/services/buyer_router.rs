@@ -5,7 +5,7 @@ use crate::models::{
     campaign::Campaign,
     lead::Lead,
 };
-use crate::services::{auction_timing::AuctionTiming, diagnostic_metrics::DiagnosticMetrics};
+use crate::services::{auction_timing::AtomicAuctionTiming, diagnostic_metrics::DiagnosticMetrics};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use reqwest::header::HeaderMap;
@@ -50,7 +50,7 @@ pub struct BuyerRouter {
     pool: Arc<PgPool>,
     #[allow(dead_code)] // May be used in future for external buyer encryption
     encryption_key: Arc<Vec<u8>>,
-    timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
+    timing: Option<Arc<AtomicAuctionTiming>>,
     metrics: Option<Arc<DiagnosticMetrics>>,
     // Pre-loaded buyer/integration data to avoid redundant DB lookups
     preloaded_integration: Option<crate::models::buyer_integration::BuyerIntegration>,
@@ -100,7 +100,7 @@ impl BuyerRouter {
 
     pub fn with_timing_and_metrics(
         mut self,
-        timing: Option<Arc<std::sync::Mutex<AuctionTiming>>>,
+        timing: Option<Arc<AtomicAuctionTiming>>,
         metrics: Option<Arc<DiagnosticMetrics>>,
     ) -> Self {
         self.timing = timing;
@@ -160,25 +160,13 @@ impl BuyerRouter {
                     integration.slug
                 ));
             }
-            // Start buyer_ping_sent stage
-            let stage_ping_sent = if let Some(ref t) = self.timing {
-                let mut timing_guard = t.lock().unwrap();
-                Some(timing_guard.start_stage(
-                    "buyer_ping_sent",
-                    serde_json::json!({"campaign_id": campaign.id, "method": "direct"}),
-                ))
-            } else {
-                None
-            };
             use crate::services::pulsar::PulsarService;
             let ping_start = std::time::Instant::now();
-            let result = PulsarService::route_ping_direct(
-                self.pool.clone(),
+            let result = PulsarService::route_ping_direct_sync(
                 &self.lead,
                 campaign,
                 self.preloaded_qual_config.clone(),
-            )
-            .await;
+            );
             let ping_duration = ping_start.elapsed().as_millis() as u64;
 
             if let Ok(ref resp) = result {
@@ -194,43 +182,15 @@ impl BuyerRouter {
                 );
             }
 
-            // Complete buyer_ping_sent and start buyer_ping_response
+            // Record ping timing
             if let Some(ref t) = self.timing {
-                if let Some(stage) = stage_ping_sent {
-                    let mut timing_guard = t.lock().unwrap();
-                    timing_guard.complete_stage(
-                        stage,
-                        Some(serde_json::json!({"duration_ms": ping_duration})),
-                    );
-                }
-                let mut timing_guard = t.lock().unwrap();
-                timing_guard.start_stage(
-                    "buyer_ping_response",
-                    serde_json::json!({"campaign_id": campaign.id}),
-                );
+                t.record_ping_auction(ping_duration);
             }
             if let Some(ref m) = self.metrics {
                 m.record_query(ping_duration);
             }
 
-            // Complete buyer_ping_response
-            if let Some(ref t) = self.timing {
-                let mut timing_guard = t.lock().unwrap();
-                if let Some(stage) = timing_guard
-                    .stages
-                    .iter()
-                    .position(|s| s.name == "buyer_ping_response" && s.completed_at.is_none())
-                {
-                    let success = result.is_ok();
-                    timing_guard.complete_stage(
-                        stage,
-                        Some(serde_json::json!({
-                            "success": success,
-                            "duration_ms": ping_duration
-                        })),
-                    );
-                }
-            }
+            // Timing is tracked at ping_tree_router level
 
             return result;
         }
@@ -258,16 +218,7 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
-        // Start buyer_ping_sent stage
-        let stage_ping_sent = if let Some(ref t) = self.timing {
-            let mut timing_guard = t.lock().unwrap();
-            Some(timing_guard.start_stage(
-                "buyer_ping_sent",
-                serde_json::json!({"campaign_id": campaign.id, "endpoint": endpoint}),
-            ))
-        } else {
-            None
-        };
+        // Timing is tracked at ping_tree_router level
 
         // Send HTTP request
         let client = &*HTTP_CLIENT;
@@ -320,21 +271,7 @@ impl BuyerRouter {
         };
         let ping_duration = ping_start.elapsed().as_millis() as u64;
 
-        // Complete buyer_ping_sent and start buyer_ping_response
-        if let Some(ref t) = self.timing {
-            if let Some(stage) = stage_ping_sent {
-                let mut timing_guard = t.lock().unwrap();
-                timing_guard.complete_stage(
-                    stage,
-                    Some(serde_json::json!({"duration_ms": ping_duration})),
-                );
-            }
-            let mut timing_guard = t.lock().unwrap();
-            timing_guard.start_stage(
-                "buyer_ping_response",
-                serde_json::json!({"campaign_id": campaign.id}),
-            );
-        }
+        // Timing is tracked at ping_tree_router level
         if let Some(ref m) = self.metrics {
             m.record_query(ping_duration);
         }
@@ -342,7 +279,7 @@ impl BuyerRouter {
         // Parse response
         let parse_start = std::time::Instant::now();
         let result = self.parse_buyer_response(response, "ping").await;
-        let parse_duration = parse_start.elapsed().as_millis() as u64;
+        let _parse_duration = parse_start.elapsed().as_millis() as u64;
 
         if let Ok(ref resp) = result {
             tracing::info!(
@@ -356,24 +293,7 @@ impl BuyerRouter {
             );
         }
 
-        // Complete buyer_ping_response
-        if let Some(ref t) = self.timing {
-            let mut timing_guard = t.lock().unwrap();
-            if let Some(stage) = timing_guard
-                .stages
-                .iter()
-                .position(|s| s.name == "buyer_ping_response" && s.completed_at.is_none())
-            {
-                let success = result.is_ok();
-                timing_guard.complete_stage(
-                    stage,
-                    Some(serde_json::json!({
-                        "success": success,
-                        "duration_ms": parse_duration
-                    })),
-                );
-            }
-        }
+        // Timing is tracked at ping_tree_router level
 
         result
     }
@@ -405,64 +325,22 @@ impl BuyerRouter {
                     integration.slug
                 ));
             }
-            // Start buyer_post_sent stage
-            let stage_post_sent = if let Some(ref t) = self.timing {
-                let mut timing_guard = t.lock().unwrap();
-                Some(timing_guard.start_stage(
-                    "buyer_post_sent",
-                    serde_json::json!({"campaign_id": campaign.id, "method": "direct"}),
-                ))
-            } else {
-                None
-            };
             use crate::services::pulsar::PulsarService;
             let post_start = std::time::Instant::now();
-            let result = PulsarService::route_post_direct(
-                self.pool.clone(),
+            let result = PulsarService::route_post_direct_sync(
                 &self.lead,
                 campaign,
                 promise_id,
                 self.preloaded_qual_config.clone(),
-            )
-            .await;
+            );
             let post_duration = post_start.elapsed().as_millis() as u64;
 
-            // Complete buyer_post_sent and start buyer_post_response
+            // Record post timing (non-blocking)
             if let Some(ref t) = self.timing {
-                if let Some(stage) = stage_post_sent {
-                    let mut timing_guard = t.lock().unwrap();
-                    timing_guard.complete_stage(
-                        stage,
-                        Some(serde_json::json!({"duration_ms": post_duration})),
-                    );
-                }
-                let mut timing_guard = t.lock().unwrap();
-                timing_guard.start_stage(
-                    "buyer_post_response",
-                    serde_json::json!({"campaign_id": campaign.id}),
-                );
+                t.record_post_sent(post_duration);
             }
             if let Some(ref m) = self.metrics {
                 m.record_query(post_duration);
-            }
-
-            // Complete buyer_post_response
-            if let Some(ref t) = self.timing {
-                let mut timing_guard = t.lock().unwrap();
-                if let Some(stage) = timing_guard
-                    .stages
-                    .iter()
-                    .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
-                {
-                    let success = result.is_ok();
-                    timing_guard.complete_stage(
-                        stage,
-                        Some(serde_json::json!({
-                            "success": success,
-                            "duration_ms": post_duration
-                        })),
-                    );
-                }
             }
 
             return result;
@@ -485,16 +363,7 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
-        // Start buyer_post_sent stage
-        let stage_post_sent = if let Some(ref t) = self.timing {
-            let mut timing_guard = t.lock().unwrap();
-            Some(timing_guard.start_stage(
-                "buyer_post_sent",
-                serde_json::json!({"campaign_id": campaign.id, "endpoint": endpoint}),
-            ))
-        } else {
-            None
-        };
+        // Timing is tracked at ping_tree_router level
 
         // Send HTTP request
         let client = &*HTTP_CLIENT;
@@ -555,20 +424,9 @@ impl BuyerRouter {
         };
         let post_duration = post_start.elapsed().as_millis() as u64;
 
-        // Complete buyer_post_sent and start buyer_post_response
+        // Record post timing (non-blocking)
         if let Some(ref t) = self.timing {
-            if let Some(stage) = stage_post_sent {
-                let mut timing_guard = t.lock().unwrap();
-                timing_guard.complete_stage(
-                    stage,
-                    Some(serde_json::json!({"duration_ms": post_duration})),
-                );
-            }
-            let mut timing_guard = t.lock().unwrap();
-            timing_guard.start_stage(
-                "buyer_post_response",
-                serde_json::json!({"campaign_id": campaign.id}),
-            );
+            t.record_post_sent(post_duration);
         }
         if let Some(ref m) = self.metrics {
             m.record_query(post_duration);
@@ -577,26 +435,9 @@ impl BuyerRouter {
         // Parse response
         let parse_start = std::time::Instant::now();
         let result = self.parse_buyer_response(response, "post").await;
-        let parse_duration = parse_start.elapsed().as_millis() as u64;
+        let _parse_duration = parse_start.elapsed().as_millis() as u64;
 
-        // Complete buyer_post_response
-        if let Some(ref t) = self.timing {
-            let mut timing_guard = t.lock().unwrap();
-            if let Some(stage) = timing_guard
-                .stages
-                .iter()
-                .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
-            {
-                let success = result.is_ok();
-                timing_guard.complete_stage(
-                    stage,
-                    Some(serde_json::json!({
-                        "success": success,
-                        "duration_ms": parse_duration
-                    })),
-                );
-            }
-        }
+        // Timing is tracked at ping_tree_router level
 
         result
     }
@@ -623,61 +464,25 @@ impl BuyerRouter {
                     integration.slug
                 ));
             }
-            // Start buyer_post_sent stage (fullpost uses post stages)
-            let stage_post_sent = if let Some(ref t) = self.timing {
-                let mut timing_guard = t.lock().unwrap();
-                Some(timing_guard.start_stage("buyer_post_sent", serde_json::json!({"campaign_id": campaign.id, "method": "direct", "request_type": "fullpost"})))
-            } else {
-                None
-            };
+            // Timing is tracked at ping_tree_router level
             use crate::services::pulsar::PulsarService;
             let post_start = std::time::Instant::now();
-            let result = PulsarService::route_fullpost_direct(
-                self.pool.clone(),
+            let result = PulsarService::route_fullpost_direct_sync(
                 &self.lead,
                 campaign,
                 self.preloaded_qual_config.clone(),
-            )
-            .await;
+            );
             let post_duration = post_start.elapsed().as_millis() as u64;
 
-            // Complete buyer_post_sent and start buyer_post_response
+            // Record post timing (non-blocking)
             if let Some(ref t) = self.timing {
-                if let Some(stage) = stage_post_sent {
-                    let mut timing_guard = t.lock().unwrap();
-                    timing_guard.complete_stage(
-                        stage,
-                        Some(serde_json::json!({"duration_ms": post_duration})),
-                    );
-                }
-                let mut timing_guard = t.lock().unwrap();
-                timing_guard.start_stage(
-                    "buyer_post_response",
-                    serde_json::json!({"campaign_id": campaign.id}),
-                );
+                t.record_post_sent(post_duration);
             }
             if let Some(ref m) = self.metrics {
                 m.record_query(post_duration);
             }
 
-            // Complete buyer_post_response
-            if let Some(ref t) = self.timing {
-                let mut timing_guard = t.lock().unwrap();
-                if let Some(stage) = timing_guard
-                    .stages
-                    .iter()
-                    .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
-                {
-                    let success = result.is_ok();
-                    timing_guard.complete_stage(
-                        stage,
-                        Some(serde_json::json!({
-                            "success": success,
-                            "duration_ms": post_duration
-                        })),
-                    );
-                }
-            }
+            // Timing is tracked at ping_tree_router level
 
             return result;
         }
@@ -697,13 +502,7 @@ impl BuyerRouter {
             "lead": lead_data
         });
 
-        // Start buyer_post_sent stage
-        let stage_post_sent = if let Some(ref t) = self.timing {
-            let mut timing_guard = t.lock().unwrap();
-            Some(timing_guard.start_stage("buyer_post_sent", serde_json::json!({"campaign_id": campaign.id, "endpoint": endpoint, "request_type": "fullpost"})))
-        } else {
-            None
-        };
+        // Timing is tracked at ping_tree_router level
 
         // Send HTTP request
         let client = &*HTTP_CLIENT;
@@ -766,20 +565,9 @@ impl BuyerRouter {
         };
         let post_duration = post_start.elapsed().as_millis() as u64;
 
-        // Complete buyer_post_sent and start buyer_post_response
+        // Record post timing (non-blocking)
         if let Some(ref t) = self.timing {
-            if let Some(stage) = stage_post_sent {
-                let mut timing_guard = t.lock().unwrap();
-                timing_guard.complete_stage(
-                    stage,
-                    Some(serde_json::json!({"duration_ms": post_duration})),
-                );
-            }
-            let mut timing_guard = t.lock().unwrap();
-            timing_guard.start_stage(
-                "buyer_post_response",
-                serde_json::json!({"campaign_id": campaign.id}),
-            );
+            t.record_post_sent(post_duration);
         }
         if let Some(ref m) = self.metrics {
             m.record_query(post_duration);
@@ -788,26 +576,9 @@ impl BuyerRouter {
         // Parse response
         let parse_start = std::time::Instant::now();
         let result = self.parse_buyer_response(response, "fullpost").await;
-        let parse_duration = parse_start.elapsed().as_millis() as u64;
+        let _parse_duration = parse_start.elapsed().as_millis() as u64;
 
-        // Complete buyer_post_response
-        if let Some(ref t) = self.timing {
-            let mut timing_guard = t.lock().unwrap();
-            if let Some(stage) = timing_guard
-                .stages
-                .iter()
-                .position(|s| s.name == "buyer_post_response" && s.completed_at.is_none())
-            {
-                let success = result.is_ok();
-                timing_guard.complete_stage(
-                    stage,
-                    Some(serde_json::json!({
-                        "success": success,
-                        "duration_ms": parse_duration
-                    })),
-                );
-            }
-        }
+        // Timing is tracked at ping_tree_router level
 
         result
     }

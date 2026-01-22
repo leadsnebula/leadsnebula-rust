@@ -4,6 +4,12 @@
 # Note: Cargo.lock should be committed for applications (not libraries)
 # Cargo.lock
 
+# Profiling artifacts
+*.folded
+traces.*
+flamegraph.svg
+flamegraph-*.svg
+
 # IDE
 .idea/
 .vscode/

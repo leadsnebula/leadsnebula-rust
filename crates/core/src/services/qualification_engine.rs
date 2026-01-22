@@ -32,11 +32,13 @@ impl QualificationEngine {
     }
 
     /// Evaluate qualification rules and return result
+    #[inline(always)]
     pub fn evaluate(&self) -> QualificationResult {
         // If no config exists, default pass (accept all)
         let config = match &self.qualification_config {
             Some(c) => c,
             None => {
+                #[cfg(all(feature = "tracing", debug_assertions))]
                 tracing::debug!("No qualification config found - defaulting to accept");
                 return QualificationResult {
                     accepted: true,
@@ -48,6 +50,7 @@ impl QualificationEngine {
 
         // If config is disabled, default pass
         if !config.enabled || !config.is_active {
+            #[cfg(all(feature = "tracing", debug_assertions))]
             tracing::debug!("Qualification config is disabled - defaulting to accept");
             return QualificationResult {
                 accepted: true,
@@ -63,6 +66,7 @@ impl QualificationEngine {
         for rule_name in rules_order {
             let result = self.evaluate_rule(&rule_name, &config.config);
             if !result.accepted {
+                #[cfg(all(feature = "tracing", debug_assertions))]
                 tracing::debug!(
                     rule = %rule_name,
                     reason = %result.reason,
@@ -108,6 +112,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate a single rule
+    #[inline(always)]
     fn evaluate_rule(&self, rule_name: &str, config: &Value) -> QualificationResult {
         match rule_name {
             "zip_blacklist" => self.evaluate_zip_blacklist(),

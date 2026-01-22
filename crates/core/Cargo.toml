@@ -48,6 +48,7 @@ url = { version = "2", optional = true }
 
 [features]
 default = []
+tracing = []
 sentry = ["dep:sentry"]
 webauthn = ["dep:webauthn-rs", "dep:url"]
 otp = ["dep:totp-rs"]

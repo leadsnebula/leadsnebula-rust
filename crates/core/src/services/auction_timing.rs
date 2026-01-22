@@ -1,4 +1,6 @@
 use serde_json;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -114,6 +116,104 @@ impl AuctionTiming {
                 "metadata": s.metadata
             })).collect::<Vec<_>>()
         })
+    }
+}
+
+/// Atomic-only timing for hot path (no mutex contention)
+/// Uses atomic counters for zero-overhead timing in critical path
+#[derive(Clone)]
+pub struct AtomicAuctionTiming {
+    lead_arrived_at: Instant,
+    // Atomic counters for each stage duration (in milliseconds)
+    pre_checks_ms: Arc<AtomicU64>,
+    ping_auction_ms: Arc<AtomicU64>,
+    qualification_ms: Arc<AtomicU64>,
+    post_sent_ms: Arc<AtomicU64>,
+    total_ms: Arc<AtomicU64>,
+}
+
+impl AtomicAuctionTiming {
+    pub fn new() -> Self {
+        Self {
+            lead_arrived_at: Instant::now(),
+            pre_checks_ms: Arc::new(AtomicU64::new(0)),
+            ping_auction_ms: Arc::new(AtomicU64::new(0)),
+            qualification_ms: Arc::new(AtomicU64::new(0)),
+            post_sent_ms: Arc::new(AtomicU64::new(0)),
+            total_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[inline(always)]
+    pub fn record_pre_checks(&self, duration_ms: u64) {
+        self.pre_checks_ms.store(duration_ms, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn record_ping_auction(&self, duration_ms: u64) {
+        self.ping_auction_ms.store(duration_ms, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn record_qualification(&self, duration_ms: u64) {
+        self.qualification_ms.store(duration_ms, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn record_post_sent(&self, duration_ms: u64) {
+        self.post_sent_ms.store(duration_ms, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn record_total(&self) {
+        let total = self.lead_arrived_at.elapsed().as_millis() as u64;
+        self.total_ms.store(total, Ordering::Relaxed);
+    }
+
+    /// Flush to background task for detailed logging (non-blocking)
+    pub fn flush_to_background(&self, lead_id: &str) {
+        let lead_id = lead_id.to_string();
+        let pre_checks = self.pre_checks_ms.load(Ordering::Relaxed);
+        let ping_auction = self.ping_auction_ms.load(Ordering::Relaxed);
+        let qualification = self.qualification_ms.load(Ordering::Relaxed);
+        let post_sent = self.post_sent_ms.load(Ordering::Relaxed);
+        let total = self.total_ms.load(Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            #[cfg(feature = "tracing")]
+            {
+                tracing::info!(
+                    lead_id = %lead_id,
+                    pre_checks_ms = pre_checks,
+                    ping_auction_ms = ping_auction,
+                    qualification_ms = qualification,
+                    post_sent_ms = post_sent,
+                    total_ms = total,
+                    "Auction timing summary"
+                );
+            }
+            #[cfg(not(feature = "tracing"))]
+            {
+                let _ = (
+                    pre_checks,
+                    ping_auction,
+                    qualification,
+                    post_sent,
+                    total,
+                    lead_id,
+                );
+            }
+        });
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.lead_arrived_at.elapsed().as_millis() as u64
+    }
+}
+
+impl Default for AtomicAuctionTiming {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

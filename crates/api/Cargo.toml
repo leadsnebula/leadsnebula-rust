@@ -51,6 +51,7 @@ sentry-tower = { version = "0.32", optional = true }
 
 [features]
 default = ["webauthn"]
+profiling = []
 sentry = ["dep:sentry", "dep:sentry-tower", "leadsnebula_core/sentry"]
 webauthn = ["dep:webauthn-rs", "dep:url", "leadsnebula_core/webauthn"]
 

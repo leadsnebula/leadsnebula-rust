@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Query, State},
     http::StatusCode,
     response::Json,
     routing::post,
@@ -17,10 +17,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::AppState;
-use leadsnebula_core::services::auction_timing::AuctionTiming;
+use leadsnebula_core::services::auction_timing::AtomicAuctionTiming;
 use leadsnebula_core::services::diagnostic_metrics::DiagnosticMetrics;
 use leadsnebula_core::services::ssm_key_cache::get_ssm_parameter_cached;
-use std::sync::{Arc, Mutex};
+use simd_json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
 
@@ -167,14 +168,21 @@ pub fn carina_routes() -> Router<AppState> {
 async fn create_lead(
     State(state): State<AppState>,
     Extension(publisher): Extension<Publisher>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
     // Initialize timing and metrics
-    let mut timing = AuctionTiming::new();
-    let metrics = DiagnosticMetrics::new();
+    let timing = Arc::new(AtomicAuctionTiming::new());
+    let metrics = Arc::new(DiagnosticMetrics::new());
 
-    let stage_lead_received = timing.start_stage("lead_received", serde_json::json!({}));
-    let request_level_verbose = payload.verbose.unwrap_or(false);
+    // Check for minimal mode
+    let minimal_mode = params.get("minimal").map(|v| v == "true").unwrap_or(false);
+
+    let request_level_verbose = if minimal_mode {
+        false // Skip verbose in minimal mode
+    } else {
+        payload.verbose.unwrap_or(false)
+    };
     let lead_data = payload.lead;
     let request_type = lead_data
         .request_type
@@ -187,27 +195,14 @@ async fn create_lead(
     } else {
         lead_data.verbose.unwrap_or(false)
     };
-    timing.complete_stage(
-        stage_lead_received,
-        Some(serde_json::json!({"request_type": request_type.clone()})),
-    );
-
-    // Publisher validation (already done via Extension middleware)
-    // Note: Publisher is available from middleware, not a DB query, so no parallelization needed
-    let stage_publisher = timing.start_stage("publisher_validation", serde_json::json!({}));
-    timing.complete_stage(
-        stage_publisher,
-        Some(serde_json::json!({"publisher_id": publisher.id})),
-    );
 
     // Validate vertical (CACHED - 24h TTL, verticals rarely change)
     // Note: Pre-checks query uses vertical.slug in subquery, so it could theoretically run in parallel
     // However, vertical lookup is cached and fast (<5ms), so parallelization benefit is minimal
-    let stage_vertical = timing.start_stage("vertical_lookup", serde_json::json!({}));
     let vertical_start = std::time::Instant::now();
     let cache_key = format!("vertical:slug:{}", lead_data.vertical);
 
-    let (vertical_result, cache_hit) = if let Some(cache) = &state.cache {
+    let (vertical_result, _cache_hit) = if let Some(cache) = &state.cache {
         // Use cached lookup with 24h TTL
         // Cache stores Option<Vertical> - serialize None as "null"
         let cache_check_start = std::time::Instant::now();
@@ -264,10 +259,7 @@ async fn create_lead(
         (result, false)
     };
     let vertical_duration = vertical_start.elapsed().as_millis() as u64;
-    timing.complete_stage(
-        stage_vertical,
-        Some(serde_json::json!({"cache_hit": cache_hit, "duration_ms": vertical_duration})),
-    );
+    timing.record_pre_checks(vertical_duration);
 
     let vertical = match vertical_result {
         Ok(Some(v)) => v,
@@ -608,8 +600,8 @@ async fn create_lead(
         }
 
         // Route the post through the ping-tree router to perform buyer post handling
-        let timing_arc = Arc::new(Mutex::new(timing));
-        let metrics_arc = Arc::new(metrics);
+        let timing_arc = timing.clone();
+        let metrics_arc = metrics.clone();
         let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
             lead.clone(),
             publisher.id,
@@ -721,22 +713,26 @@ async fn create_lead(
                             leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
                                 &det_key, &salt,
                             );
-                        if let Ok(req_str) = serde_json::to_string(&post_request_json) {
-                            if let Ok(env) =
-                                leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                                    &derived, &req_str, true,
-                                )
-                            {
-                                enc_req_opt = Some(env);
+                        if let Ok(bytes) = simd_json::to_vec(&post_request_json) {
+                            if let Ok(req_str) = String::from_utf8(bytes) {
+                                if let Ok(env) =
+                                    leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+                                        &derived, &req_str, true,
+                                    )
+                                {
+                                    enc_req_opt = Some(env);
+                                }
                             }
                         }
-                        if let Ok(resp_str) = serde_json::to_string(&post_response_json) {
-                            if let Ok(env2) =
-                                leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                                    &derived, &resp_str, true,
-                                )
-                            {
-                                enc_resp_opt = Some(env2);
+                        if let Ok(bytes) = simd_json::to_vec(&post_response_json) {
+                            if let Ok(resp_str) = String::from_utf8(bytes) {
+                                if let Ok(env2) =
+                                    leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+                                        &derived, &resp_str, true,
+                                    )
+                                {
+                                    enc_resp_opt = Some(env2);
+                                }
                             }
                         }
                     }
@@ -911,7 +907,6 @@ async fn create_lead(
     // Pre-insert checks: determine buyer_id and campaign_id to satisfy NOT NULL constraints
     // OPTIMIZED: Single query combining all pre-checks (reduces 4-6 queries to 1)
     // CACHED: Short TTL (300s) since campaigns can change
-    let stage_prechecks = timing.start_stage("pre_checks", serde_json::json!({}));
     let prechecks_start = std::time::Instant::now();
     let mut preproblems: Vec<String> = Vec::new();
     let mut buyer_id_opt: Option<uuid::Uuid> = None;
@@ -1094,11 +1089,11 @@ async fn create_lead(
     );
 
     // Extract results
-    let (result, prechecks_cache_hit) = prechecks_result;
+    let (result, _prechecks_cache_hit) = prechecks_result;
     let (det_key_result, salt_result) = ssm_results;
 
     let prechecks_duration = prechecks_start.elapsed().as_millis() as u64;
-    timing.complete_stage(stage_prechecks, Some(serde_json::json!({"cache_hit": prechecks_cache_hit, "duration_ms": prechecks_duration})));
+    timing.record_pre_checks(prechecks_duration);
 
     match result {
         Ok(Some((campaign_id, effective_buyer_id, has_ping_tree))) => {
@@ -1212,7 +1207,7 @@ async fn create_lead(
 
     // Encrypt PII fields using SSM deterministic key
     // Note: SSM keys were already fetched in parallel with pre-checks query above
-    let stage_encryption = timing.start_stage("encryption_setup", serde_json::json!({}));
+    let encryption_start = std::time::Instant::now();
 
     let pii_encryption_key = match (det_key_result, salt_result) {
         (Ok(Some(det_key)), Ok(Some(salt))) => Some(
@@ -1266,12 +1261,11 @@ async fn create_lead(
     let zip_encrypted = encrypt_pii(lead_data.zip.clone());
     let ip_address_encrypted = encrypt_pii(lead_data.ip_address.clone());
 
-    // Complete encryption stage
-    timing.complete_stage(stage_encryption, Some(serde_json::json!({})));
+    // Record encryption timing (non-critical, background)
+    let _encryption_duration = encryption_start.elapsed().as_millis() as u64;
 
     // Batch all DB writes in single transaction (lead + ping + ping_payloads)
     // This reduces 3 sequential writes (600-1000ms) to 1 transaction (200-300ms)
-    let stage_lead_insertion = timing.start_stage("lead_insertion", serde_json::json!({}));
     let lead_insert_start = std::time::Instant::now();
     tracing::info!(
         "Creating lead: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}",
@@ -1287,11 +1281,15 @@ async fn create_lead(
         serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
     // Try to encrypt the request payload using the same SSM deterministic key
     let encrypted_request_opt: Option<String> = if let Some(key_bytes) = &pii_encryption_key {
-        if let Ok(req_str) = serde_json::to_string(&request_payload_json) {
-            leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                key_bytes, &req_str, true,
-            )
-            .ok()
+        if let Ok(bytes) = simd_json::to_vec(&request_payload_json) {
+            if let Ok(req_str) = String::from_utf8(bytes) {
+                leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+                    key_bytes, &req_str, true,
+                )
+                .ok()
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1479,10 +1477,6 @@ async fn create_lead(
         Ok(_) => {
             let lead_insert_duration = lead_insert_start.elapsed().as_millis() as u64;
             metrics.record_query(lead_insert_duration);
-            timing.complete_stage(
-                stage_lead_insertion,
-                Some(serde_json::json!({"duration_ms": lead_insert_duration})),
-            );
             tracing::info!("Successfully created lead, ping, and ping_payloads in single transaction for lead {}", lead_uuid);
         }
         Err(e) => {
@@ -1565,13 +1559,9 @@ async fn create_lead(
     };
 
     // Route the lead through ping tree
-    let stage_routing_start = timing.start_stage("routing_start", serde_json::json!({}));
-    let timing_arc = Arc::new(Mutex::new(timing));
-    let metrics_arc = Arc::new(metrics);
-    {
-        let mut t = timing_arc.lock().unwrap();
-        t.complete_stage(stage_routing_start, Some(serde_json::json!({})));
-    }
+    let routing_start = std::time::Instant::now();
+    let timing_arc = timing.clone();
+    let metrics_arc = metrics.clone();
     let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
         lead,
         publisher.id,
@@ -1587,10 +1577,8 @@ async fn create_lead(
             std::sync::Arc::new(state.config.encryption_key.clone()),
         )
         .await;
-    let stage_routing_complete = {
-        let mut t = timing_arc.lock().unwrap();
-        t.start_stage("routing_complete", serde_json::json!({}))
-    };
+    let _routing_duration = routing_start.elapsed().as_millis() as u64;
+    timing_arc.record_total();
 
     match routing_result {
         Ok(routing_result) => {
@@ -1631,7 +1619,10 @@ async fn create_lead(
             };
 
             // Resolve buyer and campaign names if available (best-effort; ignore failures)
-            let buyer_name = if let Some(bid) = routing_result.buyer_id {
+            // Skip in minimal mode for performance
+            let buyer_name = if minimal_mode {
+                None
+            } else if let Some(bid) = routing_result.buyer_id {
                 (sqlx::query_scalar::<_, String>(
                     "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
                 )
@@ -1643,7 +1634,9 @@ async fn create_lead(
                 None
             };
 
-            let campaign_name = if let Some(cid) = routing_result.campaign_id {
+            let campaign_name = if minimal_mode {
+                None
+            } else if let Some(cid) = routing_result.campaign_id {
                 (sqlx::query_scalar::<_, String>(
                     "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
                 )
@@ -1655,7 +1648,9 @@ async fn create_lead(
                 None
             };
 
-            let verbose_json = if verbose_requested {
+            let verbose_json = if minimal_mode {
+                None // Skip verbose JSON in minimal mode
+            } else if verbose_requested {
                 Some(serde_json::json!({
                     "error_code": format!("ERR_{}", 200),
                     "timestamp": Utc::now().to_rfc3339(),
@@ -1696,13 +1691,15 @@ async fn create_lead(
                             leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
                                 &det_key, &salt,
                             );
-                        if let Ok(resp_str) = serde_json::to_string(&response_json) {
-                            if let Ok(envelope) =
-                                leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                                    &derived, &resp_str, true,
-                                )
-                            {
-                                encrypted_response_opt = Some(envelope);
+                        if let Ok(bytes) = simd_json::to_vec(&response_json) {
+                            if let Ok(resp_str) = String::from_utf8(bytes) {
+                                if let Ok(envelope) =
+                                    leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+                                        &derived, &resp_str, true,
+                                    )
+                                {
+                                    encrypted_response_opt = Some(envelope);
+                                }
                             }
                         }
                     }
@@ -1872,15 +1869,8 @@ async fn create_lead(
                 };
             }
 
-            // Log diagnostic summary and timing before returning
-            {
-                let mut t = timing_arc.lock().unwrap();
-                t.complete_stage(
-                    stage_routing_complete,
-                    Some(serde_json::json!({"status": routing_result.status.clone()})),
-                );
-                t.log_summary(&lead_uuid.to_string());
-            }
+            // Log diagnostic summary and timing before returning (non-blocking)
+            timing_arc.flush_to_background(&lead_uuid.to_string());
             metrics_arc.log_summary("carina");
 
             Ok(Json(LeadResponse {
@@ -1905,14 +1895,7 @@ async fn create_lead(
         }
         Err(e) => {
             tracing::error!("Routing error: {}", e);
-            {
-                let mut t = timing_arc.lock().unwrap();
-                t.complete_stage(
-                    stage_routing_complete,
-                    Some(serde_json::json!({"error": e.to_string()})),
-                );
-                t.log_summary(&lead_uuid.to_string());
-            }
+            timing_arc.flush_to_background(&lead_uuid.to_string());
             metrics_arc.log_summary("carina");
             let (message, technical) = map_error_to_user(&e.to_string());
             Ok(Json(LeadResponse {

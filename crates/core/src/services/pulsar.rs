@@ -29,6 +29,53 @@ async fn inject_chaos_delay() {
     }
 }
 
+fn inject_chaos_delay_sync() {
+    if should_inject_chaos() {
+        let delay_ms = rand::random::<u64>() % 150 + 50; // 50-200ms
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+}
+
+#[inline(always)]
+fn generate_promise_id() -> String {
+    let hex_bytes = rand::random::<[u8; 6]>();
+    let hex_str = hex::encode(hex_bytes);
+    let mut result = String::with_capacity(8 + hex_str.len());
+    result.push_str("PROMISE_");
+    result.push_str(&hex_str.to_uppercase());
+    result
+}
+
+#[inline(always)]
+fn generate_ping_id(lead_id: &str) -> String {
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
+    payload.push_str(lead_id);
+    payload.push('|');
+    payload.push_str(&timestamp);
+    payload.push_str("|accepted");
+    let encoded = BASE64_STD.encode(payload);
+    let mut ping_id = String::with_capacity(3 + encoded.len());
+    ping_id.push_str("FP_");
+    ping_id.push_str(&encoded);
+    ping_id
+}
+
+#[inline(always)]
+fn generate_post_id(lead_id: &str) -> String {
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 6);
+    payload.push_str(lead_id);
+    payload.push('|');
+    payload.push_str(&timestamp);
+    payload.push_str("|sold");
+    let encoded = BASE64_STD.encode(payload);
+    let mut post_id = String::with_capacity(3 + encoded.len());
+    post_id.push_str("RP_");
+    post_id.push_str(&encoded);
+    post_id
+}
+
 pub struct PulsarService;
 
 impl PulsarService {
@@ -263,6 +310,164 @@ impl PulsarService {
             bid: None, // Fullpost responses have price, not bid
             error: post_response.error,
             message: post_response.message,
+        })
+    }
+
+    /// SYNC version: Direct call to Pulsar for fullpost requests (bypasses HTTP, no async overhead)
+    /// Fullpost = ping + post in one call (both sync)
+    #[inline(always)]
+    pub fn route_fullpost_direct_sync(
+        lead: &Lead,
+        campaign: &Campaign,
+        qualification_config: Option<BuyerQualificationConfig>,
+    ) -> Result<BuyerResponse> {
+        // First do ping (sync)
+        let ping_response =
+            Self::route_ping_direct_sync(lead, campaign, qualification_config.clone())?;
+
+        // If ping fails, return early
+        if !ping_response.success {
+            return Ok(ping_response);
+        }
+
+        // Extract promise_id from ping response
+        let promise_id = ping_response
+            .promise_id
+            .ok_or_else(|| anyhow::anyhow!("Ping succeeded but no promise_id returned"))?;
+
+        // Then do post (sync)
+        let post_response =
+            Self::route_post_direct_sync(lead, campaign, &promise_id, qualification_config)?;
+
+        // Return post response (which includes both ping_id and post_id)
+        Ok(BuyerResponse {
+            success: post_response.success,
+            status: post_response.status,
+            ping_id: ping_response.ping_id, // Include ping_id from ping phase
+            post_id: post_response.post_id,
+            promise_id: post_response.promise_id,
+            price: post_response.price,
+            bid: None, // Fullpost responses have price, not bid
+            error: post_response.error,
+            message: post_response.message,
+        })
+    }
+
+    /// SYNC version: Direct call to Pulsar for ping requests (bypasses HTTP, no async overhead)
+    /// Returns instantly with random bid + UUID promise
+    #[inline(always)]
+    pub fn route_ping_direct_sync(
+        lead: &Lead,
+        _campaign: &Campaign,
+        qualification_config: Option<BuyerQualificationConfig>,
+    ) -> Result<BuyerResponse> {
+        let lead_id = lead
+            .lead_id
+            .clone()
+            .unwrap_or_else(|| lead.uuid.to_string());
+
+        // Inject chaos delay if enabled (sync version)
+        inject_chaos_delay_sync();
+
+        // Evaluate qualification rules using qualification engine (already sync)
+        let engine =
+            QualificationEngine::new(lead.clone(), "ping".to_string(), qualification_config);
+        let qual_result: QualificationResult = engine.evaluate();
+        let accepted = qual_result.accepted;
+
+        if !accepted {
+            let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
+            let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
+            payload.push_str(&lead_id);
+            payload.push('|');
+            payload.push_str(&timestamp);
+            payload.push_str("|rejected");
+            let encoded = BASE64_STD.encode(payload);
+            let mut rejected_ping_id = String::with_capacity(3 + encoded.len());
+            rejected_ping_id.push_str("FP_");
+            rejected_ping_id.push_str(&encoded);
+            return Ok(BuyerResponse {
+                success: false,
+                status: "rejected".to_string(),
+                ping_id: Some(rejected_ping_id),
+                post_id: None,
+                promise_id: None,
+                price: None,
+                bid: None,
+                error: Some("Lead rejected by qualification rules".to_string()),
+                message: Some("Lead did not meet qualification requirements".to_string()),
+            });
+        }
+
+        // Generate IDs instantly
+        let ping_id = generate_ping_id(&lead_id);
+        let promise_id = generate_promise_id();
+
+        // Return instantly with random bid
+        Ok(BuyerResponse {
+            success: true,
+            status: "accepted".to_string(),
+            ping_id: Some(ping_id),
+            post_id: None,
+            promise_id: Some(promise_id),
+            price: None,
+            bid: Some((rand::random::<u32>() % 200 + 100) as f64),
+            error: None,
+            message: Some("Lead accepted for ping".to_string()),
+        })
+    }
+
+    /// SYNC version: Direct call to Pulsar for post requests (bypasses HTTP, no async overhead)
+    /// Returns instantly with random price + UUID promise
+    #[inline(always)]
+    pub fn route_post_direct_sync(
+        lead: &Lead,
+        _campaign: &Campaign,
+        promise_id: &str,
+        qualification_config: Option<BuyerQualificationConfig>,
+    ) -> Result<BuyerResponse> {
+        let lead_id = lead
+            .lead_id
+            .clone()
+            .unwrap_or_else(|| lead.uuid.to_string());
+
+        // Inject chaos delay if enabled (sync version)
+        inject_chaos_delay_sync();
+
+        // Evaluate qualification rules using qualification engine (already sync)
+        let engine =
+            QualificationEngine::new(lead.clone(), "post".to_string(), qualification_config);
+        let qual_result: QualificationResult = engine.evaluate();
+        let accepted = qual_result.accepted;
+
+        if !accepted {
+            return Ok(BuyerResponse {
+                success: false,
+                status: "rejected".to_string(),
+                ping_id: None,
+                post_id: None,
+                promise_id: Some(promise_id.to_string()),
+                price: None,
+                bid: None,
+                error: Some("Lead rejected by qualification rules".to_string()),
+                message: Some("Lead did not meet qualification requirements".to_string()),
+            });
+        }
+
+        // Generate post_id instantly
+        let post_id = generate_post_id(&lead_id);
+
+        // Return instantly with random price
+        Ok(BuyerResponse {
+            success: true,
+            status: "sold".to_string(),
+            ping_id: None,
+            post_id: Some(post_id),
+            promise_id: Some(promise_id.to_string()),
+            price: Some((rand::random::<u32>() % 200 + 100) as f64),
+            bid: None,
+            error: None,
+            message: Some("Lead accepted and sold".to_string()),
         })
     }
 }

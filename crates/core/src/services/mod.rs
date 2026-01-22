@@ -9,6 +9,7 @@ pub mod qualification_engine;
 pub mod retry;
 pub mod revenue_calculator;
 pub mod ssm_key_cache;
+pub mod write_behind_queue;
 
 #[cfg(test)]
 mod ping_tree_router_loom_tests;

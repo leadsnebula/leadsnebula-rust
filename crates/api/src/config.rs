@@ -2,6 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use leadsnebula_core::cache::CacheService;
 use leadsnebula_core::redis::RedisClient;
 use leadsnebula_core::services::database::create_pool;
+use leadsnebula_core::services::write_behind_queue::WriteBehindQueue;
 use leadsnebula_core::ssm::SsmService;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub ssm: Arc<SsmService>,
     #[allow(dead_code)] // Used by routes for caching
     pub cache: Option<Arc<CacheService>>,
+    #[allow(dead_code)] // Used for batching background database writes
+    pub write_behind_queue: Arc<WriteBehindQueue>,
 }
 
 impl AppConfig {
@@ -488,12 +491,16 @@ impl AppState {
             ))
         });
 
+        // Create write-behind queue for batching background database writes
+        let write_behind_queue = Arc::new(WriteBehindQueue::new(db_pool.clone()));
+
         Ok(Self {
             config,
             db_pool,
             redis,
             ssm,
             cache,
+            write_behind_queue,
         })
     }
 }
