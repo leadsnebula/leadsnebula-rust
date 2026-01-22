@@ -118,7 +118,7 @@ async fn pre_warm_ping_trees(
 }
 
 /// Pre-warm SSM encryption keys
-async fn pre_warm_ssm_keys(
+pub async fn pre_warm_ssm_keys(
     ssm: &std::sync::Arc<leadsnebula_core::ssm::SsmService>,
     environment: &str,
 ) -> usize {
@@ -132,40 +132,53 @@ async fn pre_warm_ssm_keys(
         "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
         env_norm
     );
-    match ssm.get_parameter(&det_path, true).await {
+    let det_key_cached = match ssm.get_parameter(&det_path, true).await {
         Ok(Some(_)) => {
             warmed += 1;
+            true
         }
         Ok(None) => {
             warn!(
                 "SSM parameter not found (expected for warmup): {}",
                 det_path
             );
+            false
         }
         Err(e) => {
             warn!("Failed to pre-warm SSM key {}: {}", det_path, e);
+            false
         }
-    }
+    };
 
     // Pre-warm key derivation salt
     let salt_path = format!(
         "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
         env_norm
     );
-    match ssm.get_parameter(&salt_path, true).await {
+    let salt_key_cached = match ssm.get_parameter(&salt_path, true).await {
         Ok(Some(_)) => {
             warmed += 1;
+            true
         }
         Ok(None) => {
             warn!(
                 "SSM parameter not found (expected for warmup): {}",
                 salt_path
             );
+            false
         }
         Err(e) => {
             warn!("Failed to pre-warm SSM key {}: {}", salt_path, e);
+            false
         }
-    }
+    };
+
+    // Log cache status after pre-warm
+    info!(
+        "SSM pre-warm cache keys: det_key={}, salt={}",
+        if det_key_cached { "hit" } else { "miss" },
+        if salt_key_cached { "hit" } else { "miss" }
+    );
 
     warmed
 }

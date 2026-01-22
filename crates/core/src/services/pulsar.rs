@@ -381,6 +381,9 @@ impl PulsarService {
         promise_id: &str,
         qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
+        #[cfg(feature = "tracing")]
+        let total_start = std::time::Instant::now();
+
         let lead_id = lead
             .lead_id
             .clone()
@@ -389,11 +392,23 @@ impl PulsarService {
         // Inject chaos delay if enabled (sync version)
         inject_chaos_delay_sync();
 
+        #[cfg(feature = "tracing")]
+        let qual_start = std::time::Instant::now();
+
         // Evaluate qualification rules using qualification engine (already sync)
         let engine =
             QualificationEngine::new(lead.clone(), "post".to_string(), qualification_config);
         let qual_result: QualificationResult = engine.evaluate();
         let accepted = qual_result.accepted;
+
+        #[cfg(feature = "tracing")]
+        {
+            let qual_duration = qual_start.elapsed().as_millis() as u64;
+            tracing::debug!(
+                "route_post_direct_sync: qualification took {}ms",
+                qual_duration
+            );
+        }
 
         if !accepted {
             return Ok(BuyerResponse {
@@ -409,8 +424,22 @@ impl PulsarService {
             });
         }
 
+        #[cfg(feature = "tracing")]
+        let gen_start = std::time::Instant::now();
+
         // Generate post_id instantly
         let post_id = generate_post_id(&lead_id);
+
+        #[cfg(feature = "tracing")]
+        {
+            let gen_duration = gen_start.elapsed().as_millis() as u64;
+            let total_duration = total_start.elapsed().as_millis() as u64;
+            tracing::debug!(
+                "route_post_direct_sync: post_id generation took {}ms, total {}ms",
+                gen_duration,
+                total_duration
+            );
+        }
 
         // Return instantly with random price
         Ok(BuyerResponse {

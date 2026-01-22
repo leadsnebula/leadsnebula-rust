@@ -172,7 +172,7 @@ async fn create_lead(
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
     // Critical path timing: mark lead_received
-    #[cfg(all(feature = "tracing", debug_assertions))]
+    #[cfg(feature = "tracing")]
     let critical_path_start = std::time::Instant::now();
 
     // Initialize timing and metrics
@@ -442,74 +442,155 @@ async fn create_lead(
                 }));
             }
         };
-        let lead = match leadsnebula_core::models::lead::Lead::find_by_promise_id(
-            &state.db_pool,
-            &promise_id,
-        )
-        .await
-        {
-            Ok(Some(l)) => l,
-            Ok(None) => {
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: None,
-                        error: Some("Lead not found".to_string()),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: None,
-                        lead_uuid: None,
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": format!("ERR_{}", 404),
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 404
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(404),
-                }));
+        // CACHE: Lead lookup by promise_id (5m TTL - leads don't change after creation)
+        let lead_cache_key = format!("lead:promise_id:{}", promise_id);
+        let lead = if let Some(cache) = &state.cache {
+            match cache
+                .get_or_insert_with(&lead_cache_key, 300, || async {
+                    leadsnebula_core::models::lead::Lead::find_by_promise_id(
+                        &state.db_pool,
+                        &promise_id,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                })
+                .await
+            {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    return Ok(Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: None,
+                            error: Some("Lead not found".to_string()),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": format!("ERR_{}", 404),
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 404
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(404),
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!("Database error finding lead: {}", e);
+                    let (message, technical) = map_error_to_user(&e.to_string());
+                    return Ok(Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: Some(message),
+                            error: Some(technical),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": "ERR_500",
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 500
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(500),
+                    }));
+                }
             }
-            Err(e) => {
-                tracing::error!("Database error finding lead: {}", e);
-                let (message, technical) = map_error_to_user(&e.to_string());
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some(message),
-                        error: Some(technical),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: None,
-                        lead_uuid: None,
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": "ERR_500",
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 500
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(500),
-                }));
+        } else {
+            // Fallback if cache not available
+            match leadsnebula_core::models::lead::Lead::find_by_promise_id(
+                &state.db_pool,
+                &promise_id,
+            )
+            .await
+            {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    return Ok(Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: None,
+                            error: Some("Lead not found".to_string()),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": format!("ERR_{}", 404),
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 404
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(404),
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!("Database error finding lead: {}", e);
+                    let (message, technical) = map_error_to_user(&e.to_string());
+                    return Ok(Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: Some(message),
+                            error: Some(technical),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": "ERR_500",
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 500
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(500),
+                    }));
+                }
             }
         };
 
@@ -743,56 +824,54 @@ async fn create_lead(
                     }
                 }
 
-                // Insert into post_payloads
-                // Clone post_id once for both branches
-                let post_id_for_insert = routing_result.post_id.clone();
-                let _ = if let (Some(er), Some(epr)) = (enc_req_opt, enc_resp_opt) {
-                    sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, $5, now())")
-                        .bind(lead.uuid)
-                        .bind(&post_id_for_insert)
-                        .bind(sqlx::types::Json(&post_request_json))
-                        .bind(er)
-                        .bind(epr)
-                        .execute(&*state.db_pool)
-                        .await
-                } else {
-                    sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, created_at) VALUES ($1, $2, $3, now())")
-                        .bind(lead.uuid)
-                        .bind(&post_id_for_insert)
-                        .bind(sqlx::types::Json(&post_request_json))
-                        .execute(&*state.db_pool)
-                        .await
-                };
+                // Insert into post_payloads via write-behind queue (decoupled from critical path)
+                state.write_behind_queue.enqueue(
+                    leadsnebula_core::services::write_behind_queue::BackgroundTask::PayloadUpdate {
+                        lead_id: lead.uuid,
+                        payload_type: "post".to_string(),
+                        payload: post_request_json.clone(),
+                        post_id: routing_result.post_id.clone(),
+                        request_payload_encrypted: enc_req_opt.clone(),
+                        response_payload_encrypted: enc_resp_opt.clone(),
+                        ping_payloads_row_id: None,
+                        external_ping_id: None,
+                    },
+                );
 
                 // Encryption of buyer_responses moved to background job/cron - spawn overhead eliminated
                 // If encryption is needed, it should be handled by a separate background task or write-behind queue
 
-                // Update lead final state: if sold, set post_id and status sold; if not, clear in-progress placeholder
+                // Update lead final state via write-behind queue (decoupled from critical path)
                 if routing_result.success && routing_result.status == "sold" {
                     // Set final post_id and mark sold only if our in-progress token is still present
-                    let _ = sqlx::query(
-                        r#"
-                        UPDATE leads SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW() 
-                        WHERE uuid = $3 AND post_id = $4
-                        "#,
-                    )
-                    .bind(routing_result.post_id.clone())
-                    .bind(leadsnebula_core::models::enums::LeadStatus::Sold)
-                    .bind(lead.uuid)
-                    .bind(inprog_token.clone())
-                    .execute(&*state.db_pool)
-                    .await;
+                    state.write_behind_queue.enqueue(
+                        leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
+                            lead_id: lead.uuid,
+                            status: "sold".to_string(),
+                            campaign_id: routing_result.campaign_id,
+                            buyer_id: routing_result.buyer_id,
+                            promise_id: None,
+                            ping_id: None,
+                            post_id: routing_result.post_id.clone(),
+                            sold_at: true,
+                            inprog_token: Some(inprog_token.clone()),
+                        },
+                    );
                 } else {
                     // Reset placeholder so another post attempt may try
-                    let _ = sqlx::query(
-                        r#"
-                        UPDATE leads SET post_id = '' WHERE uuid = $1 AND post_id = $2
-                        "#,
-                    )
-                    .bind(lead.uuid)
-                    .bind(inprog_token.clone())
-                    .execute(&*state.db_pool)
-                    .await;
+                    state.write_behind_queue.enqueue(
+                        leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
+                            lead_id: lead.uuid,
+                            status: lead.status.to_string(),
+                            campaign_id: None,
+                            buyer_id: None,
+                            promise_id: None,
+                            ping_id: None,
+                            post_id: Some("".to_string()),
+                            sold_at: false,
+                            inprog_token: Some(inprog_token.clone()),
+                        },
+                    );
                 }
                 return Ok(Json(LeadResponse {
                     status: StatusNode {
@@ -1058,7 +1137,36 @@ async fn create_lead(
 
     // Extract results
     let (result, _prechecks_cache_hit) = prechecks_result;
-    let (det_key_result, salt_result) = ssm_results;
+    let (mut det_key_result, mut salt_result) = ssm_results;
+
+    // If SSM keys are missing, force pre-warm as fallback and retry once
+    if det_key_result.is_err()
+        || det_key_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.as_ref())
+            .is_none()
+        || salt_result.is_err()
+        || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none()
+    {
+        tracing::warn!("SSM keys missing, forcing immediate pre-warm as fallback...");
+        use crate::cache_warmup::pre_warm_ssm_keys;
+        let _ = pre_warm_ssm_keys(&state.ssm, &state.config.environment).await;
+
+        // Retry once after pre-warm
+        if det_key_result.is_err()
+            || det_key_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.as_ref())
+                .is_none()
+        {
+            det_key_result = get_ssm_parameter_cached(&state.ssm, &det_path, true).await;
+        }
+        if salt_result.is_err() || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none() {
+            salt_result = get_ssm_parameter_cached(&state.ssm, &salt_path, true).await;
+        }
+    }
 
     let prechecks_duration = prechecks_start.elapsed().as_millis() as u64;
     timing.record_pre_checks(prechecks_duration);
@@ -1620,31 +1728,75 @@ async fn create_lead(
             let verbose_json = if minimal_mode {
                 None // Skip verbose JSON in minimal mode
             } else if verbose_requested {
-                // Note: Using serde_json::json! for building, but simd_json is used for encryption serialization
-                // The final response serialization is handled by axum's Json extractor
-                let mut json_obj = serde_json::json!({
-                    "error_code": format!("ERR_{}", 200),
-                    "timestamp": Utc::now().to_rfc3339(),
-                    "endpoint": "POST /api/v1/leads",
-                    "status_code": 200,
-                    "routing": {
-                        "buyer_name": buyer_name,
-                        "buyer_id": routing_result.buyer_id.map(|b| b.to_string()),
-                        "campaign_name": campaign_name,
-                        "campaign_id": routing_result.campaign_id.map(|c| c.to_string())
-                    }
-                });
+                // Build JSON manually using serde_json::Value::Object to avoid macro overhead
+                // This is more efficient than serde_json::json! macro and allows simd_json serialization later
+                use serde_json::Map;
+
+                let mut routing_map = Map::new();
+                routing_map.insert(
+                    "buyer_name".to_string(),
+                    serde_json::Value::String(buyer_name.as_deref().unwrap_or("").to_string()),
+                );
+                if let Some(buyer_id) = routing_result.buyer_id {
+                    routing_map.insert(
+                        "buyer_id".to_string(),
+                        serde_json::Value::String(buyer_id.to_string()),
+                    );
+                } else {
+                    routing_map.insert("buyer_id".to_string(), serde_json::Value::Null);
+                }
+                routing_map.insert(
+                    "campaign_name".to_string(),
+                    serde_json::Value::String(campaign_name.as_deref().unwrap_or("").to_string()),
+                );
+                if let Some(campaign_id) = routing_result.campaign_id {
+                    routing_map.insert(
+                        "campaign_id".to_string(),
+                        serde_json::Value::String(campaign_id.to_string()),
+                    );
+                } else {
+                    routing_map.insert("campaign_id".to_string(), serde_json::Value::Null);
+                }
+
+                let mut json_obj_map = Map::new();
+                json_obj_map.insert(
+                    "error_code".to_string(),
+                    serde_json::Value::String(format!("ERR_{}", 200)),
+                );
+                json_obj_map.insert(
+                    "timestamp".to_string(),
+                    serde_json::Value::String(Utc::now().to_rfc3339()),
+                );
+                json_obj_map.insert(
+                    "endpoint".to_string(),
+                    serde_json::Value::String("POST /api/v1/leads".to_string()),
+                );
+                json_obj_map.insert(
+                    "status_code".to_string(),
+                    serde_json::Value::Number(200.into()),
+                );
+                json_obj_map.insert(
+                    "routing".to_string(),
+                    serde_json::Value::Object(routing_map),
+                );
+
                 // Add per_buyer_timings if available
                 if let Some(ref timings) = routing_result.per_buyer_timings {
-                    json_obj["per_buyer_timings"] = serde_json::Value::Array(timings.clone());
+                    json_obj_map.insert(
+                        "per_buyer_timings".to_string(),
+                        serde_json::Value::Array(timings.clone()),
+                    );
                 }
+
+                let json_obj = serde_json::Value::Object(json_obj_map);
+
                 Some(json_obj)
             } else {
                 None
             };
 
             // Update the ping_payloads row with the routing result as response_payload and external id
-            if let Some(row_id) = payload_row_id {
+            if payload_row_id.is_some() {
                 let response_json = serde_json::json!({
                     "routing_result": {
                         "status": routing_result.status,
@@ -1681,23 +1833,20 @@ async fn create_lead(
                     }
                 }
 
-                // Clone ping_id once for both branches
+                // Update ping_payloads via write-behind queue (decoupled from critical path)
                 let ping_id_for_update = routing_result.ping_id.clone();
-                if let Some(encrypted_response) = encrypted_response_opt {
-                    let _ = sqlx::query("UPDATE ping_payloads SET payload = COALESCE(payload, 'null'::jsonb), response_payload_encrypted = $1, external_ping_id = $2, updated_at = now() WHERE id = $3")
-                            .bind(encrypted_response)
-                            .bind(&ping_id_for_update)
-                            .bind(row_id)
-                            .execute(&*state.db_pool)
-                            .await;
-                } else {
-                    let _ = sqlx::query("UPDATE ping_payloads SET payload = COALESCE(payload, 'null'::jsonb), response_payload = $1, external_ping_id = $2, updated_at = now() WHERE id = $3")
-                            .bind(sqlx::types::Json(&response_json))
-                            .bind(&ping_id_for_update)
-                            .bind(row_id)
-                            .execute(&*state.db_pool)
-                            .await;
-                }
+                state.write_behind_queue.enqueue(
+                    leadsnebula_core::services::write_behind_queue::BackgroundTask::PayloadUpdate {
+                        lead_id: lead_uuid,
+                        payload_type: "ping".to_string(),
+                        payload: response_json.clone(),
+                        post_id: None,
+                        request_payload_encrypted: None,
+                        response_payload_encrypted: encrypted_response_opt.clone(),
+                        ping_payloads_row_id: Some(lead_uuid),
+                        external_ping_id: ping_id_for_update,
+                    },
+                );
 
                 // Encryption of buyer_responses moved to background job/cron - spawn overhead eliminated
                 // If encryption is needed, it should be handled by a separate background task or write-behind queue
@@ -1765,26 +1914,19 @@ async fn create_lead(
                     }
                 }
 
-                // Insert into post_payloads for fullpost
-                // Clone post_id once for both branches
-                let post_id_for_insert_fp = routing_result.post_id.clone();
-                let _ = if let (Some(er), Some(epr)) = (enc_req_opt_fp, enc_resp_opt_fp) {
-                    sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, $5, now())")
-                        .bind(lead_uuid)
-                        .bind(&post_id_for_insert_fp)
-                        .bind(sqlx::types::Json(&post_request_json))
-                        .bind(er)
-                        .bind(epr)
-                        .execute(&*state.db_pool)
-                        .await
-                } else {
-                    sqlx::query("INSERT INTO post_payloads (lead_id, post_id, payload, created_at) VALUES ($1, $2, $3, now())")
-                        .bind(lead_uuid)
-                        .bind(&post_id_for_insert_fp)
-                        .bind(sqlx::types::Json(&post_request_json))
-                        .execute(&*state.db_pool)
-                        .await
-                };
+                // Insert into post_payloads for fullpost via write-behind queue (decoupled from critical path)
+                state.write_behind_queue.enqueue(
+                    leadsnebula_core::services::write_behind_queue::BackgroundTask::PayloadUpdate {
+                        lead_id: lead_uuid,
+                        payload_type: "post".to_string(),
+                        payload: post_request_json.clone(),
+                        post_id: routing_result.post_id.clone(),
+                        request_payload_encrypted: enc_req_opt_fp.clone(),
+                        response_payload_encrypted: enc_resp_opt_fp.clone(),
+                        ping_payloads_row_id: None,
+                        external_ping_id: None,
+                    },
+                );
             }
 
             // Log diagnostic summary and timing before returning (non-blocking)
@@ -1792,10 +1934,10 @@ async fn create_lead(
             metrics_arc.log_summary("carina");
 
             // Critical path timing: mark post_response_parsed (response ready to return)
-            #[cfg(all(feature = "tracing", debug_assertions))]
+            #[cfg(feature = "tracing")]
             {
                 let critical_path_elapsed = critical_path_start.elapsed();
-                tracing::debug!(
+                tracing::info!(
                     lead_id = %lead_uuid,
                     critical_path_ms = critical_path_elapsed.as_millis() as u64,
                     "Non-DB critical path timing"

@@ -32,18 +32,50 @@ pub async fn api_key_auth_middleware(
 
     // Note: test_before_acquire is enabled in pool config to detect stale connections
     // This should prevent most "expected to read X bytes, got 0" errors from Neon
-    let publisher = match Publisher::find_by_api_key(&state.db_pool, &api_key).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            tracing::warn!("Invalid API key provided");
-            return StatusCode::UNAUTHORIZED.into_response();
+    // CACHE: Publisher lookup by API key (1h TTL - publishers rarely change)
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.trim().as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+    let cache_key = format!("publisher:api_key:{}", key_hash);
+
+    let publisher = if let Some(cache) = &state.cache {
+        match cache
+            .get_or_insert_with(&cache_key, 3600, || async {
+                Publisher::find_by_api_key(&state.db_pool, &api_key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+            })
+            .await
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::warn!("Invalid API key provided");
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Database error during API key lookup (after retries): {}",
+                    e
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
-        Err(e) => {
-            tracing::error!(
-                "Database error during API key lookup (after retries): {}",
-                e
-            );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    } else {
+        // Fallback if cache not available
+        match Publisher::find_by_api_key(&state.db_pool, &api_key).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::warn!("Invalid API key provided");
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Database error during API key lookup (after retries): {}",
+                    e
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
     };
 

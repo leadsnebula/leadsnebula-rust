@@ -137,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
 
         let (flame_layer, _guard) = FlameLayer::with_file("./traces.folded").unwrap();
 
+        // Note: For production, set RUST_LOG=warn in Fly.io environment to disable
+        // feature-gated tracing and eliminate logging overhead (zero tracing overhead in production).
+        // Keep RUST_LOG=debug or RUST_LOG=info for development/staging.
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| default_filter.into());
 

@@ -5,6 +5,9 @@ primary_region = "iad"
 
 [env]
   ENVIRONMENT = "production"
+  # Note: Set RUST_LOG=warn via `fly secrets set RUST_LOG=warn` for production
+  # to disable feature-gated tracing and eliminate logging overhead.
+  # Keep RUST_LOG=debug or RUST_LOG=info for development/staging.
 
 [http_service]
   internal_port = 8080

@@ -90,3 +90,15 @@ Before committing code, run the validation script to ensure CI will pass:
 - Docker images are built in GHA and pushed to GHCR
 - Fly.io deployments use pre-built images
 
+## Production Configuration
+
+### Logging
+
+For production deployments, set `RUST_LOG=warn` in the Fly.io environment to disable feature-gated tracing and eliminate logging overhead. This ensures zero tracing overhead in production builds.
+
+**Fly.io Configuration:**
+```bash
+fly secrets set RUST_LOG=warn
+```
+
+**Note**: Keep `RUST_LOG=debug` or `RUST_LOG=info` for development/staging environments to enable detailed logging and debugging.

@@ -571,6 +571,7 @@ impl QualificationEngine {
     }
 
     /// Evaluate purchase_timeframe rule
+    #[inline(always)]
     fn evaluate_purchase_timeframe(
         &self,
         _rule_config: Option<&serde_json::Map<String, Value>>,

@@ -1,3 +1,4 @@
+use crate::cache::CacheService;
 use crate::encryption::EncryptionService;
 use crate::models::{
     buyer::Buyer,
@@ -57,6 +58,8 @@ pub struct BuyerRouter {
     // Pre-loaded qualification config to avoid redundant DB lookups
     preloaded_qual_config:
         Option<crate::models::buyer_qualification_config::BuyerQualificationConfig>,
+    // Cache service for fallback DB lookups
+    cache: Option<Arc<CacheService>>,
 }
 
 impl BuyerRouter {
@@ -77,7 +80,14 @@ impl BuyerRouter {
             metrics: None,
             preloaded_integration: None,
             preloaded_qual_config: None,
+            cache: None,
         }
+    }
+
+    /// Create BuyerRouter with cache service (for fallback DB lookups)
+    pub fn with_cache(mut self, cache: Option<Arc<CacheService>>) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// Create BuyerRouter with pre-loaded integration data (optimizes DB lookups)
@@ -592,11 +602,23 @@ impl BuyerRouter {
             return Ok(integration.clone());
         }
 
-        // Fallback to DB lookup if not pre-loaded
+        // Fallback to DB lookup if not pre-loaded (CACHED - 1h TTL)
         // Look up buyer to get buyer_integration_id
-        let buyer = Buyer::find_by_id(&self.pool, campaign.buyer_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Buyer not found: {}", campaign.buyer_id))?;
+        let buyer_cache_key = format!("buyer:id:{}", campaign.buyer_id);
+        let buyer = if let Some(cache) = &self.cache {
+            cache
+                .get_or_insert_with(&buyer_cache_key, 3600, || async {
+                    Buyer::find_by_id(&self.pool, campaign.buyer_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                })
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Buyer not found: {}", campaign.buyer_id))?
+        } else {
+            Buyer::find_by_id(&self.pool, campaign.buyer_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Buyer not found: {}", campaign.buyer_id))?
+        };
 
         // Check if buyer is active
         if !buyer.active() {
@@ -611,10 +633,22 @@ impl BuyerRouter {
             .buyer_integration_id
             .ok_or_else(|| anyhow::anyhow!("Buyer has no integration configured"))?;
 
-        // Look up integration
-        let integration = BuyerIntegration::find_by_id(&self.pool, &integration_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Buyer integration not found: {}", integration_id))?;
+        // Look up integration (CACHED - 1h TTL)
+        let integration_cache_key = format!("buyer_integration:id:{}", integration_id);
+        let integration = if let Some(cache) = &self.cache {
+            cache
+                .get_or_insert_with(&integration_cache_key, 3600, || async {
+                    BuyerIntegration::find_by_id(&self.pool, &integration_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                })
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Buyer integration not found: {}", integration_id))?
+        } else {
+            BuyerIntegration::find_by_id(&self.pool, &integration_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Buyer integration not found: {}", integration_id))?
+        };
 
         Ok(integration)
     }

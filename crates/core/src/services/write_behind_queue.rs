@@ -29,6 +29,18 @@ type LeadUpdateTuple = (
     Option<String>,
     Option<String>,
     Option<String>,
+    bool,           // sold_at
+    Option<String>, // inprog_token
+);
+type PayloadUpdateTuple = (
+    Uuid,
+    String,
+    Value,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<uuid::Uuid>,
+    Option<String>,
 );
 
 /// Background tasks that can be batched
@@ -51,6 +63,8 @@ pub enum BackgroundTask {
         promise_id: Option<String>,
         ping_id: Option<String>,
         post_id: Option<String>,
+        sold_at: bool, // If true, set sold_at = NOW() when status = "sold"
+        inprog_token: Option<String>, // For conditional update (WHERE post_id = inprog_token)
     },
     /// Buyer response batch insert
     BuyerResponse {
@@ -66,6 +80,13 @@ pub enum BackgroundTask {
         lead_id: Uuid,
         payload_type: String, // "ping" or "post"
         payload: Value,
+        // For post_payloads INSERT:
+        post_id: Option<String>,
+        request_payload_encrypted: Option<String>,
+        response_payload_encrypted: Option<String>,
+        // For ping_payloads UPDATE:
+        ping_payloads_row_id: Option<uuid::Uuid>, // row id for ping_payloads UPDATE (actually lead_id, used to find the row)
+        external_ping_id: Option<String>,         // external_ping_id for ping_payloads UPDATE
     },
 }
 
@@ -193,6 +214,8 @@ impl WriteBehindQueue {
                     promise_id,
                     ping_id,
                     post_id,
+                    sold_at,
+                    inprog_token,
                 } => lead_updates.push((
                     lead_id,
                     status,
@@ -201,12 +224,28 @@ impl WriteBehindQueue {
                     promise_id,
                     ping_id,
                     post_id,
+                    sold_at,
+                    inprog_token,
                 )),
                 BackgroundTask::PayloadUpdate {
                     lead_id,
                     payload_type,
                     payload,
-                } => payload_updates.push((lead_id, payload_type, payload)),
+                    post_id,
+                    request_payload_encrypted,
+                    response_payload_encrypted,
+                    ping_payloads_row_id,
+                    external_ping_id,
+                } => payload_updates.push((
+                    lead_id,
+                    payload_type,
+                    payload,
+                    post_id,
+                    request_payload_encrypted,
+                    response_payload_encrypted,
+                    ping_payloads_row_id,
+                    external_ping_id,
+                )),
             }
         }
 
@@ -308,60 +347,165 @@ impl WriteBehindQueue {
         }
 
         // Update individually (can optimize later)
-        for (lead_id, status, campaign_id, buyer_id, promise_id, ping_id, post_id) in updates {
-            let _ = sqlx::query(
-                r#"
-                UPDATE leads
-                SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, updated_at = NOW()
-                WHERE uuid = $1
-                "#,
-            )
-            .bind(lead_id)
-            .bind(status)
-            .bind(campaign_id)
-            .bind(buyer_id)
-            .bind(promise_id)
-            .bind(ping_id)
-            .bind(post_id)
-            .execute(pool)
-            .await;
+        for (
+            lead_id,
+            status,
+            campaign_id,
+            buyer_id,
+            promise_id,
+            ping_id,
+            post_id,
+            sold_at,
+            inprog_token,
+        ) in updates
+        {
+            if *sold_at && status == "sold" {
+                // Update with sold_at and conditional post_id check
+                if let Some(token) = inprog_token {
+                    let _ = sqlx::query(
+                        r#"
+                        UPDATE leads
+                        SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW()
+                        WHERE uuid = $3 AND post_id = $4
+                        "#,
+                    )
+                    .bind(post_id)
+                    .bind(status)
+                    .bind(lead_id)
+                    .bind(token)
+                    .execute(pool)
+                    .await;
+                } else {
+                    let _ = sqlx::query(
+                        r#"
+                        UPDATE leads
+                        SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW()
+                        WHERE uuid = $3
+                        "#,
+                    )
+                    .bind(post_id)
+                    .bind(status)
+                    .bind(lead_id)
+                    .execute(pool)
+                    .await;
+                }
+            } else if let Some(token) = inprog_token {
+                // Reset placeholder (clear inprog_token)
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE leads SET post_id = '' WHERE uuid = $1 AND post_id = $2
+                    "#,
+                )
+                .bind(lead_id)
+                .bind(token)
+                .execute(pool)
+                .await;
+            } else {
+                // Standard update
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE leads
+                    SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, updated_at = NOW()
+                    WHERE uuid = $1
+                    "#,
+                )
+                .bind(lead_id)
+                .bind(status)
+                .bind(campaign_id)
+                .bind(buyer_id)
+                .bind(promise_id)
+                .bind(ping_id)
+                .bind(post_id)
+                .execute(pool)
+                .await;
+            }
         }
 
         Ok(())
     }
 
     /// Batch update payloads
-    async fn batch_update_payloads(updates: &[(Uuid, String, Value)], pool: &PgPool) -> Result<()> {
+    async fn batch_update_payloads(updates: &[PayloadUpdateTuple], pool: &PgPool) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
 
         // Update individually (can optimize later)
-        for (lead_id, payload_type, payload) in updates {
+        for (
+            lead_id,
+            payload_type,
+            payload,
+            post_id,
+            request_payload_encrypted,
+            response_payload_encrypted,
+            ping_payloads_row_id,
+            external_ping_id,
+        ) in updates
+        {
             if payload_type == "ping" {
-                let _ = sqlx::query(
-                    r#"
-                    UPDATE ping_payloads
-                    SET payload = $2, updated_at = NOW()
-                    WHERE lead_id = $1
-                    "#,
-                )
-                .bind(lead_id)
-                .bind(sqlx::types::Json(payload))
-                .execute(pool)
-                .await;
+                // Update ping_payloads with response_payload_encrypted and external_ping_id
+                // Note: ping_payloads_row_id is actually lead_id (used to find the row)
+                if let Some(_row_id) = ping_payloads_row_id {
+                    // Update by lead_id (more reliable than using row id)
+                    let _ = sqlx::query(
+                        r#"
+                        UPDATE ping_payloads
+                        SET payload = COALESCE(payload, 'null'::jsonb), response_payload_encrypted = $1, external_ping_id = $2, updated_at = now()
+                        WHERE lead_id = $3
+                        "#,
+                    )
+                    .bind(response_payload_encrypted)
+                    .bind(external_ping_id)
+                    .bind(lead_id)
+                    .execute(pool)
+                    .await;
+                } else {
+                    // Fallback: update by lead_id
+                    let _ = sqlx::query(
+                        r#"
+                        UPDATE ping_payloads
+                        SET payload = $2, response_payload_encrypted = $3, external_ping_id = $4, updated_at = NOW()
+                        WHERE lead_id = $1
+                        "#,
+                    )
+                    .bind(lead_id)
+                    .bind(sqlx::types::Json(payload))
+                    .bind(response_payload_encrypted)
+                    .bind(external_ping_id)
+                    .execute(pool)
+                    .await;
+                }
             } else if payload_type == "post" {
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO post_payloads (lead_id, payload, created_at)
-                    VALUES ($1, $2, NOW())
-                    ON CONFLICT (lead_id) DO UPDATE SET payload = $2, updated_at = NOW()
-                    "#,
-                )
-                .bind(lead_id)
-                .bind(sqlx::types::Json(payload))
-                .execute(pool)
-                .await;
+                // Insert into post_payloads with all fields
+                if let (Some(er), Some(epr)) =
+                    (request_payload_encrypted, response_payload_encrypted)
+                {
+                    let _ = sqlx::query(
+                        r#"
+                        INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at)
+                        VALUES ($1, $2, $3, $4, $5, now())
+                        "#,
+                    )
+                    .bind(lead_id)
+                    .bind(post_id)
+                    .bind(sqlx::types::Json(payload))
+                    .bind(er)
+                    .bind(epr)
+                    .execute(pool)
+                    .await;
+                } else {
+                    let _ = sqlx::query(
+                        r#"
+                        INSERT INTO post_payloads (lead_id, post_id, payload, created_at)
+                        VALUES ($1, $2, $3, now())
+                        "#,
+                    )
+                    .bind(lead_id)
+                    .bind(post_id)
+                    .bind(sqlx::types::Json(payload))
+                    .execute(pool)
+                    .await;
+                }
             }
         }
 

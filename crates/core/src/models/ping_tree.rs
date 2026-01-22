@@ -82,7 +82,7 @@ impl PingTree {
         ping_tree_id: &Uuid,
     ) -> Result<Vec<crate::models::ping_tree_publisher::PingTreePublisher>, sqlx::Error> {
         crate::models::ping_tree_publisher::PingTreePublisher::find_by_ping_tree(pool, ping_tree_id)
-            .await
+        .await
     }
 
     pub async fn find_by_id(pool: &sqlx::PgPool, id: &Uuid) -> Result<Option<Self>, sqlx::Error> {
