@@ -762,19 +762,83 @@ async fn create_lead(
                 // Persist post payload (request + response) into post_payloads with encryption when possible
                 let post_request_json =
                     serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
-                let post_response_json = serde_json::json!({
-                    "routing_result": {
-                        "status": routing_result.status,
-                        "success": routing_result.success,
-                        "error": routing_result.error,
-                        "price": routing_result.price,
-                        "buyer_id": routing_result.buyer_id.map(|b| b.to_string()),
-                        "campaign_id": routing_result.campaign_id.map(|c| c.to_string()),
-                        "ping_id": routing_result.ping_id,
-                        "post_id": routing_result.post_id,
-                        "promise_id": routing_result.promise_id,
-                    }
-                });
+                // Build JSON manually using serde_json::Value::Object to avoid macro overhead
+                // This is more efficient than serde_json::json! macro
+                use serde_json::Map;
+                let mut routing_result_map = Map::new();
+                routing_result_map.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(routing_result.status.clone()),
+                );
+                routing_result_map.insert(
+                    "success".to_string(),
+                    serde_json::Value::Bool(routing_result.success),
+                );
+                if let Some(ref error) = routing_result.error {
+                    routing_result_map.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(error.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("error".to_string(), serde_json::Value::Null);
+                }
+                if let Some(price) = routing_result.price {
+                    routing_result_map.insert(
+                        "price".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(price)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
+                } else {
+                    routing_result_map.insert("price".to_string(), serde_json::Value::Null);
+                }
+                if let Some(buyer_id) = routing_result.buyer_id {
+                    routing_result_map.insert(
+                        "buyer_id".to_string(),
+                        serde_json::Value::String(buyer_id.to_string()),
+                    );
+                } else {
+                    routing_result_map.insert("buyer_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(campaign_id) = routing_result.campaign_id {
+                    routing_result_map.insert(
+                        "campaign_id".to_string(),
+                        serde_json::Value::String(campaign_id.to_string()),
+                    );
+                } else {
+                    routing_result_map.insert("campaign_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref ping_id) = routing_result.ping_id {
+                    routing_result_map.insert(
+                        "ping_id".to_string(),
+                        serde_json::Value::String(ping_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("ping_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref post_id) = routing_result.post_id {
+                    routing_result_map.insert(
+                        "post_id".to_string(),
+                        serde_json::Value::String(post_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("post_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref promise_id) = routing_result.promise_id {
+                    routing_result_map.insert(
+                        "promise_id".to_string(),
+                        serde_json::Value::String(promise_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("promise_id".to_string(), serde_json::Value::Null);
+                }
+                let mut post_response_json_map = Map::new();
+                post_response_json_map.insert(
+                    "routing_result".to_string(),
+                    serde_json::Value::Object(routing_result_map),
+                );
+                let post_response_json = serde_json::Value::Object(post_response_json_map);
 
                 // Try to encrypt using SSM deterministic key
                 let env_norm2 =
@@ -1849,19 +1913,83 @@ async fn create_lead(
 
             // Update the ping_payloads row with the routing result as response_payload and external id
             if payload_row_id.is_some() {
-                let response_json = serde_json::json!({
-                    "routing_result": {
-                        "status": routing_result.status,
-                        "success": routing_result.success,
-                        "error": routing_result.error,
-                        "price": routing_result.price,
-                        "buyer_id": routing_result.buyer_id.map(|b| b.to_string()),
-                        "campaign_id": routing_result.campaign_id.map(|c| c.to_string()),
-                        "ping_id": routing_result.ping_id,
-                        "post_id": routing_result.post_id,
-                        "promise_id": routing_result.promise_id,
-                    }
-                });
+                // Build JSON manually using serde_json::Value::Object to avoid macro overhead
+                // This is more efficient than serde_json::json! macro
+                use serde_json::Map;
+                let mut routing_result_map = Map::new();
+                routing_result_map.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(routing_result.status.clone()),
+                );
+                routing_result_map.insert(
+                    "success".to_string(),
+                    serde_json::Value::Bool(routing_result.success),
+                );
+                if let Some(ref error) = routing_result.error {
+                    routing_result_map.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(error.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("error".to_string(), serde_json::Value::Null);
+                }
+                if let Some(price) = routing_result.price {
+                    routing_result_map.insert(
+                        "price".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(price)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
+                } else {
+                    routing_result_map.insert("price".to_string(), serde_json::Value::Null);
+                }
+                if let Some(buyer_id) = routing_result.buyer_id {
+                    routing_result_map.insert(
+                        "buyer_id".to_string(),
+                        serde_json::Value::String(buyer_id.to_string()),
+                    );
+                } else {
+                    routing_result_map.insert("buyer_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(campaign_id) = routing_result.campaign_id {
+                    routing_result_map.insert(
+                        "campaign_id".to_string(),
+                        serde_json::Value::String(campaign_id.to_string()),
+                    );
+                } else {
+                    routing_result_map.insert("campaign_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref ping_id) = routing_result.ping_id {
+                    routing_result_map.insert(
+                        "ping_id".to_string(),
+                        serde_json::Value::String(ping_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("ping_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref post_id) = routing_result.post_id {
+                    routing_result_map.insert(
+                        "post_id".to_string(),
+                        serde_json::Value::String(post_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("post_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref promise_id) = routing_result.promise_id {
+                    routing_result_map.insert(
+                        "promise_id".to_string(),
+                        serde_json::Value::String(promise_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("promise_id".to_string(), serde_json::Value::Null);
+                }
+                let mut response_json_map = Map::new();
+                response_json_map.insert(
+                    "routing_result".to_string(),
+                    serde_json::Value::Object(routing_result_map),
+                );
+                let response_json = serde_json::Value::Object(response_json_map);
 
                 // Try to encrypt the response as well
                 let mut encrypted_response_opt: Option<String> = None;
