@@ -7,7 +7,7 @@ use crate::services::auction_timing::AtomicAuctionTiming;
 use crate::services::buyer_router::BuyerResponse;
 use crate::services::diagnostic_metrics::DiagnosticMetrics;
 use anyhow::Result;
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use hex;
 use rand;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,13 @@ type BuyerResponseRow = (
     Option<Uuid>,
     Uuid,
     serde_json::Value,
+);
+
+// Type alias for ping task results to reduce complexity
+type PingTaskResult = (
+    Result<Result<BuyerResponse, anyhow::Error>, anyhow::Error>,
+    Uuid,
+    u64,
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,7 +466,6 @@ impl PingTreeRouter {
         metrics: Arc<DiagnosticMetrics>,
     ) -> Result<RoutingResult> {
         use crate::services::buyer_router::BuyerRouter;
-        use futures::future::join_all;
         use tokio::time::{timeout, Duration};
         const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
 
@@ -526,9 +532,16 @@ impl PingTreeRouter {
             task_futures.push(task_future);
         }
 
-        // Wait for all responses concurrently (instead of sequentially)
+        // Wait for all responses concurrently using FuturesUnordered for better parallelism
         let ping_auction_start = std::time::Instant::now();
-        let task_results = join_all(task_futures).await;
+        let mut futures_unordered = FuturesUnordered::new();
+        for task_future in task_futures {
+            futures_unordered.push(task_future);
+        }
+        let mut task_results: Vec<PingTaskResult> = Vec::new();
+        while let Some(result) = futures_unordered.next().await {
+            task_results.push(result);
+        }
         let ping_auction_duration = ping_auction_start.elapsed().as_millis() as u64;
         metrics.record_ping_auction(ping_auction_duration); // Track ping auction duration
         metrics.record_stage_timing("ping_auction", ping_auction_duration);
@@ -1269,8 +1282,15 @@ impl PingTreeRouter {
                 });
             }
 
-            // Use join_all instead of spawn + join (eliminates spawn overhead while maintaining parallelism)
-            let results = join_all(futures).await;
+            // Use FuturesUnordered for true concurrent handling (better than join_all for parallelism)
+            let mut futures_unordered = FuturesUnordered::new();
+            for future in futures {
+                futures_unordered.push(future);
+            }
+            let mut results = Vec::new();
+            while let Some(result) = futures_unordered.next().await {
+                results.push(result);
+            }
 
             // Collect responses
             let mut responses: Vec<(

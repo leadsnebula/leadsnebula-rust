@@ -304,15 +304,35 @@ async fn main() -> anyhow::Result<()> {
 
                 #[cfg(feature = "tracing")]
                 tracing::info!("Shutdown signal received, flushing write-behind queue...");
-                // Flush with timeout (flush() has internal 5s timeout)
-                match write_behind_queue_for_shutdown.flush().await {
-                    Ok(_) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::info!("Write-behind queue flushed successfully");
-                    }
-                    Err(_e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Write-behind queue flush failed: {}", _e);
+                // Flush with retry logic (3 attempts) to ensure no data loss on shutdown
+                let mut _flush_success = false;
+                for attempt in 1..=3 {
+                    match write_behind_queue_for_shutdown.flush().await {
+                        Ok(_) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::info!(
+                                "Write-behind queue flushed successfully on attempt {}",
+                                attempt
+                            );
+                            _flush_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                "Write-behind queue flush failed on attempt {}: {}",
+                                attempt,
+                                e
+                            );
+                            if attempt < 3 {
+                                // Wait 1 second before retry
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            } else {
+                                // Final attempt failed - log error for monitoring
+                                #[cfg(feature = "tracing")]
+                                tracing::error!("Write-behind queue flush failed after 3 attempts - potential data loss");
+                            }
+                        }
                     }
                 }
 

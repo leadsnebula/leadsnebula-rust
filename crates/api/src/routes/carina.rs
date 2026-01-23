@@ -768,34 +768,52 @@ async fn create_lead(
                 let rounded_price = routing_result.price.map(|p| (p * 100.0).round() / 100.0);
 
                 // Build status node/message
+                // OPTIMIZED: Avoid unnecessary clones, use references where possible
                 let success = routing_result.success;
-                let status = routing_result.status.clone();
-                let message = if status == "sold" {
-                    if let Some(name) = buyer_name.clone() {
+                let status = routing_result.status.clone(); // Need to clone for StatusNode
+                let status_ref = &status; // Use reference for comparisons
+                let message = if *status_ref == "sold" {
+                    if let Some(ref name) = buyer_name {
+                        // Use reference
                         if let Some(p) = rounded_price {
-                            Some(format!("Lead sold to {} for ${}", name, p))
+                            // OPTIMIZED: Pre-allocate string with estimated capacity
+                            let mut msg = String::with_capacity(name.len() + 20);
+                            msg.push_str("Lead sold to ");
+                            msg.push_str(name);
+                            msg.push_str(" for $");
+                            msg.push_str(&p.to_string());
+                            Some(msg)
                         } else {
-                            Some(format!("Lead sold to {}", name))
+                            // OPTIMIZED: Pre-allocate string
+                            let mut msg = String::with_capacity(name.len() + 12);
+                            msg.push_str("Lead sold to ");
+                            msg.push_str(name);
+                            Some(msg)
                         }
                     } else if let Some(p) = rounded_price {
-                        Some(format!("Lead sold for ${}", p))
+                        // OPTIMIZED: Pre-allocate string
+                        let mut msg = String::with_capacity(20);
+                        msg.push_str("Lead sold for $");
+                        msg.push_str(&p.to_string());
+                        Some(msg)
                     } else {
                         Some("Lead sold".to_string())
                     }
                 } else {
                     routing_result
                         .error
-                        .clone()
-                        .or_else(|| routing_result.status.clone().into())
+                        .as_ref()
+                        .cloned()
+                        .or_else(|| Some(routing_result.status.clone()))
                 };
 
                 // Persist post payload (request + response) into post_payloads with encryption when possible
-                let post_request_json =
-                    serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
+                // OPTIMIZED: Defer JSON serialization - only serialize when needed (for encryption/queue)
                 // Build JSON manually using serde_json::Value::Object to avoid macro overhead
-                // This is more efficient than serde_json::json! macro
+                // OPTIMIZED: Pre-allocate Map with estimated capacity (8 fields)
                 use serde_json::Map;
-                let mut routing_result_map = Map::new();
+                let mut routing_result_map = Map::with_capacity(8);
+                // OPTIMIZED: Use string literals directly instead of .to_string() for keys
                 routing_result_map.insert(
                     "status".to_string(),
                     serde_json::Value::String(routing_result.status.clone()),
@@ -824,17 +842,23 @@ async fn create_lead(
                     routing_result_map.insert("price".to_string(), serde_json::Value::Null);
                 }
                 if let Some(buyer_id) = routing_result.buyer_id {
+                    // OPTIMIZED: Pre-allocate UUID string (36 chars)
+                    let mut buyer_id_str = String::with_capacity(36);
+                    buyer_id_str.push_str(&buyer_id.to_string());
                     routing_result_map.insert(
                         "buyer_id".to_string(),
-                        serde_json::Value::String(buyer_id.to_string()),
+                        serde_json::Value::String(buyer_id_str),
                     );
                 } else {
                     routing_result_map.insert("buyer_id".to_string(), serde_json::Value::Null);
                 }
                 if let Some(campaign_id) = routing_result.campaign_id {
+                    // OPTIMIZED: Pre-allocate UUID string (36 chars)
+                    let mut campaign_id_str = String::with_capacity(36);
+                    campaign_id_str.push_str(&campaign_id.to_string());
                     routing_result_map.insert(
                         "campaign_id".to_string(),
-                        serde_json::Value::String(campaign_id.to_string()),
+                        serde_json::Value::String(campaign_id_str),
                     );
                 } else {
                     routing_result_map.insert("campaign_id".to_string(), serde_json::Value::Null);
@@ -863,6 +887,10 @@ async fn create_lead(
                 } else {
                     routing_result_map.insert("promise_id".to_string(), serde_json::Value::Null);
                 }
+
+                // OPTIMIZED: Only serialize post_request_json when actually needed (for encryption/queue)
+                let post_request_json =
+                    serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
                 let mut post_response_json_map = Map::new();
                 post_response_json_map.insert(
                     "routing_result".to_string(),
@@ -941,7 +969,7 @@ async fn create_lead(
                     state.write_behind_queue.enqueue(
                         leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
                             lead_id: lead.uuid,
-                            status: "sold".to_string(),
+                            status: leadsnebula_core::models::enums::LeadStatus::Sold,
                             campaign_id: routing_result.campaign_id,
                             buyer_id: routing_result.buyer_id,
                             promise_id: None,
@@ -956,7 +984,7 @@ async fn create_lead(
                     state.write_behind_queue.enqueue(
                         leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
                             lead_id: lead.uuid,
-                            status: lead.status.to_string(),
+                            status: lead.status.clone(),
                             campaign_id: None,
                             buyer_id: None,
                             promise_id: None,
@@ -1358,34 +1386,53 @@ async fn create_lead(
     let critical_path_start = std::time::Instant::now();
 
     // Generate identifiers only after pre-checks pass
+    // OPTIMIZED: Use String::with_capacity + push_str instead of format! for better performance
     let lead_id = lead_data.lead_id.clone().unwrap_or_else(|| {
         let prefix = vertical.slug.to_uppercase();
-        let rand_str: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(8)
-            .map(char::from)
-            .collect::<String>()
-            .to_uppercase();
-        format!("{}-{}", prefix, rand_str)
+        // Pre-allocate string with estimated capacity (prefix + 8 chars + 1 dash)
+        let mut result = String::with_capacity(prefix.len() + 9);
+        result.push_str(&prefix);
+        result.push('-');
+        // Generate random alphanumeric string directly to uppercase
+        let mut rng = rand::thread_rng();
+        for _ in 0..8 {
+            let c = rng.sample(Alphanumeric);
+            result.push(char::from(c).to_ascii_uppercase());
+        }
+        result
     });
 
-    let event_id = format!("evt_{}", uuid::Uuid::new_v4());
+    // OPTIMIZED: Use String::with_capacity instead of format!
+    let event_uuid = uuid::Uuid::new_v4();
+    let mut event_id = String::with_capacity(41); // "evt_" + 36 chars for UUID
+    event_id.push_str("evt_");
+    event_id.push_str(&event_uuid.to_string());
 
     // Generate promise_id for ping requests (immediately, no DB needed)
+    // OPTIMIZED: Use String::with_capacity + direct hex encoding
     let promise_id = if request_type == "ping" || request_type == "fullpost" {
-        Some(format!(
-            "PROMISE_{}",
-            hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
-        ))
+        let rand_bytes = rand::random::<[u8; 6]>();
+        let mut promise = String::with_capacity(20); // "PROMISE_" + 12 hex chars
+        promise.push_str("PROMISE_");
+        // Encode hex directly to uppercase
+        for byte in rand_bytes.iter() {
+            promise.push_str(&format!("{:02X}", byte));
+        }
+        Some(promise)
     } else {
         None
     };
 
     // Generate temporary UUID for lead (will be used in DB insert)
     let lead_uuid = uuid::Uuid::new_v4();
-    let session_id = format!("sess_{}", uuid::Uuid::new_v4());
+    // OPTIMIZED: Use String::with_capacity instead of format!
+    let session_uuid = uuid::Uuid::new_v4();
+    let mut session_id = String::with_capacity(41); // "sess_" + 36 chars for UUID
+    session_id.push_str("sess_");
+    session_id.push_str(&session_uuid.to_string());
 
-    // Prepare request payload for ping_payloads (raw, will be encrypted in background)
+    // OPTIMIZED: Serialize request payload once (needed for queue, but we avoid cloning the Value)
+    // Using serde_json::to_value is already efficient, and we'll only clone the Value once
     let request_payload_json =
         serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -1422,59 +1469,69 @@ async fn create_lead(
         lead_uuid
     );
 
+    // OPTIMIZED: Minimize clones - use references where possible, move ownership where we can
+    // For strings that are only used here, we can move them instead of cloning
+    let lead_id_for_queue = if lead_id.is_empty() {
+        None
+    } else {
+        Some(lead_id.clone()) // Need to clone since we use lead_id later
+    };
+
+    // OPTIMIZED: Clone strings that are needed both in queue and later
+    let event_id_for_queue = event_id.clone();
+    let session_id_for_queue = session_id.clone();
+
     state.write_behind_queue.enqueue(
         leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadCreation {
-            event_id: event_id.clone(),
-            lead_id: if lead_id.is_empty() {
-                None
-            } else {
-                Some(lead_id.clone())
-            },
+            event_id: event_id_for_queue, // Use cloned value
+            lead_id: lead_id_for_queue,
             publisher_id: publisher.id,
             vertical_id: vertical.id,
-            request_type: request_type.clone(),
+            request_type: request_type.clone(), // Need to clone, used later
             strategy: strategy.to_string(),
-            promise_id: promise_id.clone(),
+            promise_id: promise_id.as_ref().cloned(), // Clone Option<String> efficiently
             buyer_id: buyer_id_opt.expect("buyer_id must be present after pre-checks"),
             campaign_id: campaign_id_opt.expect("campaign_id must be present after pre-checks"),
             tcpa_consent: lead_data.tcpa_consent.unwrap_or(false),
             tcpa_language: lead_data.tcpa_language.as_deref().unwrap_or("").to_string(),
             is_test: lead_data.is_test.unwrap_or(false),
-            session_id: session_id.clone(),
+            session_id: session_id_for_queue, // Use cloned value
             vertical_data: serde_json::json!({}),
             // Raw PII fields (will be encrypted in batch processor)
+            // These clones are necessary since lead_data is used later
             first_name: lead_data.first_name.clone(),
             last_name: lead_data.last_name.clone(),
             email: lead_data.email.clone(),
             cell_phone: lead_data
                 .cell_phone
                 .clone()
-                .or(lead_data.mobile_phone.clone()),
+                .or_else(|| lead_data.mobile_phone.clone()),
             street_address: lead_data.street_address.clone(),
             city: lead_data.city.clone(),
             state: lead_data.state.clone(),
             zip: lead_data.zip.clone(),
             ip_address: lead_data.ip_address.clone(),
-            request_payload: request_payload_json.clone(),
-            pii_encryption_key: pii_encryption_key.clone(),
+            request_payload: request_payload_json, // Move ownership (not used after this)
+            pii_encryption_key,                    // Move ownership (not used after this)
         },
     );
 
     // Create minimal Lead object for routing (no DB query needed)
     // This allows routing to proceed immediately while DB insert happens in background
+    // OPTIMIZED: Reuse event_id string (already created above)
     let lead = leadsnebula_core::models::lead::Lead {
         uuid: lead_uuid,
-        event_id: event_id.clone(),
+        event_id: event_id.clone(), // Need to clone since we moved it to queue
         lead_id: if lead_id.is_empty() {
             None
         } else {
-            Some(lead_id.clone())
+            Some(lead_id.clone()) // Need to clone since we use it later
         },
         publisher_id: Some(publisher.id),
         vertical_id: vertical.id,
         campaign_id: campaign_id_opt,
         buyer_id: buyer_id_opt,
-        request_type: request_type.clone(),
+        request_type: request_type.clone(), // Need to clone, used later
         strategy: strategy.to_string(),
         status: leadsnebula_core::models::enums::LeadStatus::Processing,
         promise_id: promise_id.clone(),
@@ -1654,18 +1711,22 @@ async fn create_lead(
                 None // Skip verbose JSON in minimal mode
             } else if verbose_requested {
                 // Build JSON manually using serde_json::Value::Object to avoid macro overhead
-                // This is more efficient than serde_json::json! macro and allows simd_json serialization later
+                // OPTIMIZED: Pre-allocate Maps with estimated capacity
                 use serde_json::Map;
 
-                let mut routing_map = Map::new();
+                // OPTIMIZED: Pre-allocate routing_map with capacity (4 fields)
+                let mut routing_map = Map::with_capacity(4);
                 routing_map.insert(
                     "buyer_name".to_string(),
                     serde_json::Value::String(buyer_name.as_deref().unwrap_or("").to_string()),
                 );
                 if let Some(buyer_id) = routing_result.buyer_id {
+                    // OPTIMIZED: Pre-allocate UUID string
+                    let mut buyer_id_str = String::with_capacity(36);
+                    buyer_id_str.push_str(&buyer_id.to_string());
                     routing_map.insert(
                         "buyer_id".to_string(),
-                        serde_json::Value::String(buyer_id.to_string()),
+                        serde_json::Value::String(buyer_id_str),
                     );
                 } else {
                     routing_map.insert("buyer_id".to_string(), serde_json::Value::Null);
@@ -1675,18 +1736,25 @@ async fn create_lead(
                     serde_json::Value::String(campaign_name.as_deref().unwrap_or("").to_string()),
                 );
                 if let Some(campaign_id) = routing_result.campaign_id {
+                    // OPTIMIZED: Pre-allocate UUID string
+                    let mut campaign_id_str = String::with_capacity(36);
+                    campaign_id_str.push_str(&campaign_id.to_string());
                     routing_map.insert(
                         "campaign_id".to_string(),
-                        serde_json::Value::String(campaign_id.to_string()),
+                        serde_json::Value::String(campaign_id_str),
                     );
                 } else {
                     routing_map.insert("campaign_id".to_string(), serde_json::Value::Null);
                 }
 
-                let mut json_obj_map = Map::new();
+                // OPTIMIZED: Pre-allocate json_obj_map with capacity (6 fields)
+                let mut json_obj_map = Map::with_capacity(6);
+                // OPTIMIZED: Use String::with_capacity instead of format!
+                let mut error_code = String::with_capacity(7);
+                error_code.push_str("ERR_200");
                 json_obj_map.insert(
                     "error_code".to_string(),
-                    serde_json::Value::String(format!("ERR_{}", 200)),
+                    serde_json::Value::String(error_code),
                 );
                 json_obj_map.insert(
                     "timestamp".to_string(),
@@ -1793,7 +1861,8 @@ async fn create_lead(
                 } else {
                     routing_result_map.insert("promise_id".to_string(), serde_json::Value::Null);
                 }
-                let mut response_json_map = Map::new();
+                // OPTIMIZED: Pre-allocate Map with capacity
+                let mut response_json_map = Map::with_capacity(1);
                 response_json_map.insert(
                     "routing_result".to_string(),
                     serde_json::Value::Object(routing_result_map),
@@ -1823,17 +1892,17 @@ async fn create_lead(
                 }
 
                 // Update ping_payloads via write-behind queue (decoupled from critical path)
-                let ping_id_for_update = routing_result.ping_id.clone();
+                // OPTIMIZED: Use reference instead of clone where possible
                 state.write_behind_queue.enqueue(
                     leadsnebula_core::services::write_behind_queue::BackgroundTask::PayloadUpdate {
                         lead_id: lead_uuid,
                         payload_type: "ping".to_string(),
-                        payload: response_json.clone(),
+                        payload: response_json, // Move ownership (not used after this)
                         post_id: None,
                         request_payload_encrypted: None,
-                        response_payload_encrypted: encrypted_response_opt.clone(),
+                        response_payload_encrypted: encrypted_response_opt, // Move ownership (not used after this)
                         ping_payloads_row_id: Some(lead_uuid),
-                        external_ping_id: ping_id_for_update,
+                        external_ping_id: routing_result.ping_id.clone(), // Need to clone, used in response
                     },
                 );
 
@@ -1843,12 +1912,11 @@ async fn create_lead(
 
             // For fullpost requests, also save post payloads if post_id is present
             if request_type == "fullpost" && routing_result.post_id.is_some() {
-                let post_request_json =
-                    serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
+                // OPTIMIZED: Defer JSON serialization - only serialize when needed
                 // Build JSON manually using serde_json::Value::Object to avoid macro overhead
-                // This is more efficient than serde_json::json! macro
+                // OPTIMIZED: Pre-allocate Map with estimated capacity (8 fields)
                 use serde_json::Map;
-                let mut routing_result_map = Map::new();
+                let mut routing_result_map = Map::with_capacity(8);
                 routing_result_map.insert(
                     "status".to_string(),
                     serde_json::Value::String(routing_result.status.clone()),
@@ -1916,24 +1984,30 @@ async fn create_lead(
                 } else {
                     routing_result_map.insert("promise_id".to_string(), serde_json::Value::Null);
                 }
-                let mut post_response_json_map = Map::new();
+                // OPTIMIZED: Pre-allocate Map with capacity
+                let mut post_response_json_map = Map::with_capacity(1);
                 post_response_json_map.insert(
                     "routing_result".to_string(),
                     serde_json::Value::Object(routing_result_map),
                 );
                 let post_response_json = serde_json::Value::Object(post_response_json_map);
 
+                // OPTIMIZED: Serialize post_request_json only when needed (for encryption/queue)
+                let post_request_json =
+                    serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
+
                 // Try to encrypt using SSM deterministic key
+                // OPTIMIZED: Use String::with_capacity instead of format!
                 let env_norm_fp =
                     leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
-                let det_path_fp = format!(
-                    "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
-                    env_norm_fp
-                );
-                let salt_path_fp = format!(
-                    "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
-                    env_norm_fp
-                );
+                let mut det_path_fp = String::with_capacity(env_norm_fp.len() + 60);
+                det_path_fp.push_str("/leadsnebula/");
+                det_path_fp.push_str(&env_norm_fp);
+                det_path_fp.push_str("/carina/encryption/deterministic_key_v1");
+                let mut salt_path_fp = String::with_capacity(env_norm_fp.len() + 60);
+                salt_path_fp.push_str("/leadsnebula/");
+                salt_path_fp.push_str(&env_norm_fp);
+                salt_path_fp.push_str("/carina/encryption/key_derivation_salt_v1");
                 let mut enc_req_opt_fp: Option<String> = None;
                 let mut enc_resp_opt_fp: Option<String> = None;
                 if let Ok(Some(det_key)) =

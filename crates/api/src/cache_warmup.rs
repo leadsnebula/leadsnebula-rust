@@ -202,7 +202,7 @@ async fn pre_warm_buyer_names(
     let mut warmed = 0;
 
     match sqlx::query(
-        "SELECT id, name FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200",
+        "SELECT id, name FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 500",
     )
     .fetch_all(pool)
     .await
@@ -236,7 +236,7 @@ async fn pre_warm_campaign_names(
     let mut warmed = 0;
 
     match sqlx::query(
-        "SELECT id, name FROM campaigns WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200"
+        "SELECT id, name FROM campaigns WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 500"
     )
     .fetch_all(pool)
     .await
@@ -272,7 +272,7 @@ async fn pre_warm_buyer_integrations(
     let mut warmed = 0;
 
     match sqlx::query(
-        "SELECT id FROM buyer_integrations WHERE status = 'available' ORDER BY created_at DESC LIMIT 200"
+        "SELECT id FROM buyer_integrations WHERE status = 'available' ORDER BY created_at DESC LIMIT 500"
     )
     .fetch_all(pool)
     .await
@@ -311,7 +311,7 @@ async fn pre_warm_qualification_configs(
 
     // Get list of buyer_ids with active qualification configs
     match sqlx::query(
-        "SELECT DISTINCT buyer_id FROM buyer_qualification_configs WHERE enabled = true AND is_active = true LIMIT 200"
+        "SELECT DISTINCT buyer_id FROM buyer_qualification_configs WHERE enabled = true AND is_active = true LIMIT 500"
     )
     .fetch_all(pool)
     .await
@@ -355,7 +355,7 @@ async fn pre_warm_buyer_ids(
     let mut warmed = 0;
 
     match sqlx::query(
-        "SELECT id FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200",
+        "SELECT id FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 500",
     )
     .fetch_all(pool)
     .await

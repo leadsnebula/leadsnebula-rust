@@ -24,7 +24,7 @@ type BuyerResponseTuple = (
 );
 type LeadUpdateTuple = (
     Uuid,
-    String,
+    LeadStatus, // Changed from String to LeadStatus enum
     Option<Uuid>,
     Option<Uuid>,
     Option<String>,
@@ -59,13 +59,13 @@ pub enum BackgroundTask {
     /// Lead update
     LeadUpdate {
         lead_id: Uuid,
-        status: String,
+        status: LeadStatus, // Changed from String to LeadStatus enum for type safety
         campaign_id: Option<Uuid>,
         buyer_id: Option<Uuid>,
         promise_id: Option<String>,
         ping_id: Option<String>,
         post_id: Option<String>,
-        sold_at: bool, // If true, set sold_at = NOW() when status = "sold"
+        sold_at: bool, // If true, set sold_at = NOW() when status = LeadStatus::Sold
         inprog_token: Option<String>, // For conditional update (WHERE post_id = inprog_token)
     },
     /// Buyer response batch insert
@@ -399,10 +399,10 @@ impl WriteBehindQueue {
             inprog_token,
         ) in updates
         {
-            if *sold_at && status == "sold" {
+            if *sold_at && *status == LeadStatus::Sold {
                 // Update with sold_at and conditional post_id check
                 if let Some(token) = inprog_token {
-                    let _ = sqlx::query(
+                    match sqlx::query(
                         r#"
                         UPDATE leads
                         SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW()
@@ -414,9 +414,19 @@ impl WriteBehindQueue {
                     .bind(lead_id)
                     .bind(token)
                     .execute(pool)
-                    .await;
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to update lead {} to sold status: {}",
+                                lead_id,
+                                e
+                            );
+                        }
+                    }
                 } else {
-                    let _ = sqlx::query(
+                    match sqlx::query(
                         r#"
                         UPDATE leads
                         SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW()
@@ -427,11 +437,21 @@ impl WriteBehindQueue {
                     .bind(status)
                     .bind(lead_id)
                     .execute(pool)
-                    .await;
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to update lead {} to sold status: {}",
+                                lead_id,
+                                e
+                            );
+                        }
+                    }
                 }
             } else if let Some(token) = inprog_token {
                 // Reset placeholder (clear inprog_token)
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     r#"
                     UPDATE leads SET post_id = '' WHERE uuid = $1 AND post_id = $2
                     "#,
@@ -439,10 +459,13 @@ impl WriteBehindQueue {
                 .bind(lead_id)
                 .bind(token)
                 .execute(pool)
-                .await;
+                .await
+                {
+                    tracing::error!("Failed to reset inprog_token for lead {}: {}", lead_id, e);
+                }
             } else {
                 // Standard update
-                let _ = sqlx::query(
+                match sqlx::query(
                     r#"
                     UPDATE leads
                     SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, updated_at = NOW()
@@ -457,7 +480,13 @@ impl WriteBehindQueue {
                 .bind(ping_id)
                 .bind(post_id)
                 .execute(pool)
-                .await;
+                .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Failed to update lead {} status: {}", lead_id, e);
+                    }
+                }
             }
         }
 

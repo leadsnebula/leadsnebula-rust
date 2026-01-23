@@ -18,12 +18,14 @@ impl ManageConnection for RedisConnectionManager {
     type Error = RedisError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!("🔵 Step 5: Getting ConnectionManager via client.get_connection_manager()...");
         let start = std::time::Instant::now();
         // Use client.get_connection_manager() instead of ConnectionManager::new()
         // This method properly handles both redis:// and rediss:// URLs
         let result = self.client.get_connection_manager().await;
         let elapsed = start.elapsed();
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!(
             "🔵 Step 5: client.get_connection_manager() completed in {:?}",
             elapsed
@@ -73,7 +75,9 @@ impl RedisClient {
         pool_size: u32,
         min_idle: u32,
     ) -> anyhow::Result<Self> {
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!("🔵 Step 1: Creating Redis client from URL...");
+        #[cfg(all(feature = "tracing", debug_assertions))]
         debug!(
             "Creating Redis connection manager with URL scheme: {}",
             if redis_url.starts_with("rediss://") {
@@ -86,6 +90,7 @@ impl RedisClient {
         );
 
         // Create Redis client from URL - handles both redis:// and rediss:// URLs automatically
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!("🔵 Step 2: Calling Client::open()...");
         let client = Client::open(redis_url).map_err(|e| {
             error!(
@@ -101,8 +106,10 @@ impl RedisClient {
             }
             anyhow::anyhow!("Redis client error: {}", e)
         })?;
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!("✅ Step 2: Client::open() succeeded");
 
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!(
             "🔵 Step 3: Creating Redis connection manager (TLS: {})...",
             redis_url.starts_with("rediss://")
@@ -111,6 +118,7 @@ impl RedisClient {
         // Create our custom ManageConnection wrapper
         let manager = RedisConnectionManager { client };
 
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!(
             "🔵 Step 4: Building Redis connection pool (size: {}, min_idle: {})...",
             pool_size, min_idle
@@ -135,6 +143,7 @@ impl RedisClient {
                 anyhow::anyhow!("Redis pool build error: {}", e)
             })?;
 
+        #[cfg(all(feature = "tracing", debug_assertions))]
         info!(
             "Redis connection pool created successfully (max_size: {})",
             pool_size

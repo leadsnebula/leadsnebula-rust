@@ -342,7 +342,7 @@ impl AppConfig {
                     .ok()
                     .and_then(|s| s.parse::<u32>().ok())
             })
-            .unwrap_or(15);
+            .unwrap_or(25); // Increased from 15 to 25 for better concurrency
 
         // Redis min_idle (default: 2, configurable via SSM)
         let redis_min_idle = params
@@ -356,7 +356,7 @@ impl AppConfig {
                     .ok()
                     .and_then(|s| s.parse::<u32>().ok())
             })
-            .unwrap_or(2);
+            .unwrap_or(5); // Increased from 2 to 5 for better connection readiness
 
         info!(
             "Configuration loaded successfully for environment: {}",

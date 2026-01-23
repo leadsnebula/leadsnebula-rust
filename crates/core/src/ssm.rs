@@ -39,6 +39,7 @@ impl SsmService {
         if let Some(redis) = &self.redis {
             let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
             if let Ok(Some(cached)) = redis.get(&cache_key).await {
+                #[cfg(all(feature = "tracing", debug_assertions))]
                 debug!("SSM cache hit: {}", path);
                 return Ok(Some(cached));
             }
