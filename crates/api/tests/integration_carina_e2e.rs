@@ -274,6 +274,7 @@ async fn test_e2e_ping_request_flow() {
     };
 
     // Insert lead into database (required for router.update_lead_status)
+    // Use buyer_id and campaign_id from test setup (database requires buyer_id to be NOT NULL)
     let strategy_val = "pingPost".to_string();
     sqlx::query(
             r#"
@@ -289,8 +290,8 @@ async fn test_e2e_ping_request_flow() {
         .bind(&strategy_val)
         .bind(lead.tcpa_consent)
         .bind(&lead.tcpa_language)
-        .bind(lead.buyer_id)
-        .bind(lead.campaign_id)
+        .bind(buyer_id)  // Use buyer_id from test setup
+        .bind(campaign_id)  // Use campaign_id from test setup
         .bind(lead.post_id.as_ref().unwrap_or(&String::new()))
         .bind(lead.session_id.as_ref())
         .execute(&mut *tx)
@@ -500,6 +501,7 @@ async fn test_e2e_fullpost_request_flow() {
     };
 
     // Insert lead into database (required for router.update_lead_status)
+    // Use buyer_id and campaign_id from test setup (database requires buyer_id to be NOT NULL)
     let strategy_val = "fullPost".to_string();
     sqlx::query(
             r#"
@@ -515,8 +517,8 @@ async fn test_e2e_fullpost_request_flow() {
         .bind(&strategy_val)
         .bind(lead.tcpa_consent)
         .bind(&lead.tcpa_language)
-        .bind(lead.buyer_id)
-        .bind(lead.campaign_id)
+        .bind(buyer_id)  // Use buyer_id from test setup
+        .bind(campaign_id)  // Use campaign_id from test setup
         .bind(lead.post_id.as_ref().unwrap_or(&String::new()))
         .bind(lead.session_id.as_ref())
         .execute(&mut *tx)
@@ -559,6 +561,38 @@ async fn test_e2e_error_handling() {
     let (_app, pool) = create_test_app_state().await;
     let mut tx = pool.begin().await.unwrap();
     let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&mut *tx).await;
+
+    // Create buyer and campaign (required for lead INSERT - buyer_id must be NOT NULL)
+    let buyer_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+            INSERT INTO buyers (id, instance_id, name, status, created_at, updated_at)
+            VALUES ($1, (SELECT id FROM instances LIMIT 1), $2, 'active', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+    )
+    .bind(buyer_id)
+    .bind("Test Buyer")
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let campaign_id = Uuid::new_v4();
+    sqlx::query(
+            r#"
+            INSERT INTO campaigns (id, buyer_id, publisher_id, instance_id, vertical, campaign_token, status, created_at, updated_at)
+            VALUES ($1, $2, $3, (SELECT id FROM instances LIMIT 1), $4, $5, 'active', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(campaign_id)
+        .bind(buyer_id)
+        .bind(publisher_id)
+        .bind(&vertical_slug)
+        .bind(format!("token_{}", Uuid::new_v4()))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Test 1: No ping tree for publisher/vertical
     let lead_no_tree = Lead {
@@ -616,6 +650,7 @@ async fn test_e2e_error_handling() {
     };
 
     // Insert lead into database (required for router.update_lead_status)
+    // Use buyer_id and campaign_id from test setup (database requires buyer_id to be NOT NULL)
     let strategy_val = "pingPost".to_string();
     sqlx::query(
             r#"
@@ -631,8 +666,8 @@ async fn test_e2e_error_handling() {
         .bind(&strategy_val)
         .bind(lead_no_tree.tcpa_consent)
         .bind(&lead_no_tree.tcpa_language)
-        .bind(lead_no_tree.buyer_id)
-        .bind(lead_no_tree.campaign_id)
+        .bind(buyer_id)  // Use buyer_id from test setup
+        .bind(campaign_id)  // Use campaign_id from test setup
         .bind(lead_no_tree.post_id.as_ref().unwrap_or(&String::new()))
         .bind(lead_no_tree.session_id.as_ref())
         .execute(&mut *tx)
