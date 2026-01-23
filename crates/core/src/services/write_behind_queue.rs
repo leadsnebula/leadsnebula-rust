@@ -1,6 +1,7 @@
 // Write-behind queue for batching background database writes
 // Reduces spawn overhead and batches writes for better performance
 
+use crate::models::enums::LeadStatus;
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -662,7 +663,7 @@ impl WriteBehindQueue {
                 .bind(vertical_id)
                 .bind(request_type)
                 .bind(strategy)
-                .bind("processing")
+                .bind(LeadStatus::Processing)
                 .bind(promise_id.as_ref())
                 .bind(*tcpa_consent)
                 .bind(tcpa_language)

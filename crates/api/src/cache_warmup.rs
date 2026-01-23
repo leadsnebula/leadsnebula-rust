@@ -36,10 +36,13 @@ pub async fn pre_warm_cache(state: &AppState) {
     let integrations_warmed = pre_warm_buyer_integrations(cache, pool).await;
     let qual_configs_warmed = pre_warm_qualification_configs(cache, pool).await;
 
+    // Pre-warm buyer IDs (used in buyer_router for buyer lookups)
+    let buyer_ids_warmed = pre_warm_buyer_ids(cache, pool).await;
+
     let duration_ms = start.elapsed().as_millis();
     info!(
-        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys, {} buyers, {} campaigns, {} integrations, {} qual configs",
-        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed, buyers_warmed, campaigns_warmed, integrations_warmed, qual_configs_warmed
+        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys, {} buyers, {} campaigns, {} integrations, {} qual configs, {} buyer_ids",
+        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed, buyers_warmed, campaigns_warmed, integrations_warmed, qual_configs_warmed, buyer_ids_warmed
     );
 }
 
@@ -308,7 +311,7 @@ async fn pre_warm_qualification_configs(
 
     // Get list of buyer_ids with active qualification configs
     match sqlx::query(
-        "SELECT DISTINCT buyer_id FROM buyer_qualification_configs WHERE deleted_at IS NULL AND enabled = true AND is_active = true LIMIT 200"
+        "SELECT DISTINCT buyer_id FROM buyer_qualification_configs WHERE enabled = true AND is_active = true LIMIT 200"
     )
     .fetch_all(pool)
     .await
@@ -337,6 +340,44 @@ async fn pre_warm_qualification_configs(
         }
         Err(e) => {
             warn!("Failed to pre-warm qualification configs: {}", e);
+        }
+    }
+
+    warmed
+}
+
+/// Pre-warm buyer IDs (24h TTL - buyers rarely change)
+/// This pre-warms the buyer:id cache used in buyer_router
+async fn pre_warm_buyer_ids(
+    cache: &Arc<leadsnebula_core::cache::CacheService>,
+    pool: &PgPool,
+) -> usize {
+    let mut warmed = 0;
+
+    match sqlx::query(
+        "SELECT id FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                let buyer_id: uuid::Uuid = row.get("id");
+                let cache_key = format!("buyer:id:{}", buyer_id);
+                // Trigger cache by calling get_or_insert_with
+                let _ = cache
+                    .get_or_insert_with(&cache_key, 86400, || async {
+                        use leadsnebula_core::models::buyer::Buyer;
+                        Buyer::find_by_id(pool, buyer_id)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                    })
+                    .await;
+                warmed += 1;
+            }
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm buyer IDs: {}", e);
         }
     }
 
