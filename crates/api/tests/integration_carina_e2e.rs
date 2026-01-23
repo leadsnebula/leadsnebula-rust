@@ -298,6 +298,9 @@ async fn test_e2e_ping_request_flow() {
         .await
         .unwrap();
 
+    // Commit transaction so router can see the data (router uses pool.clone() which gets a new connection)
+    tx.commit().await.unwrap();
+
     // Test routing
     use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
     let router = PingTreeRouter::new(
@@ -317,11 +320,11 @@ async fn test_e2e_ping_request_flow() {
     assert!(result.is_ok());
     let routing_result = result.unwrap();
 
-    // Verify lead status was updated
+    // Verify lead status was updated (use pool since tx is committed)
     let updated_lead: Option<Lead> =
         sqlx::query_as::<_, Lead>("SELECT * FROM leads WHERE uuid = $1")
             .bind(lead.uuid)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&pool)
             .await
             .unwrap();
 
@@ -329,18 +332,17 @@ async fn test_e2e_ping_request_flow() {
         assert_ne!(updated.status, LeadStatus::Processing);
     }
 
-    // Verify buyer_responses were persisted
+    // Verify buyer_responses were persisted (use pool since tx is committed)
     let response_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM buyer_responses WHERE lead_id = $1")
             .bind(lead.uuid)
-            .fetch_one(&mut *tx)
+            .fetch_one(&pool)
             .await
             .unwrap();
 
     assert!(response_count >= 0); // At least attempted to persist
 
-    // Rollback transaction to prevent test data from persisting
-    tx.rollback().await.unwrap();
+    // Note: No rollback needed - data is in ephemeral Neon branch that gets cleaned up
 }
 
 #[tokio::test]
@@ -525,6 +527,9 @@ async fn test_e2e_fullpost_request_flow() {
         .await
         .unwrap();
 
+    // Commit transaction so router can see the data (router uses pool.clone() which gets a new connection)
+    tx.commit().await.unwrap();
+
     // Test fullpost routing
     use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
     let router = PingTreeRouter::new(
@@ -547,8 +552,7 @@ async fn test_e2e_fullpost_request_flow() {
     // For fullpost, we should have both ping_id and post_id
     assert!(routing_result.ping_id.is_some() || routing_result.post_id.is_some());
 
-    // Rollback transaction to prevent test data from persisting
-    tx.rollback().await.unwrap();
+    // Note: No rollback needed - data is in ephemeral Neon branch that gets cleaned up
 }
 
 #[tokio::test]
@@ -674,6 +678,9 @@ async fn test_e2e_error_handling() {
         .await
         .unwrap();
 
+    // Commit transaction so router can see the data (router uses pool.clone() which gets a new connection)
+    tx.commit().await.unwrap();
+
     use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
     let router = PingTreeRouter::new(
         lead_no_tree,
@@ -694,6 +701,5 @@ async fn test_e2e_error_handling() {
     assert!(!routing_result.success);
     assert!(routing_result.error.is_some());
 
-    // Rollback transaction to prevent test data from persisting
-    tx.rollback().await.unwrap();
+    // Note: No rollback needed - data is in ephemeral Neon branch that gets cleaned up
 }
