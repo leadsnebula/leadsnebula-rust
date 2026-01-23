@@ -1117,9 +1117,9 @@ async fn create_lead(
                             c.id AS campaign_id,
                             COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
                             EXISTS(
-                                SELECT 1 FROM ping_trees pt
-                                INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id
-                                WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL
+                                SELECT 1 FROM ping_tree_publishers ptp
+                                INNER JOIN ping_trees pt ON pt.id = ptp.ping_tree_id
+                                WHERE ptp.publisher_id = $1 AND ptp.vertical = $2 AND pt.deleted_at IS NULL
                             ) AS has_ping_tree
                         FROM (VALUES (true)) AS dummy
                         LEFT JOIN campaigns c ON (

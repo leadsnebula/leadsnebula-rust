@@ -277,12 +277,12 @@ jobs:
           cargo nextest run --test integration_publisher_crud --locked --all-features --test-threads=2 || \
             cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=2
           
-          # E2E tests
-          cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=2 || \
-            cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=2
+          # E2E tests - run with --ignored flag to include tests marked with #[ignore]
+          cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=2 --ignored || \
+            cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=2 --ignored
           
-          # NOTE: --ignored lib tests (duplicate_post, ping_tree_*_db, async_persistence) are
-          # skipped in CI; run locally via ./autotests.sh to avoid Neon load and keep CI <10 min.
+          # NOTE: Some heavy lib tests (duplicate_post, ping_tree_*_db, async_persistence) are
+          # still skipped in CI to keep runtime reasonable; run locally via ./autotests.sh for full coverage.
 
       - name: Show sccache statistics
         if: steps.needs-integration.outputs.needs_tests == 'true'
@@ -407,8 +407,10 @@ jobs:
               (echo "⚠️ Filtered tests had issues, running full test suite..." && \
                cargo nextest run --lib --locked --all-features --retries 2)
             else
-              echo "Only binary-only crates changed (no library tests to run)"
-              echo "Skipping --lib tests (binary crates don't have library tests)"
+              # Binary-only crates changed - still run all lib tests to catch regressions
+              # Binary crates may depend on library crates that need testing
+              echo "Binary-only crates changed - running all library tests to catch regressions"
+              cargo nextest run --lib --locked --all-features --retries 2
             fi
           fi
 
