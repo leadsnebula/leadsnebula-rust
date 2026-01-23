@@ -128,10 +128,12 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 // In test mode (ephemeral Neon branches), always drop and recreate _sqlx_migrations
                 // This ensures a clean slate and prevents checksum mismatches from copied state
                 // NOTE: "ep-" in URL is Neon endpoint naming, NOT a test indicator - only check for actual test prefixes
+                // CI environment variable indicates we're in CI (GitHub Actions, etc.) and should treat as test mode
                 let is_test_mode = database_url.contains("ci-local-")
                     || database_url.contains("test-")
                     || std::env::var("TEST_MODE").is_ok()
-                    || std::env::var("NEON_BRANCH").is_ok();
+                    || std::env::var("NEON_BRANCH").is_ok()
+                    || std::env::var("CI").is_ok(); // CI=1 is set in GitHub Actions
 
                 if is_test_mode {
                     // Drop and recreate _sqlx_migrations table to ensure clean state

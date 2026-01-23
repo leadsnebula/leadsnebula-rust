@@ -405,11 +405,12 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                     if echo "$E2E_OUTPUT" | grep -q "Router error"; then
                         echo "   💡 Hint: Check router error output above - may be database constraint or missing data"
                     fi
-                    if echo "$E2E_OUTPUT" | grep -q "relation.*does not exist\|ping_tree_publishers.*does not exist"; then
+                    if echo "$E2E_OUTPUT" | grep -qE "relation.*does not exist|ping_tree_publishers.*does not exist|ping_tree_publishers table does not exist|migrations may not have run"; then
                         echo "   💡 Hint: Database table missing - migrations may not have run"
                         echo "   💡 Hint: Check that create_test_pool() runs migrations successfully"
                         echo "   💡 Hint: Verify migrations directory is found and migrations are applied"
                         echo "   💡 Hint: ping_tree_publishers table missing - migration 20260120000002 may not have run"
+                        echo "   💡 Hint: In CI, ensure CI=1 is set so is_test_mode=true and migrations run"
                     fi
                     ERRORS=$((ERRORS + 1))
                 else
@@ -432,6 +433,13 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                     fi
                     if echo "$E2E_OUTPUT" | grep -q "Router error"; then
                         echo "   💡 Hint: Check router error output above - may be database constraint or missing data"
+                    fi
+                    if echo "$E2E_OUTPUT" | grep -qE "relation.*does not exist|ping_tree_publishers.*does not exist|ping_tree_publishers table does not exist|migrations may not have run"; then
+                        echo "   💡 Hint: Database table missing - migrations may not have run"
+                        echo "   💡 Hint: Check that create_test_pool() runs migrations successfully"
+                        echo "   💡 Hint: Verify migrations directory is found and migrations are applied"
+                        echo "   💡 Hint: ping_tree_publishers table missing - migration 20260120000002 may not have run"
+                        echo "   💡 Hint: In CI, ensure CI=1 is set so is_test_mode=true and migrations run"
                     fi
                     ERRORS=$((ERRORS + 1))
                 else
