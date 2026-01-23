@@ -10,11 +10,9 @@ use axum::{
     Router,
 };
 use chrono::Utc;
-use leadsnebula_core::models::enums::LeadStatus;
 use leadsnebula_core::models::publisher::Publisher;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 
 use crate::AppState;
 use leadsnebula_core::services::auction_timing::AtomicAuctionTiming;
@@ -171,10 +169,6 @@ async fn create_lead(
     Query(params): Query<std::collections::HashMap<String, String>>,
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
-    // Critical path timing: mark lead_received
-    // Always available (not feature-gated) for production performance monitoring
-    let critical_path_start = std::time::Instant::now();
-
     // Initialize timing and metrics
     let timing = Arc::new(AtomicAuctionTiming::new());
     let metrics = Arc::new(DiagnosticMetrics::new());
@@ -704,30 +698,66 @@ async fn create_lead(
             .await
         {
             Ok(routing_result) => {
-                // Batch load buyer and campaign names in parallel (performance optimization)
+                // Batch load buyer and campaign names in parallel (CACHED - 1h TTL, names rarely change)
                 let (buyer_name, campaign_name) = tokio::join!(
                     async {
                         if let Some(bid) = routing_result.buyer_id {
-                            sqlx::query_scalar::<_, String>(
-                                "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
-                            )
-                            .bind(bid)
-                            .fetch_optional(&*state.db_pool)
-                            .await
-                            .unwrap_or_default()
+                            let cache_key = format!("buyer:name:{}", bid);
+                            if let Some(cache) = &state.cache {
+                                cache
+                                    .get_or_insert_with(&cache_key, 3600, || async {
+                                        sqlx::query_scalar::<_, String>(
+                                            "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                                        )
+                                        .bind(bid)
+                                        .fetch_optional(&*state.db_pool)
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                // Fallback if cache not available
+                                sqlx::query_scalar::<_, String>(
+                                    "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                                )
+                                .bind(bid)
+                                .fetch_optional(&*state.db_pool)
+                                .await
+                                .unwrap_or_default()
+                            }
                         } else {
                             None
                         }
                     },
                     async {
                         if let Some(cid) = routing_result.campaign_id {
-                            sqlx::query_scalar::<_, String>(
-                                "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
-                            )
-                            .bind(cid)
-                            .fetch_optional(&*state.db_pool)
-                            .await
-                            .unwrap_or_default()
+                            let cache_key = format!("campaign:name:{}", cid);
+                            if let Some(cache) = &state.cache {
+                                cache
+                                    .get_or_insert_with(&cache_key, 3600, || async {
+                                        sqlx::query_scalar::<_, String>(
+                                            "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                                        )
+                                        .bind(cid)
+                                        .fetch_optional(&*state.db_pool)
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                // Fallback if cache not available
+                                sqlx::query_scalar::<_, String>(
+                                    "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                                )
+                                .bind(cid)
+                                .fetch_optional(&*state.db_pool)
+                                .await
+                                .unwrap_or_default()
+                            }
                         } else {
                             None
                         }
@@ -1322,6 +1352,11 @@ async fn create_lead(
         }));
     }
 
+    // Critical path timing: start AFTER pre-checks and DB operations
+    // This measures only the non-DB critical path (routing, response building)
+    // Always available (not feature-gated) for production performance monitoring
+    let critical_path_start = std::time::Instant::now();
+
     // Generate identifiers only after pre-checks pass
     let lead_id = lead_data.lead_id.clone().unwrap_or_else(|| {
         let prefix = vertical.slug.to_uppercase();
@@ -1336,7 +1371,7 @@ async fn create_lead(
 
     let event_id = format!("evt_{}", uuid::Uuid::new_v4());
 
-    // Generate promise_id for ping requests
+    // Generate promise_id for ping requests (immediately, no DB needed)
     let promise_id = if request_type == "ping" || request_type == "fullpost" {
         Some(format!(
             "PROMISE_{}",
@@ -1346,15 +1381,21 @@ async fn create_lead(
         None
     };
 
-    // Encrypt PII fields using SSM deterministic key
-    // Note: SSM keys were already fetched in parallel with pre-checks query above
-    let encryption_start = std::time::Instant::now();
+    // Generate temporary UUID for lead (will be used in DB insert)
+    let lead_uuid = uuid::Uuid::new_v4();
+    let session_id = format!("sess_{}", uuid::Uuid::new_v4());
 
+    // Prepare request payload for ping_payloads (raw, will be encrypted in background)
+    let request_payload_json =
+        serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
+
+    // Get SSM encryption key for background encryption (derive once, reuse in batch)
     let pii_encryption_key = match (det_key_result, salt_result) {
         (Ok(Some(det_key)), Ok(Some(salt))) => Some(
             leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
                 &det_key, &salt,
-            ),
+            )
+            .to_vec(), // Convert [u8; 32] to Vec<u8>
         ),
         (Ok(Some(_)), Ok(None)) | (Ok(Some(_)), Err(_)) => {
             tracing::warn!("Failed to get key derivation salt from SSM at {} - PII fields will not be encrypted", salt_path);
@@ -1369,386 +1410,118 @@ async fn create_lead(
         }
     };
 
-    // Encrypt PII fields
-    let encrypt_pii = |value: Option<String>| -> Option<String> {
-        if let (Some(val), Some(key)) = (value, &pii_encryption_key) {
-            if !val.is_empty() {
-                if let Ok(envelope) =
-                    leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                        key, &val, true,
-                    )
-                {
-                    return Some(envelope);
-                } else {
-                    tracing::warn!("Failed to encrypt PII field");
-                }
-            }
-        }
-        None
-    };
-
-    let first_name_encrypted = encrypt_pii(lead_data.first_name.clone());
-    let last_name_encrypted = encrypt_pii(lead_data.last_name.clone());
-    let email_encrypted = encrypt_pii(lead_data.email.clone());
-    let cell_phone_encrypted = encrypt_pii(
-        lead_data
-            .cell_phone
-            .clone()
-            .or(lead_data.mobile_phone.clone()),
-    );
-    let street_address_encrypted = encrypt_pii(lead_data.street_address.clone());
-    let city_encrypted = encrypt_pii(lead_data.city.clone());
-    let state_encrypted = encrypt_pii(lead_data.state.clone());
-    let zip_encrypted = encrypt_pii(lead_data.zip.clone());
-    let ip_address_encrypted = encrypt_pii(lead_data.ip_address.clone());
-
-    // Record encryption timing (non-critical, background)
-    let _encryption_duration = encryption_start.elapsed().as_millis() as u64;
-
-    // Batch all DB writes in single transaction (lead + ping + ping_payloads)
-    // This reduces 3 sequential writes (600-1000ms) to 1 transaction (200-300ms)
-    let lead_insert_start = std::time::Instant::now();
+    // Enqueue lead creation to write-behind queue (decoupled from critical path)
+    // All encryption happens in the background batch processor
     tracing::info!(
-        "Creating lead: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}",
+        "Enqueueing lead creation: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}, lead_uuid={}",
         event_id,
         lead_id,
         publisher.id,
         vertical.id,
-        request_type
+        request_type,
+        lead_uuid
     );
 
-    // Prepare request payload for ping_payloads
-    let request_payload_json =
-        serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
-    // Try to encrypt the request payload using the same SSM deterministic key
-    let encrypted_request_opt: Option<String> = if let Some(key_bytes) = &pii_encryption_key {
-        if let Ok(bytes) = simd_json::to_vec(&request_payload_json) {
-            if let Ok(req_str) = String::from_utf8(bytes) {
-                leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
-                    key_bytes, &req_str, true,
-                )
-                .ok()
-            } else {
+    state.write_behind_queue.enqueue(
+        leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadCreation {
+            event_id: event_id.clone(),
+            lead_id: if lead_id.is_empty() {
                 None
-            }
-        } else {
+            } else {
+                Some(lead_id.clone())
+            },
+            publisher_id: publisher.id,
+            vertical_id: vertical.id,
+            request_type: request_type.clone(),
+            strategy: strategy.to_string(),
+            promise_id: promise_id.clone(),
+            buyer_id: buyer_id_opt.expect("buyer_id must be present after pre-checks"),
+            campaign_id: campaign_id_opt.expect("campaign_id must be present after pre-checks"),
+            tcpa_consent: lead_data.tcpa_consent.unwrap_or(false),
+            tcpa_language: lead_data.tcpa_language.as_deref().unwrap_or("").to_string(),
+            is_test: lead_data.is_test.unwrap_or(false),
+            session_id: session_id.clone(),
+            vertical_data: serde_json::json!({}),
+            // Raw PII fields (will be encrypted in batch processor)
+            first_name: lead_data.first_name.clone(),
+            last_name: lead_data.last_name.clone(),
+            email: lead_data.email.clone(),
+            cell_phone: lead_data
+                .cell_phone
+                .clone()
+                .or(lead_data.mobile_phone.clone()),
+            street_address: lead_data.street_address.clone(),
+            city: lead_data.city.clone(),
+            state: lead_data.state.clone(),
+            zip: lead_data.zip.clone(),
+            ip_address: lead_data.ip_address.clone(),
+            request_payload: request_payload_json.clone(),
+            pii_encryption_key: pii_encryption_key.clone(),
+        },
+    );
+
+    // Create minimal Lead object for routing (no DB query needed)
+    // This allows routing to proceed immediately while DB insert happens in background
+    let lead = leadsnebula_core::models::lead::Lead {
+        uuid: lead_uuid,
+        event_id: event_id.clone(),
+        lead_id: if lead_id.is_empty() {
             None
-        }
-    } else {
-        None
+        } else {
+            Some(lead_id.clone())
+        },
+        publisher_id: Some(publisher.id),
+        vertical_id: vertical.id,
+        campaign_id: campaign_id_opt,
+        buyer_id: buyer_id_opt,
+        request_type: request_type.clone(),
+        strategy: strategy.to_string(),
+        status: leadsnebula_core::models::enums::LeadStatus::Processing,
+        promise_id: promise_id.clone(),
+        ping_id: None,
+        post_id: None,
+        session_id: Some(session_id),
+        request_stage: None,
+        first_name_encrypted: None, // Encryption happens in background
+        last_name_encrypted: None,
+        email_encrypted: None,
+        cell_phone_encrypted: None,
+        street_address_encrypted: None,
+        city_encrypted: None,
+        state_encrypted: None,
+        zip_encrypted: None,
+        ip_address_encrypted: None,
+        email_sha256: None,
+        phone_sha256: None,
+        ip_address_hash: None,
+        email_domain: None,
+        tcpa_consent: lead_data.tcpa_consent.unwrap_or(false),
+        tcpa_language: lead_data.tcpa_language.as_deref().unwrap_or("").to_string(),
+        is_test: lead_data.is_test.unwrap_or(false),
+        user_agent: None,
+        referrer: None,
+        website_url: None,
+        click_id: None,
+        url_consent: None,
+        best_call_time: None,
+        date_of_birth: None,
+        home_phone: None,
+        jornaya_lead_id: None,
+        trusted_form_url: None,
+        fbp_cookie: None,
+        fbc_cookie: None,
+        utm_params: None,
+        submitted_at: Some(chrono::Utc::now()),
+        sold_at: None,
+        retry_count: 0,
+        next_retry_at: None,
+        vertical_data: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
     };
-    let encrypted_request = encrypted_request_opt.unwrap_or_default();
-
-    // Generate ping_id similar to Pulsar handler: FP_<base64(lead_id|timestamp|result)>
-    // We'll generate it after we have lead_uuid, so prepare the components
-    use base64::Engine;
-    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
-
-    // Start transaction and batch all inserts
-    let mut tx = match state.db_pool.begin().await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("Failed to start transaction: {}", e);
-            let (message, technical) = map_error_to_user(&e.to_string());
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(message),
-                    error: Some(technical),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_500",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 500
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(500),
-            }));
-        }
-    };
-
-    // Insert lead
-    let lead_uuid_result = sqlx::query(
-        r#"
-        INSERT INTO leads (
-            event_id, lead_id, publisher_id, vertical_id, request_type, strategy, status,
-            promise_id, tcpa_consent, tcpa_language, is_test, session_id, vertical_data,
-            buyer_id, campaign_id, post_id, submitted_at, created_at,
-            first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted,
-            street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, NOW(), NOW(),
-            $17, $18, $19, $20, $21, $22, $23, $24, $25
-        ) RETURNING uuid
-        "#,
-    )
-    .bind(&event_id)
-    .bind(if lead_id.is_empty() {
-        None
-    } else {
-        Some(&lead_id)
-    })
-    .bind(publisher.id)
-    .bind(vertical.id)
-    .bind(&request_type)
-    .bind(strategy)
-    .bind(LeadStatus::Processing)
-    .bind(&promise_id)
-    .bind(lead_data.tcpa_consent.unwrap_or(false))
-    .bind(lead_data.tcpa_language.as_deref().unwrap_or(""))
-    .bind(lead_data.is_test.unwrap_or(false))
-    .bind(format!("sess_{}", uuid::Uuid::new_v4()).as_str())
-    .bind(serde_json::json!({}))
-    .bind(buyer_id_opt.expect("buyer_id must be present after pre-checks"))
-    .bind(campaign_id_opt.expect("campaign_id must be present after pre-checks"))
-    .bind("")
-    .bind(first_name_encrypted)
-    .bind(last_name_encrypted)
-    .bind(email_encrypted)
-    .bind(cell_phone_encrypted)
-    .bind(street_address_encrypted)
-    .bind(city_encrypted)
-    .bind(state_encrypted)
-    .bind(zip_encrypted)
-    .bind(ip_address_encrypted)
-    .fetch_one(&mut *tx)
-    .await;
-
-    let lead_uuid = match lead_uuid_result {
-        Ok(row) => row.get::<uuid::Uuid, _>(0),
-        Err(e) => {
-            tracing::error!("Database error creating lead: {}", e);
-            let _ = tx.rollback().await;
-            let (message, technical) = map_error_to_user(&e.to_string());
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(message),
-                    error: Some(technical),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_500",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 500
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(500),
-            }));
-        }
-    };
-
-    // Generate ping_id now that we have lead_uuid
-    let lead_id_str = lead_uuid.to_string();
-    let payload_str = format!("{}|{}|pending", lead_id_str, timestamp);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(payload_str);
-    let ping_id_text = format!("FP_{}", encoded);
-
-    // Insert ping record
-    let ping_id_result = sqlx::query(
-        "INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, $3, $4, now(), now()) RETURNING id"
-    )
-    .bind(&ping_id_text)
-    .bind(lead_uuid)
-    .bind(&promise_id)
-    .bind("processing")
-    .fetch_one(&mut *tx)
-    .await;
-
-    let ping_id_val = match ping_id_result {
-        Ok(row) => row.get::<i64, _>("id"),
-        Err(e) => {
-            tracing::warn!(
-                "Failed to create ping record for lead {} (non-critical): {}",
-                lead_uuid,
-                e
-            );
-            // Continue with transaction even if ping fails
-            0i64
-        }
-    };
-
-    // Insert ping_payloads
-    if ping_id_val > 0 {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, now())"
-        )
-        .bind(ping_id_val)
-        .bind(lead_uuid)
-        .bind(sqlx::types::Json(&request_payload_json))
-        .bind(encrypted_request)
-        .execute(&mut *tx)
-        .await
-        {
-            tracing::warn!("Failed to create ping_payloads record for lead {} (non-critical): {}", lead_uuid, e);
-            // Continue with transaction even if ping_payloads fails
-        }
-    }
-
-    // Commit transaction
-    match tx.commit().await {
-        Ok(_) => {
-            let lead_insert_duration = lead_insert_start.elapsed().as_millis() as u64;
-            metrics.record_query(lead_insert_duration);
-            tracing::info!("Successfully created lead, ping, and ping_payloads in single transaction for lead {}", lead_uuid);
-        }
-        Err(e) => {
-            tracing::error!("Failed to commit transaction for lead {}: {}", lead_uuid, e);
-            let (message, technical) = map_error_to_user(&e.to_string());
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(message),
-                    error: Some(technical),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_500",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 500
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(500),
-            }));
-        }
-    }
 
     // No need to wait for ping/ping_payloads - they're audit records
     let payload_row_id: Option<uuid::Uuid> = None;
-
-    // Load the created lead - CACHED to avoid blocking DB query after transaction
-    // Cache key: lead:uuid:{uuid} with 5m TTL (leads don't change after creation)
-    let lead_cache_key = format!("lead:uuid:{}", lead_uuid);
-    let lead = if let Some(cache) = &state.cache {
-        match cache
-            .get_or_insert_with(&lead_cache_key, 300, || async {
-                sqlx::query_as::<_, leadsnebula_core::models::lead::Lead>(
-                    "SELECT * FROM leads WHERE uuid = $1",
-                )
-                .bind(lead_uuid)
-                .fetch_one(&*state.db_pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("Database error: {}", e))
-            })
-            .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("Failed to load created lead: {}", e);
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some("Failed to load created lead".to_string()),
-                        error: Some(format!("Database error: {}", e)),
-                    },
-                    lead: LeadNode {
-                        promise_id,
-                        lead_id: Some(lead_id),
-                        lead_uuid: Some(lead_uuid.to_string()),
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": format!("ERR_{}", 500),
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 500
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(500),
-                }));
-            }
-        }
-    } else {
-        // Fallback if cache not available
-        match sqlx::query_as::<_, leadsnebula_core::models::lead::Lead>(
-            "SELECT * FROM leads WHERE uuid = $1",
-        )
-        .bind(lead_uuid)
-        .fetch_one(&*state.db_pool)
-        .await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("Failed to load created lead: {}", e);
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some("Failed to load created lead".to_string()),
-                        error: Some(format!("Database error: {}", e)),
-                    },
-                    lead: LeadNode {
-                        promise_id,
-                        lead_id: Some(lead_id),
-                        lead_uuid: Some(lead_uuid.to_string()),
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": format!("ERR_{}", 500),
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 500
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(500),
-                }));
-            }
-        }
-    };
 
     // Route the lead through ping tree
     let routing_start = std::time::Instant::now();
@@ -1811,18 +1584,36 @@ async fn create_lead(
                 None
             };
 
-            // Resolve buyer and campaign names if available (best-effort; ignore failures)
+            // Resolve buyer and campaign names if available (CACHED - 1h TTL, names rarely change)
             // Skip in minimal mode for performance
             let buyer_name = if minimal_mode {
                 None
             } else if let Some(bid) = routing_result.buyer_id {
-                (sqlx::query_scalar::<_, String>(
-                    "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
-                )
-                .bind(bid)
-                .fetch_optional(&*state.db_pool)
-                .await)
+                let cache_key = format!("buyer:name:{}", bid);
+                if let Some(cache) = &state.cache {
+                    cache
+                        .get_or_insert_with(&cache_key, 3600, || async {
+                            sqlx::query_scalar::<_, String>(
+                                "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                            )
+                            .bind(bid)
+                            .fetch_optional(&*state.db_pool)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    // Fallback if cache not available
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                    )
+                    .bind(bid)
+                    .fetch_optional(&*state.db_pool)
+                    .await
                     .unwrap_or_default()
+                }
             } else {
                 None
             };
@@ -1830,13 +1621,31 @@ async fn create_lead(
             let campaign_name = if minimal_mode {
                 None
             } else if let Some(cid) = routing_result.campaign_id {
-                (sqlx::query_scalar::<_, String>(
-                    "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
-                )
-                .bind(cid)
-                .fetch_optional(&*state.db_pool)
-                .await)
+                let cache_key = format!("campaign:name:{}", cid);
+                if let Some(cache) = &state.cache {
+                    cache
+                        .get_or_insert_with(&cache_key, 3600, || async {
+                            sqlx::query_scalar::<_, String>(
+                                "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                            )
+                            .bind(cid)
+                            .fetch_optional(&*state.db_pool)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    // Fallback if cache not available
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                    )
+                    .bind(cid)
+                    .fetch_optional(&*state.db_pool)
+                    .await
                     .unwrap_or_default()
+                }
             } else {
                 None
             };

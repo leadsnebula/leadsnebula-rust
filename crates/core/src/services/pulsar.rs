@@ -276,12 +276,33 @@ impl PulsarService {
         campaign: &Campaign,
         qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
+        #[cfg(all(feature = "tracing", debug_assertions))]
+        let fullpost_start = std::time::Instant::now();
+
         // First do ping (sync)
+        #[cfg(all(feature = "tracing", debug_assertions))]
+        let ping_start = std::time::Instant::now();
         let ping_response =
             Self::route_ping_direct_sync(lead, campaign, qualification_config.clone())?;
+        #[cfg(all(feature = "tracing", debug_assertions))]
+        {
+            let ping_duration = ping_start.elapsed().as_millis() as u64;
+            tracing::debug!(
+                "route_fullpost_direct_sync: ping phase took {}ms",
+                ping_duration
+            );
+        }
 
         // If ping fails, return early
         if !ping_response.success {
+            #[cfg(all(feature = "tracing", debug_assertions))]
+            {
+                let total_duration = fullpost_start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    "route_fullpost_direct_sync: rejected in ping phase, total {}ms",
+                    total_duration
+                );
+            }
             return Ok(ping_response);
         }
 
@@ -291,8 +312,20 @@ impl PulsarService {
             .ok_or_else(|| anyhow::anyhow!("Ping succeeded but no promise_id returned"))?;
 
         // Then do post (sync)
+        #[cfg(all(feature = "tracing", debug_assertions))]
+        let post_start = std::time::Instant::now();
         let post_response =
             Self::route_post_direct_sync(lead, campaign, &promise_id, qualification_config)?;
+        #[cfg(all(feature = "tracing", debug_assertions))]
+        {
+            let post_duration = post_start.elapsed().as_millis() as u64;
+            let total_duration = fullpost_start.elapsed().as_millis() as u64;
+            tracing::debug!(
+                "route_fullpost_direct_sync: post phase took {}ms, total {}ms",
+                post_duration,
+                total_duration
+            );
+        }
 
         // Return post response (which includes both ping_id and post_id)
         Ok(BuyerResponse {
@@ -381,7 +414,7 @@ impl PulsarService {
         promise_id: &str,
         qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
-        #[cfg(feature = "tracing")]
+        #[cfg(all(feature = "tracing", debug_assertions))]
         let total_start = std::time::Instant::now();
 
         let lead_id = lead
@@ -392,7 +425,7 @@ impl PulsarService {
         // Inject chaos delay if enabled (sync version)
         inject_chaos_delay_sync();
 
-        #[cfg(feature = "tracing")]
+        #[cfg(all(feature = "tracing", debug_assertions))]
         let qual_start = std::time::Instant::now();
 
         // Evaluate qualification rules using qualification engine (already sync)
@@ -401,7 +434,7 @@ impl PulsarService {
         let qual_result: QualificationResult = engine.evaluate();
         let accepted = qual_result.accepted;
 
-        #[cfg(feature = "tracing")]
+        #[cfg(all(feature = "tracing", debug_assertions))]
         {
             let qual_duration = qual_start.elapsed().as_millis() as u64;
             tracing::debug!(
@@ -424,13 +457,13 @@ impl PulsarService {
             });
         }
 
-        #[cfg(feature = "tracing")]
+        #[cfg(all(feature = "tracing", debug_assertions))]
         let gen_start = std::time::Instant::now();
 
         // Generate post_id instantly
         let post_id = generate_post_id(&lead_id);
 
-        #[cfg(feature = "tracing")]
+        #[cfg(all(feature = "tracing", debug_assertions))]
         {
             let gen_duration = gen_start.elapsed().as_millis() as u64;
             let total_duration = total_start.elapsed().as_millis() as u64;

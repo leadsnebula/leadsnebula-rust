@@ -28,10 +28,18 @@ pub async fn pre_warm_cache(state: &AppState) {
     // Pre-warm SSM encryption keys (eliminates ~300ms delays on first request)
     let ssm_keys_warmed = pre_warm_ssm_keys(&state.ssm, &state.config.environment).await;
 
+    // Pre-warm buyer and campaign names (used in response messages)
+    let buyers_warmed = pre_warm_buyer_names(cache, pool).await;
+    let campaigns_warmed = pre_warm_campaign_names(cache, pool).await;
+
+    // Pre-warm buyer integrations and qualification configs (used in routing)
+    let integrations_warmed = pre_warm_buyer_integrations(cache, pool).await;
+    let qual_configs_warmed = pre_warm_qualification_configs(cache, pool).await;
+
     let duration_ms = start.elapsed().as_millis();
     info!(
-        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys",
-        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed
+        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys, {} buyers, {} campaigns, {} integrations, {} qual configs",
+        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed, buyers_warmed, campaigns_warmed, integrations_warmed, qual_configs_warmed
     );
 }
 
@@ -179,6 +187,158 @@ pub async fn pre_warm_ssm_keys(
         if det_key_cached { "hit" } else { "miss" },
         if salt_key_cached { "hit" } else { "miss" }
     );
+
+    warmed
+}
+
+/// Pre-warm buyer names (1h TTL - names rarely change)
+async fn pre_warm_buyer_names(
+    cache: &Arc<leadsnebula_core::cache::CacheService>,
+    pool: &PgPool,
+) -> usize {
+    let mut warmed = 0;
+
+    match sqlx::query(
+        "SELECT id, name FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                let buyer_id: uuid::Uuid = row.get("id");
+                let name: String = row.get("name");
+                let cache_key = format!("buyer:name:{}", buyer_id);
+                let _ = cache
+                    .get_or_insert_with(&cache_key, 3600, || async {
+                        Ok::<String, anyhow::Error>(name.clone())
+                    })
+                    .await;
+                warmed += 1;
+            }
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm buyer names: {}", e);
+        }
+    }
+
+    warmed
+}
+
+/// Pre-warm campaign names (1h TTL - names rarely change)
+async fn pre_warm_campaign_names(
+    cache: &Arc<leadsnebula_core::cache::CacheService>,
+    pool: &PgPool,
+) -> usize {
+    let mut warmed = 0;
+
+    match sqlx::query(
+        "SELECT id, name FROM campaigns WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200"
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                let campaign_id: uuid::Uuid = row.get("id");
+                let name: String = row.get("name");
+                let cache_key = format!("campaign:name:{}", campaign_id);
+                let _ = cache
+                    .get_or_insert_with(&cache_key, 3600, || async {
+                        Ok::<String, anyhow::Error>(name.clone())
+                    })
+                    .await;
+                warmed += 1;
+            }
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm campaign names: {}", e);
+        }
+    }
+
+    warmed
+}
+
+/// Pre-warm buyer integrations (1h TTL - integrations rarely change)
+/// Note: Buyer integrations are cached by integration_id in buyer_router, not buyer_id
+/// This pre-warms active buyer integrations
+async fn pre_warm_buyer_integrations(
+    cache: &Arc<leadsnebula_core::cache::CacheService>,
+    pool: &PgPool,
+) -> usize {
+    let mut warmed = 0;
+
+    match sqlx::query(
+        "SELECT id FROM buyer_integrations WHERE status = 'available' ORDER BY created_at DESC LIMIT 200"
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                let integration_id: uuid::Uuid = row.get("id");
+                let cache_key = format!("buyer_integration:id:{}", integration_id);
+                // Trigger cache by calling get_or_insert_with (BuyerIntegration::find_by_id is already cached in buyer_router)
+                let _ = cache
+                    .get_or_insert_with(&cache_key, 3600, || async {
+                        use leadsnebula_core::models::buyer_integration::BuyerIntegration;
+                        BuyerIntegration::find_by_id(pool, &integration_id)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                    })
+                    .await;
+                warmed += 1;
+            }
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm buyer integrations: {}", e);
+        }
+    }
+
+    warmed
+}
+
+/// Pre-warm qualification configs (1h TTL - configs rarely change)
+/// Uses find_by_buyer_ids which takes a slice, so we batch them
+async fn pre_warm_qualification_configs(
+    cache: &Arc<leadsnebula_core::cache::CacheService>,
+    pool: &PgPool,
+) -> usize {
+    let mut warmed = 0;
+
+    // Get list of buyer_ids with active qualification configs
+    match sqlx::query(
+        "SELECT DISTINCT buyer_id FROM buyer_qualification_configs WHERE deleted_at IS NULL AND enabled = true AND is_active = true LIMIT 200"
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            let buyer_ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.get::<uuid::Uuid, _>("buyer_id")).collect();
+
+            // Batch fetch all configs at once
+            if !buyer_ids.is_empty() {
+                use leadsnebula_core::models::buyer_qualification_config::BuyerQualificationConfig;
+                if let Ok(configs_map) = BuyerQualificationConfig::find_by_buyer_ids(pool, &buyer_ids).await {
+                    for buyer_id in buyer_ids {
+                        let cache_key = format!("qual:buyers:{}", buyer_id);
+                        // Trigger cache by calling get_or_insert_with
+                        if let Some(config) = configs_map.get(&buyer_id).and_then(|c| c.as_ref()) {
+                            let _ = cache
+                                .get_or_insert_with(&cache_key, 3600, || async {
+                                    Ok::<BuyerQualificationConfig, anyhow::Error>(config.clone())
+                                })
+                                .await;
+                            warmed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to pre-warm qualification configs: {}", e);
+        }
+    }
 
     warmed
 }

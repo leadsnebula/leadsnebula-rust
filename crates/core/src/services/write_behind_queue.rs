@@ -45,6 +45,7 @@ type PayloadUpdateTuple = (
 
 /// Background tasks that can be batched
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)] // LeadCreation variant is large but necessary for decoupling
 pub enum BackgroundTask {
     /// Pulsar decision log
     PulsarLog {
@@ -87,6 +88,38 @@ pub enum BackgroundTask {
         // For ping_payloads UPDATE:
         ping_payloads_row_id: Option<uuid::Uuid>, // row id for ping_payloads UPDATE (actually lead_id, used to find the row)
         external_ping_id: Option<String>,         // external_ping_id for ping_payloads UPDATE
+    },
+    /// Lead creation (decoupled from critical path)
+    /// All encryption happens here in batch
+    LeadCreation {
+        event_id: String,
+        lead_id: Option<String>,
+        publisher_id: Uuid,
+        vertical_id: Uuid,
+        request_type: String,
+        strategy: String,
+        promise_id: Option<String>,
+        buyer_id: Uuid,
+        campaign_id: Uuid,
+        tcpa_consent: bool,
+        tcpa_language: String,
+        is_test: bool,
+        session_id: String,
+        vertical_data: Value,
+        // Raw PII fields (will be encrypted in batch processor)
+        first_name: Option<String>,
+        last_name: Option<String>,
+        email: Option<String>,
+        cell_phone: Option<String>,
+        street_address: Option<String>,
+        city: Option<String>,
+        state: Option<String>,
+        zip: Option<String>,
+        ip_address: Option<String>,
+        // Raw request payload (will be encrypted in batch processor)
+        request_payload: Value,
+        // SSM encryption key (derived from det_key + salt, passed to avoid re-fetching)
+        pii_encryption_key: Option<Vec<u8>>,
     },
 }
 
@@ -181,6 +214,7 @@ impl WriteBehindQueue {
         let mut buyer_responses = Vec::new();
         let mut lead_updates = Vec::new();
         let mut payload_updates = Vec::new();
+        let mut lead_creations = Vec::new();
 
         for task in batch.drain(..) {
             match task {
@@ -246,15 +280,17 @@ impl WriteBehindQueue {
                     ping_payloads_row_id,
                     external_ping_id,
                 )),
+                BackgroundTask::LeadCreation { .. } => lead_creations.push(task),
             }
         }
 
         // Execute batches in parallel
-        let (pulsar_result, buyer_result, lead_result, payload_result) = tokio::join!(
+        let (pulsar_result, buyer_result, lead_result, payload_result, creation_result) = tokio::join!(
             Self::batch_insert_pulsar_logs(&pulsar_logs, pool),
             Self::batch_insert_buyer_responses(&buyer_responses, pool),
             Self::batch_update_leads(&lead_updates, pool),
             Self::batch_update_payloads(&payload_updates, pool),
+            Self::batch_create_leads(&lead_creations, pool),
         );
 
         // Log errors (non-blocking)
@@ -269,6 +305,9 @@ impl WriteBehindQueue {
         }
         if let Err(e) = payload_result {
             tracing::warn!("Failed to batch update payloads: {}", e);
+        }
+        if let Err(e) = creation_result {
+            tracing::warn!("Failed to batch create leads: {}", e);
         }
     }
 
@@ -505,6 +544,213 @@ impl WriteBehindQueue {
                     .bind(sqlx::types::Json(payload))
                     .execute(pool)
                     .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batch create leads with encryption
+    async fn batch_create_leads(creations: &[BackgroundTask], pool: &PgPool) -> Result<()> {
+        if creations.is_empty() {
+            return Ok(());
+        }
+
+        // Process each lead creation individually (encryption happens here)
+        for task in creations {
+            if let BackgroundTask::LeadCreation {
+                event_id,
+                lead_id,
+                publisher_id,
+                vertical_id,
+                request_type,
+                strategy,
+                promise_id,
+                buyer_id,
+                campaign_id,
+                tcpa_consent,
+                tcpa_language,
+                is_test,
+                session_id,
+                vertical_data,
+                first_name,
+                last_name,
+                email,
+                cell_phone,
+                street_address,
+                city,
+                state,
+                zip,
+                ip_address,
+                request_payload,
+                pii_encryption_key,
+            } = task
+            {
+                // Encrypt PII fields in batch (using shared key if available)
+                let encrypt_pii = |value: Option<String>| -> Option<String> {
+                    if let (Some(val), Some(key)) = (value, pii_encryption_key) {
+                        if !val.is_empty() {
+                            if let Ok(envelope) =
+                                crate::encryption::EncryptionService::encrypt_envelope(
+                                    key, &val, true,
+                                )
+                            {
+                                return Some(envelope);
+                            }
+                        }
+                    }
+                    None
+                };
+
+                let first_name_encrypted = encrypt_pii(first_name.clone());
+                let last_name_encrypted = encrypt_pii(last_name.clone());
+                let email_encrypted = encrypt_pii(email.clone());
+                let cell_phone_encrypted = encrypt_pii(cell_phone.clone());
+                let street_address_encrypted = encrypt_pii(street_address.clone());
+                let city_encrypted = encrypt_pii(city.clone());
+                let state_encrypted = encrypt_pii(state.clone());
+                let zip_encrypted = encrypt_pii(zip.clone());
+                let ip_address_encrypted = encrypt_pii(ip_address.clone());
+
+                // Encrypt request payload if key is available
+                let encrypted_request = if let Some(key) = pii_encryption_key {
+                    if let Ok(bytes) = simd_json::to_vec(request_payload) {
+                        if let Ok(req_str) = String::from_utf8(bytes) {
+                            crate::encryption::EncryptionService::encrypt_envelope(
+                                key, &req_str, true,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Start transaction
+                let mut tx = match pool.begin().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("Failed to start transaction for lead creation: {}", e);
+                        continue;
+                    }
+                };
+
+                // Insert lead
+                let lead_uuid_result = sqlx::query(
+                    r#"
+                    INSERT INTO leads (
+                        event_id, lead_id, publisher_id, vertical_id, request_type, strategy, status,
+                        promise_id, tcpa_consent, tcpa_language, is_test, session_id, vertical_data,
+                        buyer_id, campaign_id, post_id, submitted_at, created_at,
+                        first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted,
+                        street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                        $14, $15, $16, NOW(), NOW(),
+                        $17, $18, $19, $20, $21, $22, $23, $24, $25
+                    ) RETURNING uuid
+                    "#,
+                )
+                .bind(event_id)
+                .bind(lead_id.as_ref())
+                .bind(publisher_id)
+                .bind(vertical_id)
+                .bind(request_type)
+                .bind(strategy)
+                .bind("processing")
+                .bind(promise_id.as_ref())
+                .bind(*tcpa_consent)
+                .bind(tcpa_language)
+                .bind(*is_test)
+                .bind(session_id)
+                .bind(sqlx::types::Json(vertical_data))
+                .bind(buyer_id)
+                .bind(campaign_id)
+                .bind("")
+                .bind(first_name_encrypted)
+                .bind(last_name_encrypted)
+                .bind(email_encrypted)
+                .bind(cell_phone_encrypted)
+                .bind(street_address_encrypted)
+                .bind(city_encrypted)
+                .bind(state_encrypted)
+                .bind(zip_encrypted)
+                .bind(ip_address_encrypted)
+                .fetch_one(&mut *tx)
+                .await;
+
+                let lead_uuid = match lead_uuid_result {
+                    Ok(row) => {
+                        use sqlx::Row;
+                        row.get::<uuid::Uuid, _>(0)
+                    }
+                    Err(e) => {
+                        tracing::error!("Database error creating lead: {}", e);
+                        let _ = tx.rollback().await;
+                        continue;
+                    }
+                };
+
+                // Generate ping_id
+                let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+                let lead_id_str = lead_uuid.to_string();
+                let payload_str = format!("{}|{}|pending", lead_id_str, timestamp);
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(payload_str);
+                let ping_id_text = format!("FP_{}", encoded);
+
+                // Insert ping record
+                let ping_id_result = sqlx::query(
+                    "INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, $3, $4, now(), now()) RETURNING id"
+                )
+                .bind(&ping_id_text)
+                .bind(lead_uuid)
+                .bind(promise_id.as_ref())
+                .bind("processing")
+                .fetch_one(&mut *tx)
+                .await;
+
+                let ping_id_val = match ping_id_result {
+                    Ok(row) => {
+                        use sqlx::Row;
+                        row.get::<i64, _>("id")
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to create ping record for lead {} (non-critical): {}",
+                            lead_uuid,
+                            e
+                        );
+                        0i64
+                    }
+                };
+
+                // Insert ping_payloads
+                if ping_id_val > 0 {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at) VALUES ($1, $2, $3, $4, now())"
+                    )
+                    .bind(ping_id_val)
+                    .bind(lead_uuid)
+                    .bind(sqlx::types::Json(request_payload))
+                    .bind(encrypted_request)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        tracing::warn!("Failed to create ping_payloads record for lead {} (non-critical): {}", lead_uuid, e);
+                    }
+                }
+
+                // Commit transaction
+                if let Err(e) = tx.commit().await {
+                    tracing::error!("Failed to commit transaction for lead {}: {}", lead_uuid, e);
+                } else {
+                    tracing::debug!("Successfully created lead {} in background", lead_uuid);
                 }
             }
         }
