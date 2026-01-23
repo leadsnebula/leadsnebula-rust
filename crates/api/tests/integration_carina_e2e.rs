@@ -176,8 +176,9 @@ async fn test_e2e_ping_request_flow() {
         .unwrap();
 
     // Create ping_tree_publishers entry (required for routing in new schema)
-    // Ignore errors if table doesn't exist yet (migration may not have run)
-    let _ = sqlx::query(
+    // Use savepoint to handle errors gracefully without aborting the transaction
+    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    let insert_result = sqlx::query(
             r#"
             INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
             VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
@@ -189,6 +190,13 @@ async fn test_e2e_ping_request_flow() {
         .bind(&vertical_slug)
         .execute(&mut *tx)
         .await;
+    
+    // If insert failed (e.g., table doesn't exist), rollback to savepoint
+    if insert_result.is_err() {
+        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    } else {
+        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    }
 
     // Add campaign to ping tree
     sqlx::query(
@@ -258,6 +266,30 @@ async fn test_e2e_ping_request_flow() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
+
+    // Insert lead into database (required for router.update_lead_status)
+    let strategy_val = "pingPost".to_string();
+    sqlx::query(
+            r#"
+            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, tcpa_consent, tcpa_language, submitted_at, buyer_id, campaign_id, post_id, session_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8, NOW(), $9, $10, $11, $12, NOW(), NOW())
+            "#,
+        )
+        .bind(lead.uuid)
+        .bind(&lead.event_id)
+        .bind(lead.publisher_id)
+        .bind(lead.vertical_id)
+        .bind(&lead.request_type)
+        .bind(&strategy_val)
+        .bind(lead.tcpa_consent)
+        .bind(&lead.tcpa_language)
+        .bind(lead.buyer_id)
+        .bind(lead.campaign_id)
+        .bind(lead.post_id.as_ref().unwrap_or(&String::new()))
+        .bind(lead.session_id.as_ref())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Test routing
     use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
@@ -364,8 +396,9 @@ async fn test_e2e_fullpost_request_flow() {
         .unwrap();
 
     // Create ping_tree_publishers entry (required for routing in new schema)
-    // Ignore errors if table doesn't exist yet (migration may not have run)
-    let _ = sqlx::query(
+    // Use savepoint to handle errors gracefully without aborting the transaction
+    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    let insert_result = sqlx::query(
             r#"
             INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
             VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
@@ -377,6 +410,13 @@ async fn test_e2e_fullpost_request_flow() {
         .bind(&vertical_slug)
         .execute(&mut *tx)
         .await;
+    
+    // If insert failed (e.g., table doesn't exist), rollback to savepoint
+    if insert_result.is_err() {
+        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    } else {
+        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    }
 
     // Add campaign to ping tree
     sqlx::query(
@@ -446,6 +486,30 @@ async fn test_e2e_fullpost_request_flow() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
+
+    // Insert lead into database (required for router.update_lead_status)
+    let strategy_val = "fullPost".to_string();
+    sqlx::query(
+            r#"
+            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, tcpa_consent, tcpa_language, submitted_at, buyer_id, campaign_id, post_id, session_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8, NOW(), $9, $10, $11, $12, NOW(), NOW())
+            "#,
+        )
+        .bind(lead.uuid)
+        .bind(&lead.event_id)
+        .bind(lead.publisher_id)
+        .bind(lead.vertical_id)
+        .bind(&lead.request_type)
+        .bind(&strategy_val)
+        .bind(lead.tcpa_consent)
+        .bind(&lead.tcpa_language)
+        .bind(lead.buyer_id)
+        .bind(lead.campaign_id)
+        .bind(lead.post_id.as_ref().unwrap_or(&String::new()))
+        .bind(lead.session_id.as_ref())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Test fullpost routing
     use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
@@ -538,6 +602,30 @@ async fn test_e2e_error_handling() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
+
+    // Insert lead into database (required for router.update_lead_status)
+    let strategy_val = "pingPost".to_string();
+    sqlx::query(
+            r#"
+            INSERT INTO leads (uuid, event_id, publisher_id, vertical_id, request_type, strategy, status, tcpa_consent, tcpa_language, submitted_at, buyer_id, campaign_id, post_id, session_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8, NOW(), $9, $10, $11, $12, NOW(), NOW())
+            "#,
+        )
+        .bind(lead_no_tree.uuid)
+        .bind(&lead_no_tree.event_id)
+        .bind(lead_no_tree.publisher_id)
+        .bind(lead_no_tree.vertical_id)
+        .bind(&lead_no_tree.request_type)
+        .bind(&strategy_val)
+        .bind(lead_no_tree.tcpa_consent)
+        .bind(&lead_no_tree.tcpa_language)
+        .bind(lead_no_tree.buyer_id)
+        .bind(lead_no_tree.campaign_id)
+        .bind(lead_no_tree.post_id.as_ref().unwrap_or(&String::new()))
+        .bind(lead_no_tree.session_id.as_ref())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     use leadsnebula_core::services::ping_tree_router::PingTreeRouter;
     let router = PingTreeRouter::new(
