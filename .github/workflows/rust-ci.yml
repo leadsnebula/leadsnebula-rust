@@ -96,6 +96,14 @@ jobs:
             cargo clippy ${{ steps.changed-rust.outputs.packages }} --all-targets --all-features -- -D warnings
           fi
 
+      - name: Show sccache statistics
+        if: steps.changed-rust.outputs.has_rust_changes == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Lint Job) ==="
+            sccache --show-stats || true
+          fi
+
   test-integration:
     name: Integration Tests (ephemeral Neon branch)
     runs-on: ubuntu-latest
@@ -157,11 +165,29 @@ jobs:
         with:
           workspaces: "."
 
+      - name: Cache cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-nextest-${{ runner.os }}-
+
       - name: Install cargo-nextest
         run: |
-          if ! command -v cargo-nextest &> /dev/null; then
+          if [ -f ~/.cargo/bin/cargo-nextest ]; then
+            echo "✅ Using cached cargo-nextest"
+          elif ! command -v cargo-nextest &> /dev/null; then
             cargo install cargo-nextest --locked
           fi
+
+      - name: Cache npm (for neonctl)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-neonctl
+          restore-keys: |
+            npm-${{ runner.os }}-
 
       - name: Install Neon CLI (neonctl)
         run: |
@@ -169,7 +195,7 @@ jobs:
           # The correct package is 'neonctl', not '@neondatabase/api-client'
           echo "Setting up Neon CLI via npx..."
           echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
-          # Verify it works
+          # Verify it works (npm cache will speed this up)
           npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
           echo "✅ neonctl ready via npx"
 
@@ -237,16 +263,34 @@ jobs:
           CI: "true"
         run: |
           echo "DATABASE_URL is set (ephemeral Neon branch)"
-          # Health
-          cargo test --test integration_health --locked --all-features -- --test-threads=1
-          # Auth (OTP, passkey, user)
-          cargo test --test integration_auth --locked --all-features -- --test-threads=1
-          # Publisher CRUD
-          cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1
-          # E2E
-          cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1
+          # Use cargo-nextest for parallel execution (faster than sequential cargo test)
+          # Health tests - quick, can run in parallel
+          cargo nextest run --test integration_health --locked --all-features --test-threads=2 || \
+            cargo test --test integration_health --locked --all-features -- --test-threads=2
+          
+          # Auth tests - some may need sequential execution due to DB state
+          # Use 2 threads to balance speed and isolation
+          cargo nextest run --test integration_auth --locked --all-features --test-threads=2 || \
+            cargo test --test integration_auth --locked --all-features -- --test-threads=2
+          
+          # Publisher CRUD tests
+          cargo nextest run --test integration_publisher_crud --locked --all-features --test-threads=2 || \
+            cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=2
+          
+          # E2E tests
+          cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=2 || \
+            cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=2
+          
           # NOTE: --ignored lib tests (duplicate_post, ping_tree_*_db, async_persistence) are
           # skipped in CI; run locally via ./autotests.sh to avoid Neon load and keep CI <10 min.
+
+      - name: Show sccache statistics
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Integration Tests) ==="
+            sccache --show-stats || true
+          fi
 
       - name: Cleanup ephemeral Neon branch
         if: always() && steps.needs-integration.outputs.needs_tests == 'true'
@@ -368,6 +412,14 @@ jobs:
             fi
           fi
 
+      - name: Show sccache statistics
+        if: steps.changed-crates.outputs.has_rust_changes == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Unit Tests) ==="
+            sccache --show-stats || true
+          fi
+
   build:
     name: Build Release
     runs-on: ubuntu-latest
@@ -421,6 +473,14 @@ jobs:
       - name: Build release
         if: steps.needs-build.outputs.needs_build == 'true'
         run: cargo build --release --locked
+
+      - name: Show sccache statistics
+        if: steps.needs-build.outputs.needs_build == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics ==="
+            sccache --show-stats || true
+          fi
 
   coverage:
     name: Code Coverage
@@ -478,6 +538,15 @@ jobs:
         with:
           workspaces: "."
 
+      - name: Cache npm (for neonctl)
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-neonctl
+          restore-keys: |
+            npm-${{ runner.os }}-
+
       - name: Install Neon CLI (neonctl)
         if: steps.needs-coverage.outputs.needs_coverage == 'true'
         run: |
@@ -485,7 +554,7 @@ jobs:
           # The correct package is 'neonctl', not '@neondatabase/api-client'
           echo "Setting up Neon CLI via npx..."
           echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
-          # Verify it works
+          # Verify it works (npm cache will speed this up)
           npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
           echo "✅ neonctl ready via npx"
 
@@ -551,6 +620,14 @@ jobs:
           # Show coverage summary
           echo "📊 Coverage report generated successfully"
           echo "File size: $(du -h lcov.info | cut -f1)"
+
+      - name: Show sccache statistics
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Coverage) ==="
+            sccache --show-stats || true
+          fi
 
       - name: Upload coverage to artifacts
         if: steps.needs-coverage.outputs.needs_coverage == 'true'

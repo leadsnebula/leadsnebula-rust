@@ -3,20 +3,77 @@ description: 'Install and configure sccache for Rust compilation caching'
 runs:
   using: 'composite'
   steps:
-    - name: Install sccache
+    - name: Cache sccache binary
+      uses: actions/cache@v4
+      id: sccache-bin-cache
+      with:
+        path: ~/.cargo/bin/sccache
+        key: sccache-binary-${{ runner.os }}-v0.13.0
+        restore-keys: |
+          sccache-binary-${{ runner.os }}-
+
+    - name: Install sccache (pre-built binary)
       shell: bash
       run: |
-        if ! command -v sccache &> /dev/null; then
-          cargo install sccache --locked || true
+        if [ -f ~/.cargo/bin/sccache ] && [ -x ~/.cargo/bin/sccache ]; then
+          echo "✅ Using cached sccache binary"
+        elif ! command -v sccache &> /dev/null; then
+          echo "Downloading pre-built sccache binary..."
+          SCCACHE_VERSION="0.13.0"
+          mkdir -p ~/.cargo/bin
+          
+          # Detect OS and download appropriate binary
+          OS_TYPE="${{ runner.os }}"
+          if [ -z "$OS_TYPE" ]; then
+            # Fallback: detect OS from uname
+            case "$(uname -s)" in
+              Linux*) OS_TYPE="Linux" ;;
+              Darwin*) OS_TYPE="macOS" ;;
+              *) OS_TYPE="Linux" ;; # Default to Linux
+            esac
+          fi
+          
+          # Download pre-built binary from GitHub releases
+          if [ "$OS_TYPE" = "Linux" ]; then
+            curl -L -o /tmp/sccache.tar.gz \
+              "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+              && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+              && cp /tmp/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache ~/.cargo/bin/sccache \
+              && chmod +x ~/.cargo/bin/sccache \
+              && rm -rf /tmp/sccache* || true
+          elif [ "$OS_TYPE" = "macOS" ]; then
+            curl -L -o /tmp/sccache.tar.gz \
+              "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-apple-darwin.tar.gz" \
+              && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+              && cp /tmp/sccache-v${SCCACHE_VERSION}-x86_64-apple-darwin/sccache ~/.cargo/bin/sccache \
+              && chmod +x ~/.cargo/bin/sccache \
+              && rm -rf /tmp/sccache* || true
+          else
+            echo "⚠️  Unsupported OS: $OS_TYPE, falling back to cargo install"
+            cargo install sccache --locked --version 0.13.0 || true
+          fi
+          
+          # Add to PATH if not already there
+          if ! echo "$PATH" | grep -q "$HOME/.cargo/bin"; then
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+        fi
+        
+        # Verify installation
+        if command -v sccache &> /dev/null; then
+          sccache --version || true
+        else
+          echo "⚠️  sccache binary download failed, falling back to cargo install"
+          cargo install sccache --locked --version 0.13.0 || true
         fi
 
-    - name: Cache sccache
+    - name: Cache sccache compilation cache
       uses: actions/cache@v4
       with:
         path: ~/.cache/sccache
-        key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-sccache-cache-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-sccache-
+          ${{ runner.os }}-sccache-cache-
 
     - name: Set sccache wrapper
       shell: bash
@@ -24,4 +81,6 @@ runs:
         if command -v sccache >/dev/null 2>&1; then
           echo "RUSTC_WRAPPER=$(which sccache)" >> $GITHUB_ENV
           echo "Using sccache at $(which sccache)"
+          # Show initial stats
+          sccache --show-stats || true
         fi

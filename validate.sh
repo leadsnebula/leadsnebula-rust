@@ -54,8 +54,11 @@ USE_FALLBACK=false
 
 if [ ! -f "$VALIDATE_CONFIG_BIN" ] || [ "$VALIDATE_CONFIG_SRC" -nt "$VALIDATE_CONFIG_BIN" ]; then
     echo "Building validate-config..."
-    if ! cargo build --release --bin validate-config --quiet 2>/dev/null; then
+    # Build with visible output (remove --quiet) so we can see what's happening
+    # Redirect stderr to stdout so errors are visible
+    if ! cargo build --release --bin validate-config 2>&1 | tee /tmp/validate-config-build.log; then
         echo "⚠️  validate-config build failed, using fallback parsing"
+        echo "   Build output saved to /tmp/validate-config-build.log"
         USE_FALLBACK=true
     fi
 fi
