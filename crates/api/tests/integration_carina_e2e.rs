@@ -669,7 +669,7 @@ async fn test_e2e_error_handling() {
         .bind(buyer_id)  // Use buyer_id from test setup
         .bind(campaign_id)  // Use campaign_id from test setup
         .bind(lead_no_tree.post_id.as_ref().unwrap_or(&String::new()))
-        .bind(lead_no_tree.session_id.as_ref())
+        .bind(lead_no_tree.session_id.as_ref().unwrap_or(&format!("sess_{}", Uuid::new_v4())))  // Generate session_id if None (required NOT NULL)
         .execute(&mut *tx)
         .await
         .unwrap();
