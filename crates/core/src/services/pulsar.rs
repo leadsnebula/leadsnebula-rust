@@ -349,19 +349,35 @@ impl PulsarService {
         _campaign: &Campaign,
         qualification_config: Option<BuyerQualificationConfig>,
     ) -> Result<BuyerResponse> {
+        let total_start = std::time::Instant::now();
         let lead_id = lead
             .lead_id
             .clone()
             .unwrap_or_else(|| lead.uuid.to_string());
 
         // Inject chaos delay if enabled (sync version)
+        let chaos_start = std::time::Instant::now();
         inject_chaos_delay_sync();
+        let chaos_duration = chaos_start.elapsed().as_millis() as u64;
+        if chaos_duration > 0 {
+            tracing::info!(
+                chaos_delay_ms = chaos_duration,
+                "Chaos delay injected (sync)"
+            );
+        }
 
         // Evaluate qualification rules using qualification engine (already sync)
+        let qual_eval_start = std::time::Instant::now();
         let engine =
             QualificationEngine::new(lead.clone(), "ping".to_string(), qualification_config);
         let qual_result: QualificationResult = engine.evaluate();
+        let qual_eval_duration = qual_eval_start.elapsed().as_millis() as u64;
         let accepted = qual_result.accepted;
+        tracing::info!(
+            qualification_evaluation_ms = qual_eval_duration,
+            accepted = accepted,
+            "Qualification evaluation completed"
+        );
 
         if !accepted {
             let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -388,10 +404,24 @@ impl PulsarService {
         }
 
         // Generate IDs instantly
+        let id_generation_start = std::time::Instant::now();
         let ping_id = generate_ping_id(&lead_id);
         let promise_id = generate_promise_id();
+        let id_generation_duration = id_generation_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            id_generation_ms = id_generation_duration,
+            "Pulsar ID generation completed"
+        );
 
         // Return instantly with random bid
+        let total_pulsar_duration = total_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            total_pulsar_ping_ms = total_pulsar_duration,
+            qualification_ms = qual_eval_duration,
+            id_generation_ms = id_generation_duration,
+            chaos_delay_ms = chaos_duration,
+            "Pulsar ping_direct_sync completed"
+        );
         Ok(BuyerResponse {
             success: true,
             status: "accepted".to_string(),

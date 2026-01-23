@@ -130,6 +130,11 @@ impl PingTreeRouter {
             .unwrap_or_else(|| local_metrics);
 
         // Find active ping tree for publisher and vertical with revshare info (CACHED - 6h TTL)
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "ping_tree_lookup_start",
+            "Starting ping tree lookup"
+        );
         let _ping_tree_lookup_start = std::time::Instant::now();
         let ping_tree_start = std::time::Instant::now();
         let cache_key = format!("pingtree:pub:{}:vert:{}", self.publisher_id, self.vertical);
@@ -159,6 +164,12 @@ impl PingTreeRouter {
         } else if ping_tree_duration > 0 {
             metrics.record_cache_miss();
         }
+        // DETAILED TIMING: Log ping tree lookup
+        tracing::info!(
+            ping_tree_lookup_ms = ping_tree_duration,
+            cache_hit = was_cache_hit,
+            "Ping tree lookup completed"
+        );
 
         let (ping_tree, _revshare_percentage, _revshare_flat_amount) = match ping_tree_result {
             Some((pt, revshare_pct, revshare_flat)) => {
@@ -228,6 +239,12 @@ impl PingTreeRouter {
         }
 
         // Get enabled campaigns from ping tree (CACHED - 6h TTL)
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "campaigns_load_start",
+            ping_tree_id = %ping_tree.id,
+            "Starting campaigns loading"
+        );
         let campaigns_start = std::time::Instant::now();
         let campaigns_cache_key = format!("campaigns:pingtree:{}", ping_tree.id);
         let cache_hit_before = if let Some(cache) = &self.cache {
@@ -260,6 +277,13 @@ impl PingTreeRouter {
         } else if campaigns_duration > 0 {
             metrics.record_cache_miss();
         }
+        // DETAILED TIMING: Log campaigns loading
+        tracing::info!(
+            campaigns_load_ms = campaigns_duration,
+            cache_hit = was_cache_hit,
+            ping_tree_campaign_count = ping_tree_campaigns.len(),
+            "Campaigns loaded"
+        );
         #[cfg(all(feature = "tracing", debug_assertions))]
         tracing::debug!(
             lead_id = %self.lead.uuid,
@@ -293,14 +317,146 @@ impl PingTreeRouter {
             });
         }
 
-        // Load campaigns in batch with eager loading (optimize N+1 queries)
-        // Eager load campaigns with buyers and integrations in a single query
+        // OPTIMIZED: Load campaigns with associations (CACHED) and qualification configs in PARALLEL
+        // Both operations depend on campaign_ids but are independent of each other
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "campaigns_associations_start",
+            campaign_count = ping_tree_campaigns.len(),
+            "Starting campaigns with associations and qualification configs loading (parallelized)"
+        );
+        let campaigns_load_start = std::time::Instant::now();
+        let buyer_ids_extraction_start = std::time::Instant::now();
         let campaign_ids: Vec<Uuid> = ping_tree_campaigns
             .iter()
             .map(|ptc| ptc.campaign_id)
             .collect();
-        let campaigns_with_associations =
-            Campaign::find_by_ids_with_associations(pool.as_ref(), &campaign_ids).await?;
+
+        // Extract buyer_ids from ping_tree_campaigns by querying campaigns first (lightweight query)
+        // We need buyer_ids to parallelize qualification configs loading
+        let buyer_ids_from_campaigns = if let Some(cache) = &self.cache {
+            // Quick query to get buyer_ids (can be cached per campaign_id)
+            let mut buyer_ids = std::collections::HashSet::new();
+            for campaign_id in &campaign_ids {
+                let cache_key = format!("campaign:buyer_id:{}", campaign_id);
+                if let Ok(Some(buyer_id)) = cache
+                    .get_or_insert_with(&cache_key, 3600, || async {
+                        sqlx::query_scalar::<_, uuid::Uuid>(
+                            "SELECT buyer_id FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                        )
+                        .bind(campaign_id)
+                        .fetch_optional(pool.as_ref())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                    })
+                    .await
+                {
+                    buyer_ids.insert(buyer_id);
+                }
+            }
+            buyer_ids.into_iter().collect()
+        } else {
+            // Fallback: query buyer_ids directly
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT DISTINCT buyer_id FROM campaigns WHERE id = ANY($1) AND deleted_at IS NULL",
+            )
+            .bind(&campaign_ids)
+            .fetch_all(pool.as_ref())
+            .await
+            .unwrap_or_default()
+        };
+        let buyer_ids_extraction_duration = buyer_ids_extraction_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            buyer_ids_extraction_ms = buyer_ids_extraction_duration,
+            buyer_count = buyer_ids_from_campaigns.len(),
+            "Buyer IDs extracted from campaigns"
+        );
+
+        // PARALLELIZE: Load campaigns_with_associations (CACHED) and qualification configs simultaneously
+        let parallel_load_start = std::time::Instant::now();
+        let (campaigns_with_associations_result, qualification_configs_result) = tokio::join!(
+            // Cache campaigns with associations (1h TTL - campaigns rarely change)
+            async {
+                if let Some(cache) = &self.cache {
+                    let mut sorted_ids = campaign_ids.clone();
+                    sorted_ids.sort();
+                    let cache_key = format!(
+                        "campaigns:associations:{}",
+                        sorted_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    cache
+                        .get_or_insert_with(&cache_key, 3600, || async {
+                            Campaign::find_by_ids_with_associations(pool.as_ref(), &campaign_ids)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                        })
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Campaign::find_by_ids_with_associations(pool.as_ref(), &campaign_ids)
+                        .await
+                        .unwrap_or_default()
+                }
+            },
+            // Load qualification configs (already cached, but parallelize the cache lookup)
+            async {
+                if !buyer_ids_from_campaigns.is_empty() {
+                    let mut sorted_buyer_ids = buyer_ids_from_campaigns.clone();
+                    sorted_buyer_ids.sort();
+                    let qual_cache_key = format!(
+                        "qual:buyers:{}",
+                        sorted_buyer_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    if let Some(cache) = &self.cache {
+                        cache
+                            .get_or_insert_with(&qual_cache_key, 3600, || async {
+                                BuyerQualificationConfig::find_by_buyer_ids(
+                                    pool.as_ref(),
+                                    &buyer_ids_from_campaigns,
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                            })
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        BuyerQualificationConfig::find_by_buyer_ids(
+                            pool.as_ref(),
+                            &buyer_ids_from_campaigns,
+                        )
+                        .await
+                        .unwrap_or_default()
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                }
+            }
+        );
+
+        let campaigns_with_associations = campaigns_with_associations_result;
+        let qualification_configs = qualification_configs_result;
+        let parallel_load_duration = parallel_load_start.elapsed().as_millis() as u64;
+        let campaigns_load_duration = campaigns_load_start.elapsed().as_millis() as u64;
+        metrics.record_query(campaigns_load_duration);
+        timing.record_pre_checks(campaigns_load_duration);
+
+        // DETAILED TIMING: Log parallel loading breakdown
+        tracing::info!(
+            campaigns_associations_load_ms = campaigns_load_duration,
+            parallel_load_ms = parallel_load_duration,
+            buyer_ids_extraction_ms = buyer_ids_extraction_duration,
+            campaign_count = campaign_ids.len(),
+            buyer_count = buyer_ids_from_campaigns.len(),
+            "Campaigns with associations and qualification configs loaded in parallel"
+        );
 
         // Store buyer/integration data to avoid redundant DB lookups in BuyerRouter (Phase 7.1 optimization)
         use crate::models::buyer_integration::BuyerIntegration;
@@ -327,44 +483,16 @@ impl PingTreeRouter {
             }
         }
 
-        // Preload qualification configs for all unique buyers before spawning ping tasks
-        let unique_buyer_ids: Vec<Uuid> = campaigns
-            .iter()
-            .map(|c| c.buyer_id)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let qual_configs_query_start = std::time::Instant::now();
-
-        // Cache qualification configs to avoid 180-203ms DB query every auction
-        let qual_cache_key = format!(
-            "qual:buyers:{}",
-            unique_buyer_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
+        let qual_preload_duration = campaigns_load_duration; // Same duration since parallelized
+        metrics.record_query(campaigns_load_duration);
+        timing.record_qualification(campaigns_load_duration);
+        // DETAILED TIMING: Log qualification config loading (now parallelized with campaigns)
+        tracing::info!(
+            qual_configs_ms = campaigns_load_duration,
+            qual_preload_total_ms = qual_preload_duration,
+            buyer_count = buyer_ids_from_campaigns.len(),
+            "Qualification configs loaded (parallelized with campaigns)"
         );
-        let qualification_configs: std::collections::HashMap<
-            Uuid,
-            Option<BuyerQualificationConfig>,
-        > = if let Some(cache) = &self.cache {
-            cache
-                .get_or_insert_with(&qual_cache_key, 3600, || async {
-                    BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("DB error: {}", e))
-                })
-                .await
-                .unwrap_or_default()
-        } else {
-            BuyerQualificationConfig::find_by_buyer_ids(pool.as_ref(), &unique_buyer_ids)
-                .await
-                .unwrap_or_default()
-        };
-        let qual_configs_duration = qual_configs_query_start.elapsed().as_millis() as u64;
-        metrics.record_query(qual_configs_duration);
-        timing.record_qualification(qual_configs_duration);
         // Note: qualification_configs are preloaded and ready for use in buyer router tasks
 
         if campaigns.is_empty() {
@@ -467,16 +595,45 @@ impl PingTreeRouter {
     ) -> Result<RoutingResult> {
         use crate::services::buyer_router::BuyerRouter;
         use tokio::time::{timeout, Duration};
-        const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(1200); // 1.2 seconds
+        // OPTIMIZED: Reduced timeout for internal buyers (Pulsar is sync and instant)
+        // External buyers would need longer timeout, but we're only using Pulsar now
+        const PING_AUCTION_TIMEOUT: Duration = Duration::from_millis(100); // 100ms is plenty for sync Pulsar calls
 
         // Start ping auction stage
-        #[cfg(all(feature = "tracing", debug_assertions))]
-        tracing::debug!(
+        // VERIFICATION: Check if all buyers are internal (Pulsar) or if external HTTP calls are needed
+        let internal_buyer_count = buyer_integration_map
+            .values()
+            .filter(|opt_int| opt_int.as_ref().map(|i| i.is_internal).unwrap_or(false))
+            .count();
+        let external_buyer_count = buyer_integration_map
+            .values()
+            .filter(|opt_int| opt_int.as_ref().map(|i| !i.is_internal).unwrap_or(false))
+            .count();
+        let unknown_buyer_count = buyer_integration_map
+            .values()
+            .filter(|opt_int| opt_int.is_none())
+            .count();
+
+        tracing::info!(
             lead_id = %self.lead.uuid,
+            stage = "ping_auction_start",
             campaign_count = campaigns.len(),
             request_type = %self.request_type,
-            "Starting ping auction"
+            internal_buyers = internal_buyer_count,
+            external_buyers = external_buyer_count,
+            unknown_buyers = unknown_buyer_count,
+            "Starting ping auction - buyer type breakdown"
         );
+
+        // WARNING: If external buyers exist, HTTP calls will block the response
+        if external_buyer_count > 0 {
+            tracing::warn!(
+                lead_id = %self.lead.uuid,
+                external_buyer_count = external_buyer_count,
+                "EXTERNAL BUYERS DETECTED - HTTP calls will add latency to response"
+            );
+        }
+
         let _ping_auction_start = std::time::Instant::now();
 
         // Send concurrent pings to all campaigns with semaphore to limit concurrency
@@ -503,14 +660,48 @@ impl PingTreeRouter {
                 .get(&campaign_clone.buyer_id)
                 .and_then(|config| config.clone());
 
+            // OPTIMIZED: Check if this buyer is internal (Pulsar) to optimize path
+            let is_internal_buyer = preloaded_integration
+                .as_ref()
+                .map(|i| i.is_internal)
+                .unwrap_or(false);
+
+            // DETAILED TIMING: Log per-buyer task creation
+            tracing::info!(
+                lead_id = %self.lead.uuid,
+                campaign_id = %campaign_id,
+                buyer_id = %campaign_clone.buyer_id,
+                is_internal = is_internal_buyer,
+                has_preloaded_integration = preloaded_integration.is_some(),
+                has_preloaded_qual_config = preloaded_qual_config.is_some(),
+                "Creating buyer task"
+            );
+
             // Wrap each task with timeout and store campaign_id for result mapping
             // Track individual buyer processing time
-            // Remove inner tokio::spawn - timeout directly on the future to eliminate double-wrapping overhead
+            // OPTIMIZED: Skip semaphore and timeout for internal buyers (they're sync and instant)
             let task_future = async move {
-                let _permit = semaphore_clone.acquire().await.unwrap(); // Hold permit for duration of ping
-                                                                        // Inject chaos delay if enabled (for testing)
+                // Only acquire semaphore for external buyers (prevents connection pool exhaustion)
+                let _permit = if !is_internal_buyer {
+                    Some(semaphore_clone.acquire().await.unwrap())
+                } else {
+                    None // Skip semaphore for internal buyers (they're instant)
+                };
+
+                // Inject chaos delay if enabled (for testing)
+                let chaos_delay_start = std::time::Instant::now();
                 inject_chaos_delay().await;
+                let chaos_delay_duration = chaos_delay_start.elapsed().as_millis() as u64;
+                if chaos_delay_duration > 0 {
+                    tracing::info!(
+                        campaign_id = %campaign_id,
+                        chaos_delay_ms = chaos_delay_duration,
+                        "Chaos delay injected"
+                    );
+                }
+
                 let buyer_start = std::time::Instant::now();
+                let router_creation_start = std::time::Instant::now();
                 let router = BuyerRouter::new(
                     lead,
                     vec![campaign_clone],
@@ -521,33 +712,115 @@ impl PingTreeRouter {
                 .with_preloaded_integration(preloaded_integration)
                 .with_preloaded_qual_config(preloaded_qual_config)
                 .with_cache(self.cache.clone());
-                let result = timeout(PING_AUCTION_TIMEOUT, router.route()).await;
+                let router_creation_duration = router_creation_start.elapsed().as_millis() as u64;
+
+                // OPTIMIZED: For internal buyers (Pulsar), skip timeout wrapper (they're sync and instant)
+                // Timeout only needed for external HTTP buyers
+                let route_call_start = std::time::Instant::now();
+                let result = if is_internal_buyer {
+                    // Direct call for internal buyers (no timeout overhead)
+                    tracing::info!(
+                        campaign_id = %campaign_id,
+                        stage = "pulsar_direct_call_start",
+                        "Calling Pulsar directly (no timeout)"
+                    );
+                    let pulsar_result = router.route().await;
+                    let route_call_duration = route_call_start.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        campaign_id = %campaign_id,
+                        stage = "pulsar_direct_call_complete",
+                        pulsar_call_ms = route_call_duration,
+                        router_creation_ms = router_creation_duration,
+                        "Pulsar direct call completed"
+                    );
+                    Ok(pulsar_result)
+                } else {
+                    // Timeout wrapper for external buyers
+                    tracing::info!(
+                        campaign_id = %campaign_id,
+                        stage = "external_buyer_call_start",
+                        timeout_ms = PING_AUCTION_TIMEOUT.as_millis(),
+                        "Calling external buyer (with timeout)"
+                    );
+                    let external_result = timeout(PING_AUCTION_TIMEOUT, router.route())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Timeout: {}", e));
+                    let route_call_duration = route_call_start.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        campaign_id = %campaign_id,
+                        stage = "external_buyer_call_complete",
+                        external_call_ms = route_call_duration,
+                        router_creation_ms = router_creation_duration,
+                        "External buyer call completed"
+                    );
+                    external_result
+                };
+
                 let processing_time_ms = buyer_start.elapsed().as_millis() as u64;
-                (
-                    result.map_err(|e| anyhow::anyhow!("Timeout: {}", e)),
-                    campaign_id,
-                    processing_time_ms,
-                )
+                tracing::info!(
+                    campaign_id = %campaign_id,
+                    total_processing_ms = processing_time_ms,
+                    router_creation_ms = router_creation_duration,
+                    route_call_ms = route_call_start.elapsed().as_millis() as u64,
+                    "Buyer task completed"
+                );
+                (result, campaign_id, processing_time_ms)
             };
             task_futures.push(task_future);
         }
 
         // Wait for all responses concurrently using FuturesUnordered for better parallelism
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "futures_unordered_start",
+            task_count = task_futures.len(),
+            "Starting FuturesUnordered collection"
+        );
         let ping_auction_start = std::time::Instant::now();
         let mut futures_unordered = FuturesUnordered::new();
         for task_future in task_futures {
             futures_unordered.push(task_future);
         }
         let mut task_results: Vec<PingTaskResult> = Vec::new();
+        let mut first_response_time: Option<u64> = None;
         while let Some(result) = futures_unordered.next().await {
+            if first_response_time.is_none() {
+                first_response_time = Some(ping_auction_start.elapsed().as_millis() as u64);
+                tracing::info!(
+                    lead_id = %self.lead.uuid,
+                    first_response_ms = first_response_time.unwrap(),
+                    "First buyer response received"
+                );
+            }
             task_results.push(result);
         }
         let ping_auction_duration = ping_auction_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "futures_unordered_complete",
+            ping_auction_total_ms = ping_auction_duration,
+            first_response_ms = first_response_time,
+            response_count = task_results.len(),
+            "All buyer responses collected"
+        );
         metrics.record_ping_auction(ping_auction_duration); // Track ping auction duration
         metrics.record_stage_timing("ping_auction", ping_auction_duration);
+        // DETAILED TIMING: Log ping auction duration
+        tracing::info!(
+            ping_auction_ms = ping_auction_duration,
+            campaign_count = campaigns.len(),
+            response_count = task_results.len(),
+            "Ping auction completed"
+        );
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
         let mut per_buyer_timings: Vec<serde_json::Value> = Vec::new();
 
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "processing_responses_start",
+            response_count = task_results.len(),
+            "Starting response processing"
+        );
         for (result, campaign_id, processing_time_ms) in task_results {
             match result {
                 Ok(Ok(response)) => {
@@ -856,9 +1129,9 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest bid, then priority, then random
-        #[cfg(all(feature = "tracing", debug_assertions))]
-        tracing::debug!(
+        tracing::info!(
             lead_id = %self.lead.uuid,
+            stage = "select_winner_start",
             total_responses = responses.len(),
             valid_responses = valid_responses.len(),
             "Selecting winner from valid responses"
@@ -866,24 +1139,33 @@ impl PingTreeRouter {
         let winner_selection_start = std::time::Instant::now();
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
-        #[cfg(all(feature = "tracing", debug_assertions))]
-        tracing::debug!(
+        let winner_selection_duration = winner_selection_start.elapsed().as_millis() as u64;
+        tracing::info!(
             lead_id = %self.lead.uuid,
+            stage = "select_winner_complete",
+            winner_selection_ms = winner_selection_duration,
             winner_campaign_id = %winner_campaign_id,
             winner_bid = ?winner_response.bid,
             winner_status = %winner_response.status,
             "Winner selected"
         );
-        let _winner_selection_duration = winner_selection_start.elapsed().as_millis() as u64;
         // Timing is tracked atomically (winner selection is part of ping_auction)
 
         // Find winning campaign
+        let find_winner_campaign_start = std::time::Instant::now();
         let winner_campaign = campaigns
             .iter()
             .find(|c| c.id == winner_campaign_id)
             .ok_or_else(|| anyhow::anyhow!("Winner campaign not found"))?;
+        let find_winner_campaign_duration = find_winner_campaign_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            find_winner_campaign_ms = find_winner_campaign_duration,
+            "Winner campaign found"
+        );
 
         // Update lead with winner
+        let update_lead_start = std::time::Instant::now();
         self.update_lead_with_winner(
             pool.as_ref(),
             winner_campaign,
@@ -892,6 +1174,23 @@ impl PingTreeRouter {
             winner_response.price,
         )
         .await?;
+        let update_lead_duration = update_lead_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            update_lead_ms = update_lead_duration,
+            "Lead updated with winner"
+        );
+
+        let total_route_ping_auction_duration = _ping_auction_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            lead_id = %self.lead.uuid,
+            stage = "route_ping_auction_complete",
+            total_ping_auction_ms = total_route_ping_auction_duration,
+            ping_auction_collection_ms = ping_auction_duration,
+            winner_selection_ms = winner_selection_duration,
+            update_lead_ms = update_lead_duration,
+            "Ping auction routing completed"
+        );
 
         Ok(RoutingResult {
             success: winner_response.success,

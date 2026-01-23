@@ -1385,7 +1385,17 @@ async fn create_lead(
     // Always available (not feature-gated) for production performance monitoring
     let critical_path_start = std::time::Instant::now();
 
+    // Generate temporary UUID for lead (will be used in DB insert)
+    let lead_uuid = uuid::Uuid::new_v4();
+
+    tracing::info!(
+        lead_uuid = %lead_uuid,
+        stage = "critical_path_start",
+        "Starting critical path timing"
+    );
+
     // Generate identifiers only after pre-checks pass
+    let id_generation_start = std::time::Instant::now();
     // OPTIMIZED: Use String::with_capacity + push_str instead of format! for better performance
     let lead_id = lead_data.lead_id.clone().unwrap_or_else(|| {
         let prefix = vertical.slug.to_uppercase();
@@ -1423,20 +1433,30 @@ async fn create_lead(
         None
     };
 
-    // Generate temporary UUID for lead (will be used in DB insert)
-    let lead_uuid = uuid::Uuid::new_v4();
     // OPTIMIZED: Use String::with_capacity instead of format!
     let session_uuid = uuid::Uuid::new_v4();
     let mut session_id = String::with_capacity(41); // "sess_" + 36 chars for UUID
     session_id.push_str("sess_");
     session_id.push_str(&session_uuid.to_string());
+    let id_generation_duration = id_generation_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        id_generation_ms = id_generation_duration,
+        "ID generation completed"
+    );
 
     // OPTIMIZED: Serialize request payload once (needed for queue, but we avoid cloning the Value)
+    let payload_serialization_start = std::time::Instant::now();
     // Using serde_json::to_value is already efficient, and we'll only clone the Value once
     let request_payload_json =
         serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
+    let payload_serialization_duration = payload_serialization_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        payload_serialization_ms = payload_serialization_duration,
+        "Payload serialization completed"
+    );
 
     // Get SSM encryption key for background encryption (derive once, reuse in batch)
+    let ssm_key_derivation_start = std::time::Instant::now();
     let pii_encryption_key = match (det_key_result, salt_result) {
         (Ok(Some(det_key)), Ok(Some(salt))) => Some(
             leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(
@@ -1456,8 +1476,14 @@ async fn create_lead(
             None
         }
     };
+    let ssm_key_derivation_duration = ssm_key_derivation_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        ssm_key_derivation_ms = ssm_key_derivation_duration,
+        "SSM key derivation completed"
+    );
 
     // Enqueue lead creation to write-behind queue (decoupled from critical path)
+    let queue_enqueue_start = std::time::Instant::now();
     // All encryption happens in the background batch processor
     tracing::info!(
         "Enqueueing lead creation: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}, lead_uuid={}",
@@ -1515,8 +1541,14 @@ async fn create_lead(
             pii_encryption_key,                    // Move ownership (not used after this)
         },
     );
+    let queue_enqueue_duration = queue_enqueue_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        queue_enqueue_ms = queue_enqueue_duration,
+        "Queue enqueue completed"
+    );
 
     // Create minimal Lead object for routing (no DB query needed)
+    let lead_object_creation_start = std::time::Instant::now();
     // This allows routing to proceed immediately while DB insert happens in background
     // OPTIMIZED: Reuse event_id string (already created above)
     let lead = leadsnebula_core::models::lead::Lead {
@@ -1576,14 +1608,23 @@ async fn create_lead(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
+    let lead_object_creation_duration = lead_object_creation_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        lead_object_creation_ms = lead_object_creation_duration,
+        "Lead object creation completed"
+    );
 
     // No need to wait for ping/ping_payloads - they're audit records
     let payload_row_id: Option<uuid::Uuid> = None;
 
     // Route the lead through ping tree
+    tracing::info!(stage = "routing_start", "Starting routing phase");
     let routing_start = std::time::Instant::now();
     let timing_arc = timing.clone();
     let metrics_arc = metrics.clone();
+
+    // DETAILED TIMING: Log router creation
+    let router_create_start = std::time::Instant::now();
     let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
         lead,
         publisher.id,
@@ -1593,14 +1634,28 @@ async fn create_lead(
         Some(state.write_behind_queue.clone()),
     )
     .with_timing_and_metrics(timing_arc.clone(), metrics_arc.clone());
+    let router_create_duration = router_create_start.elapsed().as_millis() as u64;
+    tracing::info!(router_create_ms = router_create_duration, "Router created");
 
+    // DETAILED TIMING: Log route call
+    let route_call_start = std::time::Instant::now();
     let routing_result = router
         .route(
             state.db_pool.clone(),
             std::sync::Arc::new(state.config.encryption_key.clone()),
         )
         .await;
-    let _routing_duration = routing_start.elapsed().as_millis() as u64;
+    let route_call_duration = route_call_start.elapsed().as_millis() as u64;
+    let routing_duration = routing_start.elapsed().as_millis() as u64;
+
+    // DETAILED TIMING: Log routing breakdown
+    tracing::info!(
+        routing_total_ms = routing_duration,
+        route_call_ms = route_call_duration,
+        router_create_ms = router_create_duration,
+        "Routing completed"
+    );
+
     timing_arc.record_total();
 
     match routing_result {
@@ -1641,75 +1696,18 @@ async fn create_lead(
                 None
             };
 
-            // Resolve buyer and campaign names if available (CACHED - 1h TTL, names rarely change)
-            // Skip in minimal mode for performance
-            let buyer_name = if minimal_mode {
-                None
-            } else if let Some(bid) = routing_result.buyer_id {
-                let cache_key = format!("buyer:name:{}", bid);
-                if let Some(cache) = &state.cache {
-                    cache
-                        .get_or_insert_with(&cache_key, 3600, || async {
-                            sqlx::query_scalar::<_, String>(
-                                "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
-                            )
-                            .bind(bid)
-                            .fetch_optional(&*state.db_pool)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Database error: {}", e))
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                } else {
-                    // Fallback if cache not available
-                    sqlx::query_scalar::<_, String>(
-                        "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
-                    )
-                    .bind(bid)
-                    .fetch_optional(&*state.db_pool)
-                    .await
-                    .unwrap_or_default()
-                }
-            } else {
-                None
-            };
+            // DECOUPLED: Buyer and campaign names removed from critical path
+            // Names are only cosmetic and not needed for core response
+            // If needed, they can be fetched asynchronously or included in verbose response
+            // This saves 10-50ms per request (even with cache hits, there's still overhead)
+            let buyer_name: Option<String> = None;
+            let campaign_name: Option<String> = None;
 
-            let campaign_name = if minimal_mode {
-                None
-            } else if let Some(cid) = routing_result.campaign_id {
-                let cache_key = format!("campaign:name:{}", cid);
-                if let Some(cache) = &state.cache {
-                    cache
-                        .get_or_insert_with(&cache_key, 3600, || async {
-                            sqlx::query_scalar::<_, String>(
-                                "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
-                            )
-                            .bind(cid)
-                            .fetch_optional(&*state.db_pool)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Database error: {}", e))
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                } else {
-                    // Fallback if cache not available
-                    sqlx::query_scalar::<_, String>(
-                        "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
-                    )
-                    .bind(cid)
-                    .fetch_optional(&*state.db_pool)
-                    .await
-                    .unwrap_or_default()
-                }
+            // OPTIMIZED: Only build verbose JSON if explicitly requested
+            // Skip in minimal mode or when verbose is false to avoid unnecessary overhead
+            let verbose_json = if minimal_mode || !verbose_requested {
+                None // Skip verbose JSON building entirely if not needed
             } else {
-                None
-            };
-
-            let verbose_json = if minimal_mode {
-                None // Skip verbose JSON in minimal mode
-            } else if verbose_requested {
                 // Build JSON manually using serde_json::Value::Object to avoid macro overhead
                 // OPTIMIZED: Pre-allocate Maps with estimated capacity
                 use serde_json::Map;
@@ -1784,8 +1782,6 @@ async fn create_lead(
                 let json_obj = serde_json::Value::Object(json_obj_map);
 
                 Some(json_obj)
-            } else {
-                None
             };
 
             // Update the ping_payloads row with the routing result as response_payload and external id

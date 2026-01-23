@@ -5,6 +5,7 @@ use redis::{AsyncCommands, Client, RedisError};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
+#[allow(unused_imports)]
 use tracing::{debug, error, info};
 
 /// Wrapper around redis::aio::ConnectionManager to implement bb8::ManageConnection

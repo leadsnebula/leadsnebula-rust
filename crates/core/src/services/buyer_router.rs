@@ -147,8 +147,26 @@ impl BuyerRouter {
     }
 
     async fn route_ping(&self, campaign: &Campaign) -> Result<BuyerResponse> {
-        // Look up buyer integration to check if it's internal
-        let integration = self.get_buyer_integration(campaign).await?;
+        // OPTIMIZED: Use pre-loaded integration if available (eliminates cache lookup overhead)
+        let integration_lookup_start = std::time::Instant::now();
+        let integration = if let Some(ref preloaded) = self.preloaded_integration {
+            // Use pre-loaded integration (no cache lookup needed)
+            preloaded.clone()
+        } else {
+            // Fallback to cache lookup only if not pre-loaded
+            self.get_buyer_integration(campaign).await?
+        };
+        let integration_lookup_duration = integration_lookup_start.elapsed().as_millis() as u64;
+
+        // DETAILED TIMING: Log buyer integration lookup
+        tracing::info!(
+            buyer_integration_lookup_ms = integration_lookup_duration,
+            buyer_id = %campaign.buyer_id,
+            campaign_id = %campaign.id,
+            is_internal = integration.is_internal,
+            preloaded = self.preloaded_integration.is_some(),
+            "Buyer integration lookup completed"
+        );
 
         // For internal buyers (Pulsar), use direct function calls (skip HTTP overhead)
         if integration.is_internal {
@@ -178,6 +196,15 @@ impl BuyerRouter {
                 self.preloaded_qual_config.clone(),
             );
             let ping_duration = ping_start.elapsed().as_millis() as u64;
+
+            // DETAILED TIMING: Log Pulsar direct call duration
+            tracing::info!(
+                pulsar_ping_ms = ping_duration,
+                buyer_id = %campaign.buyer_id,
+                campaign_id = %campaign.id,
+                method = "direct",
+                "Pulsar direct ping completed"
+            );
 
             if let Ok(ref resp) = result {
                 tracing::debug!(
@@ -211,13 +238,15 @@ impl BuyerRouter {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?;
 
-        tracing::info!(
+        tracing::warn!(
             campaign_id = %campaign.id,
             buyer_id = %campaign.buyer_id,
             endpoint = %endpoint,
             method = "HTTP",
-            "Sending buyer ping request"
+            "EXTERNAL BUYER HTTP CALL - This will block response until buyer responds"
         );
+
+        let http_ping_start = std::time::Instant::now();
 
         // Prepare request payload
         let mut lead_data = serde_json::to_value(&self.lead)?;
@@ -245,21 +274,24 @@ impl BuyerRouter {
             .post(&endpoint)
             .json(&payload)
             .headers(headers.clone())
-            .timeout(Duration::from_secs(1))
+            .timeout(Duration::from_millis(500)) // OPTIMIZED: Reduced from 1s to 500ms for faster timeouts
             .send()
             .await
         {
             Ok(resp) => {
                 let ping_duration = ping_start.elapsed().as_millis() as u64;
-                tracing::info!(
+                let total_http_duration = http_ping_start.elapsed().as_millis() as u64;
+                // DETAILED TIMING: Log HTTP request duration
+                tracing::warn!(
+                    http_ping_ms = ping_duration,
+                    total_http_ms = total_http_duration,
                     operation = "http_request",
                     method = "POST",
                     endpoint = %endpoint,
                     campaign_id = %campaign.id,
                     buyer_id = %campaign.buyer_id,
                     status_code = resp.status().as_u16(),
-                    duration_ms = ping_duration,
-                    "HTTP ping request sent and response received"
+                    "EXTERNAL BUYER HTTP CALL COMPLETED - This blocked the response"
                 );
                 resp
             }

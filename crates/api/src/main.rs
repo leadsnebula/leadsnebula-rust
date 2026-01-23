@@ -317,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
                             _flush_success = true;
                             break;
                         }
+                        #[allow(unused_variables)]
                         Err(e) => {
                             #[cfg(feature = "tracing")]
                             tracing::warn!(
