@@ -157,18 +157,32 @@ async fn test_e2e_ping_request_flow() {
         .await
         .unwrap();
 
-    // Create ping tree
+    // Create ping tree (without publisher_id - removed in migration)
     let ping_tree_id = Uuid::new_v4();
     sqlx::query(
             r#"
-            INSERT INTO ping_trees (id, publisher_id, instance_id, name, vertical, status, strategy, created_at, updated_at)
-            VALUES ($1, $2, (SELECT id FROM instances LIMIT 1), $3, $4, 'active', 'ping_post', NOW(), NOW())
+            INSERT INTO ping_trees (id, instance_id, name, vertical, status, strategy, created_at, updated_at)
+            VALUES ($1, (SELECT id FROM instances LIMIT 1), $2, $3, 'active', 'ping_post', NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(ping_tree_id)
+        .bind("Test Ping Tree")
+        .bind(&vertical_slug)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // Create ping_tree_publishers entry (required for routing)
+    sqlx::query(
+            r#"
+            INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
+            VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(ping_tree_id)
         .bind(publisher_id)
-        .bind("Test Ping Tree")
         .bind(&vertical_slug)
         .execute(&mut *tx)
         .await
@@ -329,22 +343,36 @@ async fn test_e2e_fullpost_request_flow() {
     .await
     .unwrap();
 
-    // Create ping tree
+    // Create ping tree (without publisher_id - removed in migration)
     let ping_tree_id = Uuid::new_v4();
     sqlx::query(
         r#"
-            INSERT INTO ping_trees (id, publisher_id, instance_id, name, vertical, status, strategy, created_at, updated_at)
-            VALUES ($1, $2, (SELECT id FROM instances LIMIT 1), $3, $4, 'active', 'ping_post', NOW(), NOW())
+            INSERT INTO ping_trees (id, instance_id, name, vertical, status, strategy, created_at, updated_at)
+            VALUES ($1, (SELECT id FROM instances LIMIT 1), $2, $3, 'active', 'ping_post', NOW(), NOW())
             ON CONFLICT DO NOTHING
             "#,
     )
     .bind(ping_tree_id)
-    .bind(publisher_id)
     .bind("Test Ping Tree")
     .bind(&vertical_slug)
     .execute(&mut *tx)
     .await
     .unwrap();
+
+    // Create ping_tree_publishers entry (required for routing)
+    sqlx::query(
+            r#"
+            INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
+            VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(ping_tree_id)
+        .bind(publisher_id)
+        .bind(&vertical_slug)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     // Add campaign to ping tree
     sqlx::query(

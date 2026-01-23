@@ -277,8 +277,8 @@ jobs:
           cargo nextest run --test integration_publisher_crud --locked --all-features --test-threads=2 || \
             cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=2
           
-          # E2E tests - run with --ignored flag to include tests marked with #[ignore]
-          cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=2 --ignored || \
+          # E2E tests - run with --run-ignored flag to include tests marked with #[ignore]
+          cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=2 --run-ignored ignored || \
             cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=2 --ignored
           
           # NOTE: Some heavy lib tests (duplicate_post, ping_tree_*_db, async_persistence) are
