@@ -383,11 +383,22 @@ if command -v cargo-nextest > /dev/null 2>&1; then
         # Run E2E tests if they exist (full API flow tests; use rollback, no litter)
         if cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
             echo "   Running E2E tests (full API flow)..."
-            if ! cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored; then
-                echo "❌ E2E tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
+            # Use cargo-nextest if available (matches CI), otherwise fallback to cargo test
+            if command -v cargo-nextest > /dev/null 2>&1; then
+                if ! cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only; then
+                    echo "❌ E2E tests failed. Fix all failing tests before committing."
+                    ERRORS=$((ERRORS + 1))
+                else
+                    echo "✅ E2E tests OK (nextest)"
+                fi
             else
-                echo "✅ E2E tests OK"
+                # Fallback to cargo test (matches CI fallback)
+                if ! cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored; then
+                    echo "❌ E2E tests failed. Fix all failing tests before committing."
+                    ERRORS=$((ERRORS + 1))
+                else
+                    echo "✅ E2E tests OK (cargo test)"
+                fi
             fi
         fi
         # NOTE: async_persistence, duplicate_post, ping_tree_router_* (--ignored) require
