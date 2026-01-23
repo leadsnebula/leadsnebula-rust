@@ -122,6 +122,23 @@ async fn create_test_app_state() -> (Router, PgPool) {
 #[ignore] // Requires database setup
 async fn test_e2e_ping_request_flow() {
     let (_app, pool) = create_test_app_state().await;
+
+    // Verify migrations have run - ping_tree_publishers table must exist
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'ping_tree_publishers'
+        )",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap_or(None)
+    .unwrap_or(false);
+
+    if !table_exists {
+        panic!("ping_tree_publishers table does not exist - migrations may not have run. Check that create_test_pool() runs migrations successfully. Migration 20260120000002_create_ping_tree_publishers.sql should create this table.");
+    }
     let mut tx = pool.begin().await.unwrap();
     let (publisher_id, vertical_id, vertical_slug, _api_key) = setup_test_data(&mut *tx).await;
 
@@ -176,20 +193,35 @@ async fn test_e2e_ping_request_flow() {
         .unwrap();
 
     // Create ping_tree_publishers entry (required for routing in new schema)
-    // This table must exist for routing to work - fail test if insert fails
-    sqlx::query(
-            r#"
-            INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
-            VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
-            ON CONFLICT (ping_tree_id, publisher_id) DO NOTHING
-            "#,
-        )
-        .bind(ping_tree_id)
-        .bind(publisher_id)
-        .bind(&vertical_slug)
-        .execute(&mut *tx)
-        .await
-        .expect("ping_tree_publishers insert must succeed for routing to work");
+    // Check if table exists first - migrations may not have run yet
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'ping_tree_publishers'
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap_or(false);
+
+    if table_exists {
+        sqlx::query(
+                r#"
+                INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
+                VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
+                ON CONFLICT (ping_tree_id, publisher_id) DO NOTHING
+                "#,
+            )
+            .bind(ping_tree_id)
+            .bind(publisher_id)
+            .bind(&vertical_slug)
+            .execute(&mut *tx)
+            .await
+            .expect("ping_tree_publishers insert must succeed for routing to work");
+    } else {
+        panic!("ping_tree_publishers table does not exist - migrations may not have run. Check that create_test_pool() runs migrations successfully.");
+    }
 
     // Add campaign to ping tree
     sqlx::query(
@@ -412,20 +444,35 @@ async fn test_e2e_fullpost_request_flow() {
         .unwrap();
 
     // Create ping_tree_publishers entry (required for routing in new schema)
-    // This table must exist for routing to work - fail test if insert fails
-    sqlx::query(
-            r#"
-            INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
-            VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
-            ON CONFLICT (ping_tree_id, publisher_id) DO NOTHING
-            "#,
-        )
-        .bind(ping_tree_id)
-        .bind(publisher_id)
-        .bind(&vertical_slug)
-        .execute(&mut *tx)
-        .await
-        .expect("ping_tree_publishers insert must succeed for routing to work");
+    // Check if table exists first - migrations may not have run yet
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'ping_tree_publishers'
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap_or(false);
+
+    if table_exists {
+        sqlx::query(
+                r#"
+                INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
+                VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
+                ON CONFLICT (ping_tree_id, publisher_id) DO NOTHING
+                "#,
+            )
+            .bind(ping_tree_id)
+            .bind(publisher_id)
+            .bind(&vertical_slug)
+            .execute(&mut *tx)
+            .await
+            .expect("ping_tree_publishers insert must succeed for routing to work");
+    } else {
+        panic!("ping_tree_publishers table does not exist - migrations may not have run. Check that create_test_pool() runs migrations successfully.");
+    }
 
     // Add campaign to ping tree
     sqlx::query(
