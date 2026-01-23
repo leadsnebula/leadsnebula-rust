@@ -177,7 +177,9 @@ async fn test_e2e_ping_request_flow() {
 
     // Create ping_tree_publishers entry (required for routing in new schema)
     // Use savepoint to handle errors gracefully without aborting the transaction
-    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert")
+        .execute(&mut *tx)
+        .await;
     let insert_result = sqlx::query(
             r#"
             INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
@@ -190,12 +192,16 @@ async fn test_e2e_ping_request_flow() {
         .bind(&vertical_slug)
         .execute(&mut *tx)
         .await;
-    
+
     // If insert failed (e.g., table doesn't exist), rollback to savepoint
     if insert_result.is_err() {
-        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert")
+            .execute(&mut *tx)
+            .await;
     } else {
-        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert")
+            .execute(&mut *tx)
+            .await;
     }
 
     // Add campaign to ping tree
@@ -397,7 +403,9 @@ async fn test_e2e_fullpost_request_flow() {
 
     // Create ping_tree_publishers entry (required for routing in new schema)
     // Use savepoint to handle errors gracefully without aborting the transaction
-    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert")
+        .execute(&mut *tx)
+        .await;
     let insert_result = sqlx::query(
             r#"
             INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
@@ -410,12 +418,16 @@ async fn test_e2e_fullpost_request_flow() {
         .bind(&vertical_slug)
         .execute(&mut *tx)
         .await;
-    
+
     // If insert failed (e.g., table doesn't exist), rollback to savepoint
     if insert_result.is_err() {
-        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert")
+            .execute(&mut *tx)
+            .await;
     } else {
-        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert").execute(&mut *tx).await;
+        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert")
+            .execute(&mut *tx)
+            .await;
     }
 
     // Add campaign to ping tree
