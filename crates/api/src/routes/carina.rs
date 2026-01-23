@@ -1123,8 +1123,8 @@ async fn create_lead(
                             ) AS has_ping_tree
                         FROM (VALUES (true)) AS dummy
                         LEFT JOIN campaigns c ON (
-                            (c.campaign_token = $3 AND $3 != '') OR 
-                            (c.vertical = $2 AND c.buyer_id IN (
+                            (c.campaign_token = $3 AND $3 != '' AND c.publisher_id = $1) OR 
+                            (c.vertical = $2 AND c.publisher_id = $1 AND c.buyer_id IN (
                                 SELECT b.id FROM buyers b 
                                 WHERE b.vertical_id = (
                                     SELECT v.id FROM verticals v 
@@ -1135,9 +1135,9 @@ async fn create_lead(
                         LEFT JOIN buyers b_vertical ON 
                             b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
-                                    WHERE v2.slug = $2 AND v2.is_active = true
+                                WHERE v2.slug = $2 AND v2.is_active = true
                             ) 
-                            AND c.id IS NULL 
+                            AND (c.id IS NULL OR c.buyer_id IS NULL)
                             AND b_vertical.deleted_at IS NULL
                         LIMIT 1
                         "#,
@@ -1178,8 +1178,8 @@ async fn create_lead(
                         ) AS has_ping_tree
                     FROM (VALUES (true)) AS dummy
                     LEFT JOIN campaigns c ON (
-                        (c.campaign_token = $3 AND $3 != '') OR 
-                        (c.vertical = $2 AND c.buyer_id IN (
+                        (c.campaign_token = $3 AND $3 != '' AND c.publisher_id = $1) OR 
+                        (c.vertical = $2 AND c.publisher_id = $1 AND c.buyer_id IN (
                             SELECT b.id FROM buyers b 
                             WHERE b.vertical_id = (
                                 SELECT v.id FROM verticals v 
@@ -1192,7 +1192,7 @@ async fn create_lead(
                                 SELECT v2.id FROM verticals v2 
                                     WHERE v2.slug = $2 AND v2.is_active = true
                         ) 
-                        AND c.id IS NULL 
+                        AND (c.id IS NULL OR c.buyer_id IS NULL)
                         AND b_vertical.deleted_at IS NULL
                     LIMIT 1
                     "#,
@@ -1221,8 +1221,8 @@ async fn create_lead(
                 ) AS has_ping_tree
             FROM (VALUES (true)) AS dummy
             LEFT JOIN campaigns c ON (
-                (c.campaign_token = $3 AND $3 != '') OR 
-                (c.vertical = $2 AND c.buyer_id IN (
+                (c.campaign_token = $3 AND $3 != '' AND c.publisher_id = $1) OR 
+                (c.vertical = $2 AND c.publisher_id = $1 AND c.buyer_id IN (
                     SELECT b.id FROM buyers b 
                     WHERE b.vertical_id = (
                         SELECT v.id FROM verticals v 
@@ -1235,7 +1235,7 @@ async fn create_lead(
                                 SELECT v2.id FROM verticals v2 
                                     WHERE v2.slug = $2 AND v2.is_active = true
                 ) 
-                AND c.id IS NULL 
+                AND (c.id IS NULL OR c.buyer_id IS NULL)
                 AND b_vertical.deleted_at IS NULL
             LIMIT 1
             "#,
