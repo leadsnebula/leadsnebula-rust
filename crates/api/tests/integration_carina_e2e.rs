@@ -176,33 +176,20 @@ async fn test_e2e_ping_request_flow() {
         .unwrap();
 
     // Create ping_tree_publishers entry (required for routing in new schema)
-    // Use savepoint to handle errors gracefully without aborting the transaction
-    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert")
-        .execute(&mut *tx)
-        .await;
-    let insert_result = sqlx::query(
+    // This table must exist for routing to work - fail test if insert fails
+    sqlx::query(
             r#"
             INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
             VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (ping_tree_id, publisher_id) DO NOTHING
             "#,
         )
         .bind(ping_tree_id)
         .bind(publisher_id)
         .bind(&vertical_slug)
         .execute(&mut *tx)
-        .await;
-
-    // If insert failed (e.g., table doesn't exist), rollback to savepoint
-    if insert_result.is_err() {
-        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert")
-            .execute(&mut *tx)
-            .await;
-    } else {
-        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert")
-            .execute(&mut *tx)
-            .await;
-    }
+        .await
+        .expect("ping_tree_publishers insert must succeed for routing to work");
 
     // Add campaign to ping tree
     sqlx::query(
@@ -312,12 +299,32 @@ async fn test_e2e_ping_request_flow() {
         None,
     );
 
+    // Verify ping_tree_publishers entry exists (required for routing)
+    let ptp_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ping_tree_publishers WHERE ping_tree_id = $1 AND publisher_id = $2",
+    )
+    .bind(ping_tree_id)
+    .bind(publisher_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ptp_count > 0,
+        "ping_tree_publishers entry must exist for routing to work"
+    );
+
     let pool_arc = Arc::new(pool.clone());
     let encryption_key = Arc::new(vec![0u8; 32]); // Dummy key for tests
     let result = router.route(pool_arc, encryption_key).await;
 
-    // Verify result
-    assert!(result.is_ok());
+    // Verify result - print error if failed
+    if let Err(ref e) = result {
+        eprintln!("Router error: {:?}", e);
+        eprintln!("Lead: {:?}", lead);
+        eprintln!("Publisher ID: {}", publisher_id);
+        eprintln!("Vertical: {}", vertical_slug);
+    }
+    assert!(result.is_ok(), "Router should succeed: {:?}", result);
     let routing_result = result.unwrap();
 
     // Verify lead status was updated (use pool since tx is committed)
@@ -405,33 +412,20 @@ async fn test_e2e_fullpost_request_flow() {
         .unwrap();
 
     // Create ping_tree_publishers entry (required for routing in new schema)
-    // Use savepoint to handle errors gracefully without aborting the transaction
-    let _ = sqlx::query("SAVEPOINT ping_tree_publishers_insert")
-        .execute(&mut *tx)
-        .await;
-    let insert_result = sqlx::query(
+    // This table must exist for routing to work - fail test if insert fails
+    sqlx::query(
             r#"
             INSERT INTO ping_tree_publishers (id, ping_tree_id, publisher_id, vertical, created_at, updated_at)
             VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (ping_tree_id, publisher_id) DO NOTHING
             "#,
         )
         .bind(ping_tree_id)
         .bind(publisher_id)
         .bind(&vertical_slug)
         .execute(&mut *tx)
-        .await;
-
-    // If insert failed (e.g., table doesn't exist), rollback to savepoint
-    if insert_result.is_err() {
-        let _ = sqlx::query("ROLLBACK TO SAVEPOINT ping_tree_publishers_insert")
-            .execute(&mut *tx)
-            .await;
-    } else {
-        let _ = sqlx::query("RELEASE SAVEPOINT ping_tree_publishers_insert")
-            .execute(&mut *tx)
-            .await;
-    }
+        .await
+        .expect("ping_tree_publishers insert must succeed for routing to work");
 
     // Add campaign to ping tree
     sqlx::query(
@@ -541,12 +535,32 @@ async fn test_e2e_fullpost_request_flow() {
         None,
     );
 
+    // Verify ping_tree_publishers entry exists (required for routing)
+    let ptp_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ping_tree_publishers WHERE ping_tree_id = $1 AND publisher_id = $2",
+    )
+    .bind(ping_tree_id)
+    .bind(publisher_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ptp_count > 0,
+        "ping_tree_publishers entry must exist for routing to work"
+    );
+
     let pool_arc = Arc::new(pool.clone());
     let encryption_key = Arc::new(vec![0u8; 32]);
     let result = router.route(pool_arc, encryption_key).await;
 
-    // Verify result
-    assert!(result.is_ok());
+    // Verify result - print error if failed
+    if let Err(ref e) = result {
+        eprintln!("Router error: {:?}", e);
+        eprintln!("Lead: {:?}", lead);
+        eprintln!("Publisher ID: {}", publisher_id);
+        eprintln!("Vertical: {}", vertical_slug);
+    }
+    assert!(result.is_ok(), "Router should succeed: {:?}", result);
     let routing_result = result.unwrap();
 
     // For fullpost, we should have both ping_id and post_id
@@ -695,8 +709,15 @@ async fn test_e2e_error_handling() {
     let encryption_key = Arc::new(vec![0u8; 32]);
     let result = router.route(pool_arc, encryption_key).await;
 
-    // Should return error result (no ping tree found)
-    assert!(result.is_ok());
+    // Should return error result (no ping tree found) - print error if failed
+    if let Err(ref e) = result {
+        eprintln!("Router error (expected for error_handling test): {:?}", e);
+    }
+    assert!(
+        result.is_ok(),
+        "Router should return Ok with success=false: {:?}",
+        result
+    );
     let routing_result = result.unwrap();
     assert!(!routing_result.success);
     assert!(routing_result.error.is_some());

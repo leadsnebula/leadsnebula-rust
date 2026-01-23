@@ -380,21 +380,53 @@ if command -v cargo-nextest > /dev/null 2>&1; then
             fi
         done
         
-        # Run E2E tests if they exist (full API flow tests; use rollback, no litter)
+        # Run E2E tests if they exist (full API flow tests; validates routing, schema constraints, etc.)
+        # These tests catch critical issues like:
+        # - Missing required fields (session_id, buyer_id NOT NULL constraints)
+        # - Transaction isolation issues (router not seeing uncommitted data)
+        # - Ping tree routing logic errors
         if cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
-            echo "   Running E2E tests (full API flow)..."
+            echo "   Running E2E tests (full API flow - validates routing, schema constraints)..."
             # Use cargo-nextest if available (matches CI), otherwise fallback to cargo test
             if command -v cargo-nextest > /dev/null 2>&1; then
-                if ! cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only; then
+                E2E_OUTPUT=$(cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only 2>&1)
+                E2E_EXIT_CODE=${PIPESTATUS[0]}
+                if [ $E2E_EXIT_CODE -ne 0 ]; then
                     echo "❌ E2E tests failed. Fix all failing tests before committing."
+                    echo "$E2E_OUTPUT" | tail -50  # Show last 50 lines of output
+                    # Check for common error patterns and provide helpful hints
+                    if echo "$E2E_OUTPUT" | grep -q "null value in column.*violates not-null constraint"; then
+                        echo "   💡 Hint: Check that test setup provides all required fields (session_id, buyer_id, etc.)"
+                    fi
+                    if echo "$E2E_OUTPUT" | grep -q "assertion failed: result.is_ok()"; then
+                        echo "   💡 Hint: Router may not see test data - ensure transaction is committed before routing"
+                        echo "   💡 Hint: Check that ping_tree_publishers entry exists and ping tree is found"
+                    fi
+                    if echo "$E2E_OUTPUT" | grep -q "Router error"; then
+                        echo "   💡 Hint: Check router error output above - may be database constraint or missing data"
+                    fi
                     ERRORS=$((ERRORS + 1))
                 else
                     echo "✅ E2E tests OK (nextest)"
                 fi
             else
                 # Fallback to cargo test (matches CI fallback)
-                if ! cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored; then
+                E2E_OUTPUT=$(cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored 2>&1)
+                E2E_EXIT_CODE=${PIPESTATUS[0]}
+                if [ $E2E_EXIT_CODE -ne 0 ]; then
                     echo "❌ E2E tests failed. Fix all failing tests before committing."
+                    echo "$E2E_OUTPUT" | tail -50  # Show last 50 lines of output
+                    # Check for common error patterns and provide helpful hints
+                    if echo "$E2E_OUTPUT" | grep -q "null value in column.*violates not-null constraint"; then
+                        echo "   💡 Hint: Check that test setup provides all required fields (session_id, buyer_id, etc.)"
+                    fi
+                    if echo "$E2E_OUTPUT" | grep -q "assertion failed: result.is_ok()"; then
+                        echo "   💡 Hint: Router may not see test data - ensure transaction is committed before routing"
+                        echo "   💡 Hint: Check that ping_tree_publishers entry exists and ping tree is found"
+                    fi
+                    if echo "$E2E_OUTPUT" | grep -q "Router error"; then
+                        echo "   💡 Hint: Check router error output above - may be database constraint or missing data"
+                    fi
                     ERRORS=$((ERRORS + 1))
                 else
                     echo "✅ E2E tests OK (cargo test)"
