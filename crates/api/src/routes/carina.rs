@@ -172,7 +172,7 @@ async fn create_lead(
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
     // Critical path timing: mark lead_received
-    #[cfg(feature = "tracing")]
+    // Always available (not feature-gated) for production performance monitoring
     let critical_path_start = std::time::Instant::now();
 
     // Initialize timing and metrics
@@ -966,7 +966,8 @@ async fn create_lead(
     );
 
     // Prepare SSM paths for parallel fetching with pre-checks query
-    let env_norm = state.config.environment.to_lowercase();
+    // Use normalize_env_for_ssm to ensure consistency with cache_warmup (converts "development" -> "dev")
+    let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment);
     let det_path = format!(
         "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
         env_norm
@@ -1592,45 +1593,96 @@ async fn create_lead(
     // No need to wait for ping/ping_payloads - they're audit records
     let payload_row_id: Option<uuid::Uuid> = None;
 
-    // Load the created lead
-    let lead = match sqlx::query_as::<_, leadsnebula_core::models::lead::Lead>(
-        "SELECT * FROM leads WHERE uuid = $1",
-    )
-    .bind(lead_uuid)
-    .fetch_one(&*state.db_pool)
-    .await
-    {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("Failed to load created lead: {}", e);
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some("Failed to load created lead".to_string()),
-                    error: Some(format!("Database error: {}", e)),
-                },
-                lead: LeadNode {
-                    promise_id,
-                    lead_id: Some(lead_id),
-                    lead_uuid: Some(lead_uuid.to_string()),
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": format!("ERR_{}", 500),
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 500
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(500),
-            }));
+    // Load the created lead - CACHED to avoid blocking DB query after transaction
+    // Cache key: lead:uuid:{uuid} with 5m TTL (leads don't change after creation)
+    let lead_cache_key = format!("lead:uuid:{}", lead_uuid);
+    let lead = if let Some(cache) = &state.cache {
+        match cache
+            .get_or_insert_with(&lead_cache_key, 300, || async {
+                sqlx::query_as::<_, leadsnebula_core::models::lead::Lead>(
+                    "SELECT * FROM leads WHERE uuid = $1",
+                )
+                .bind(lead_uuid)
+                .fetch_one(&*state.db_pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+            })
+            .await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to load created lead: {}", e);
+                return Ok(Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some("Failed to load created lead".to_string()),
+                        error: Some(format!("Database error: {}", e)),
+                    },
+                    lead: LeadNode {
+                        promise_id,
+                        lead_id: Some(lead_id),
+                        lead_uuid: Some(lead_uuid.to_string()),
+                        ping_id: None,
+                        bid: None,
+                        post_id: None,
+                        price: None,
+                    },
+                    verbose: if verbose_requested {
+                        Some(serde_json::json!({
+                            "error_code": format!("ERR_{}", 500),
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "endpoint": "POST /api/v1/leads",
+                            "status_code": 500
+                        }))
+                    } else {
+                        None
+                    },
+                    http_status: Some(500),
+                }));
+            }
+        }
+    } else {
+        // Fallback if cache not available
+        match sqlx::query_as::<_, leadsnebula_core::models::lead::Lead>(
+            "SELECT * FROM leads WHERE uuid = $1",
+        )
+        .bind(lead_uuid)
+        .fetch_one(&*state.db_pool)
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to load created lead: {}", e);
+                return Ok(Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some("Failed to load created lead".to_string()),
+                        error: Some(format!("Database error: {}", e)),
+                    },
+                    lead: LeadNode {
+                        promise_id,
+                        lead_id: Some(lead_id),
+                        lead_uuid: Some(lead_uuid.to_string()),
+                        ping_id: None,
+                        bid: None,
+                        post_id: None,
+                        price: None,
+                    },
+                    verbose: if verbose_requested {
+                        Some(serde_json::json!({
+                            "error_code": format!("ERR_{}", 500),
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "endpoint": "POST /api/v1/leads",
+                            "status_code": 500
+                        }))
+                    } else {
+                        None
+                    },
+                    http_status: Some(500),
+                }));
+            }
         }
     };
 
@@ -1856,19 +1908,83 @@ async fn create_lead(
             if request_type == "fullpost" && routing_result.post_id.is_some() {
                 let post_request_json =
                     serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
-                let post_response_json = serde_json::json!({
-                    "routing_result": {
-                        "status": routing_result.status.clone(),
-                        "success": routing_result.success,
-                        "error": routing_result.error.clone(),
-                        "price": routing_result.price,
-                        "buyer_id": routing_result.buyer_id.map(|b| b.to_string()),
-                        "campaign_id": routing_result.campaign_id.map(|c| c.to_string()),
-                        "ping_id": routing_result.ping_id.clone(),
-                        "post_id": routing_result.post_id.clone(),
-                        "promise_id": routing_result.promise_id.clone(),
-                    }
-                });
+                // Build JSON manually using serde_json::Value::Object to avoid macro overhead
+                // This is more efficient than serde_json::json! macro
+                use serde_json::Map;
+                let mut routing_result_map = Map::new();
+                routing_result_map.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(routing_result.status.clone()),
+                );
+                routing_result_map.insert(
+                    "success".to_string(),
+                    serde_json::Value::Bool(routing_result.success),
+                );
+                if let Some(ref error) = routing_result.error {
+                    routing_result_map.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(error.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("error".to_string(), serde_json::Value::Null);
+                }
+                if let Some(price) = routing_result.price {
+                    routing_result_map.insert(
+                        "price".to_string(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(price)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
+                } else {
+                    routing_result_map.insert("price".to_string(), serde_json::Value::Null);
+                }
+                if let Some(buyer_id) = routing_result.buyer_id {
+                    routing_result_map.insert(
+                        "buyer_id".to_string(),
+                        serde_json::Value::String(buyer_id.to_string()),
+                    );
+                } else {
+                    routing_result_map.insert("buyer_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(campaign_id) = routing_result.campaign_id {
+                    routing_result_map.insert(
+                        "campaign_id".to_string(),
+                        serde_json::Value::String(campaign_id.to_string()),
+                    );
+                } else {
+                    routing_result_map.insert("campaign_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref ping_id) = routing_result.ping_id {
+                    routing_result_map.insert(
+                        "ping_id".to_string(),
+                        serde_json::Value::String(ping_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("ping_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref post_id) = routing_result.post_id {
+                    routing_result_map.insert(
+                        "post_id".to_string(),
+                        serde_json::Value::String(post_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("post_id".to_string(), serde_json::Value::Null);
+                }
+                if let Some(ref promise_id) = routing_result.promise_id {
+                    routing_result_map.insert(
+                        "promise_id".to_string(),
+                        serde_json::Value::String(promise_id.clone()),
+                    );
+                } else {
+                    routing_result_map.insert("promise_id".to_string(), serde_json::Value::Null);
+                }
+                let mut post_response_json_map = Map::new();
+                post_response_json_map.insert(
+                    "routing_result".to_string(),
+                    serde_json::Value::Object(routing_result_map),
+                );
+                let post_response_json = serde_json::Value::Object(post_response_json_map);
 
                 // Try to encrypt using SSM deterministic key
                 let env_norm_fp =
@@ -1934,15 +2050,13 @@ async fn create_lead(
             metrics_arc.log_summary("carina");
 
             // Critical path timing: mark post_response_parsed (response ready to return)
-            #[cfg(feature = "tracing")]
-            {
-                let critical_path_elapsed = critical_path_start.elapsed();
-                tracing::info!(
-                    lead_id = %lead_uuid,
-                    critical_path_ms = critical_path_elapsed.as_millis() as u64,
-                    "Non-DB critical path timing"
-                );
-            }
+            // Always available (not feature-gated) for production performance monitoring
+            let critical_path_elapsed = critical_path_start.elapsed();
+            tracing::info!(
+                lead_id = %lead_uuid,
+                critical_path_ms = critical_path_elapsed.as_millis() as u64,
+                "Non-DB critical path timing"
+            );
 
             Ok(Json(LeadResponse {
                 status: StatusNode {
