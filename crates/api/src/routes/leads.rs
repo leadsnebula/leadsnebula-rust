@@ -1377,7 +1377,9 @@ async fn create_lead(
             || salt_result.is_err()
             || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none())
     {
-        tracing::debug!("SSM keys missing in local dev - skipping pre-warm retry to avoid timeout delays");
+        tracing::debug!(
+            "SSM keys missing in local dev - skipping pre-warm retry to avoid timeout delays"
+        );
     }
 
     let prechecks_duration = prechecks_start.elapsed().as_millis() as u64;

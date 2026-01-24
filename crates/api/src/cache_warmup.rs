@@ -38,11 +38,11 @@ pub async fn pre_warm_cache(state: &AppState) {
         pre_warm_buyer_ids(cache, pool),
     );
 
-    // Group 2: Qualification configs, ping tree campaigns, and prechecks (depends on buyers/ping trees/publishers)
-    let (qual_configs_warmed, ping_tree_campaigns_warmed, prechecks_warmed) = tokio::join!(
+    // Group 2: Qualification configs and ping tree campaigns (depends on buyers/ping trees/publishers)
+    // NOTE: Prechecks are NOT pre-warmed - they cache naturally on first request to avoid stale negative results
+    let (qual_configs_warmed, ping_tree_campaigns_warmed) = tokio::join!(
         pre_warm_qualification_configs(cache, pool),
         pre_warm_ping_tree_campaigns(cache, pool),
-        pre_warm_prechecks(cache, pool),
     );
 
     // Group 3: SSM keys (independent, can run in parallel with everything)
@@ -57,8 +57,8 @@ pub async fn pre_warm_cache(state: &AppState) {
 
     let duration_ms = start.elapsed().as_millis();
     info!(
-        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys, {} buyers, {} campaigns, {} integrations, {} qual configs, {} buyer_ids, {} ping_tree_campaigns, {} prechecks",
-        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed, buyers_warmed, campaigns_warmed, integrations_warmed, qual_configs_warmed, buyer_ids_warmed, ping_tree_campaigns_warmed, prechecks_warmed
+        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys, {} buyers, {} campaigns, {} integrations, {} qual configs, {} buyer_ids, {} ping_tree_campaigns",
+        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed, buyers_warmed, campaigns_warmed, integrations_warmed, qual_configs_warmed, buyer_ids_warmed, ping_tree_campaigns_warmed
     );
 }
 
@@ -492,120 +492,9 @@ async fn pre_warm_ping_tree_campaigns(
     warmed
 }
 
-/// Pre-warm prechecks cache (5min TTL - prechecks:publisher:{id}:vertical:{slug}:token:{token})
-/// This eliminates cache misses for prechecks keys seen in logs
-async fn pre_warm_prechecks(
-    cache: &Arc<leadsnebula_core::cache::CacheService>,
-    pool: &PgPool,
-) -> usize {
-    let mut warmed = 0;
-
-    // Get active publishers and their verticals
-    match sqlx::query(
-        r#"
-        SELECT DISTINCT p.id as publisher_id, v.slug as vertical_slug
-        FROM publishers p
-        INNER JOIN ping_tree_publishers ptp ON p.id = ptp.publisher_id
-        INNER JOIN ping_trees pt ON ptp.ping_tree_id = pt.id
-        INNER JOIN verticals v ON pt.vertical = v.slug AND v.is_active = true
-        WHERE p.deleted_at IS NULL AND pt.deleted_at IS NULL AND pt.status = 'active'
-        LIMIT 100
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => {
-            for row in rows {
-                let publisher_id: uuid::Uuid = row.get("publisher_id");
-                let vertical_slug: String = row.get("vertical_slug");
-
-                // Pre-warm prechecks for empty token (most common case)
-                let cache_key = format!(
-                    "prechecks:publisher:{}:vertical:{}:token:",
-                    publisher_id, vertical_slug
-                );
-
-                // Pre-warm by running the actual prechecks query (not a placeholder)
-                let publisher_id_clone = publisher_id;
-                let vertical_slug_clone = vertical_slug.clone();
-                let pool_clone = pool.clone();
-                let _ = cache
-                    .get_or_insert_with(&cache_key, 300, || async {
-                        // Run the actual prechecks query to get real results
-                        sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
-                            r#"
-                            SELECT 
-                                c.id AS campaign_id,
-                                COALESCE(
-                                    c.buyer_id,
-                                    b_ping_tree.buyer_id,
-                                    b_vertical.id
-                                ) AS effective_buyer_id,
-                                EXISTS(
-                                    SELECT 1 FROM ping_tree_publishers ptp
-                                    INNER JOIN ping_trees pt ON pt.id = ptp.ping_tree_id
-                                    WHERE ptp.publisher_id = $1 
-                                      AND ptp.vertical = $2
-                                      AND pt.status = 'active'
-                                      AND pt.deleted_at IS NULL
-                                ) AS has_ping_tree
-                            FROM (VALUES (true)) AS dummy
-                            LEFT JOIN campaigns c ON (
-                                (c.campaign_token = $3 AND $3 != '' AND c.publisher_id = $1) OR 
-                                (c.vertical = $2 AND c.publisher_id = $1 AND c.buyer_id IN (
-                                    SELECT b.id FROM buyers b 
-                                    WHERE b.vertical_id = (
-                                        SELECT v.id FROM verticals v 
-                                        WHERE v.slug = $2 AND v.is_active = true
-                                    ) AND b.deleted_at IS NULL
-                                ))
-                            ) AND c.deleted_at IS NULL
-                            LEFT JOIN LATERAL (
-                                SELECT c_pt.buyer_id
-                                FROM ping_tree_publishers ptp_pt
-                                INNER JOIN ping_trees pt_pt ON pt_pt.id = ptp_pt.ping_tree_id
-                                INNER JOIN ping_tree_campaigns ptc ON ptc.ping_tree_id = pt_pt.id
-                                INNER JOIN campaigns c_pt ON c_pt.id = ptc.campaign_id
-                                WHERE ptp_pt.publisher_id = $1
-                                  AND ptp_pt.vertical = $2
-                                  AND pt_pt.status = 'active'
-                                  AND pt_pt.deleted_at IS NULL
-                                  AND ptc.enabled = true
-                                  AND c_pt.status = 'active'
-                                  AND c_pt.deleted_at IS NULL
-                                  AND c_pt.buyer_id IS NOT NULL
-                                LIMIT 1
-                            ) b_ping_tree ON TRUE
-                            LEFT JOIN buyers b_vertical ON 
-                                b_vertical.vertical_id = (
-                                    SELECT v2.id FROM verticals v2 
-                                    WHERE v2.slug = $2 AND v2.is_active = true
-                                ) 
-                                AND (c.id IS NULL OR c.buyer_id IS NULL)
-                                AND b_ping_tree.buyer_id IS NULL
-                                AND b_vertical.deleted_at IS NULL
-                            LIMIT 1
-                            "#,
-                        )
-                        .bind(publisher_id_clone)
-                        .bind(vertical_slug_clone)
-                        .bind("") // Empty campaign_token for warmup
-                        .fetch_optional(&pool_clone)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Database error during warmup: {}", e))
-                    })
-                    .await;
-                warmed += 1;
-            }
-        }
-        Err(e) => {
-            warn!("Failed to pre-warm prechecks: {}", e);
-        }
-    }
-
-    warmed
-}
+// Prechecks are NOT pre-warmed - they cache naturally on first request
+// This avoids caching stale negative results (has_ping_tree=false, buyer_id=NULL) during warmup
+// which can cause routing failures. Let real requests populate the cache with correct results.
 
 /// Pre-warm buyer IDs (24h TTL - buyers rarely change)
 /// This pre-warms the buyer:id cache used in buyer_router

@@ -146,8 +146,11 @@ impl SsmService {
                     .with_decryption(with_decryption)
                     .send();
 
-                match tokio::time::timeout(std::time::Duration::from_millis(retry_timeout_ms), retry_future)
-                    .await
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(retry_timeout_ms),
+                    retry_future,
+                )
+                .await
                 {
                     Ok(Ok(response)) => {
                         if let Some(param) = response.parameter() {
