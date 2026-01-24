@@ -45,7 +45,12 @@ impl SsmService {
             }
         }
 
-        // Fetch from SSM with 200ms timeout + single retry (100ms backoff) + graceful fallback
+        // OPTIMIZED: Use shorter timeout in local dev (50ms) to fail faster when AWS unavailable
+        let is_local_dev = std::path::Path::new(".env.local").exists();
+        let timeout_ms = if is_local_dev { 50 } else { 200 };
+        let retry_timeout_ms = if is_local_dev { 50 } else { 200 };
+
+        // Fetch from SSM with timeout + single retry + graceful fallback
         let ssm_future = self
             .client
             .get_parameter()
@@ -53,8 +58,8 @@ impl SsmService {
             .with_decryption(with_decryption)
             .send();
 
-        // First attempt with 200ms timeout
-        match tokio::time::timeout(std::time::Duration::from_millis(200), ssm_future).await {
+        // First attempt with timeout
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), ssm_future).await {
             Ok(Ok(response)) => {
                 if let Some(param) = response.parameter() {
                     let value = param.value().unwrap_or("").to_string();
@@ -141,7 +146,7 @@ impl SsmService {
                     .with_decryption(with_decryption)
                     .send();
 
-                match tokio::time::timeout(std::time::Duration::from_millis(200), retry_future)
+                match tokio::time::timeout(std::time::Duration::from_millis(retry_timeout_ms), retry_future)
                     .await
                 {
                     Ok(Ok(response)) => {

@@ -1338,14 +1338,17 @@ async fn create_lead(
     let (mut det_key_result, mut salt_result) = ssm_results;
 
     // If SSM keys are missing, force pre-warm as fallback and retry once
-    if det_key_result.is_err()
-        || det_key_result
-            .as_ref()
-            .ok()
-            .and_then(|r| r.as_ref())
-            .is_none()
-        || salt_result.is_err()
-        || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none()
+    // OPTIMIZED: Skip pre-warm retry in local dev to avoid SSM timeout delays
+    let is_local_dev = std::path::Path::new(".env.local").exists();
+    if !is_local_dev
+        && (det_key_result.is_err()
+            || det_key_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.as_ref())
+                .is_none()
+            || salt_result.is_err()
+            || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none())
     {
         tracing::warn!("SSM keys missing, forcing immediate pre-warm as fallback...");
         use crate::cache_warmup::pre_warm_ssm_keys;
@@ -1364,6 +1367,17 @@ async fn create_lead(
         if salt_result.is_err() || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none() {
             salt_result = get_ssm_parameter_cached(&state.ssm, &salt_path, true).await;
         }
+    } else if is_local_dev
+        && (det_key_result.is_err()
+            || det_key_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.as_ref())
+                .is_none()
+            || salt_result.is_err()
+            || salt_result.as_ref().ok().and_then(|r| r.as_ref()).is_none())
+    {
+        tracing::debug!("SSM keys missing in local dev - skipping pre-warm retry to avoid timeout delays");
     }
 
     let prechecks_duration = prechecks_start.elapsed().as_millis() as u64;
@@ -1375,13 +1389,13 @@ async fn create_lead(
             buyer_id_opt = effective_buyer_id;
 
             // Debug logging to diagnose buyer detection issues
-            tracing::debug!(
+            tracing::warn!(
                 publisher_id = %publisher.id,
                 vertical = %vertical.slug,
                 campaign_id = ?campaign_id,
                 effective_buyer_id = ?effective_buyer_id,
                 has_ping_tree = has_ping_tree,
-                "Prechecks query results"
+                "Prechecks query results - DETAILED DEBUG"
             );
 
             // Log ping tree status

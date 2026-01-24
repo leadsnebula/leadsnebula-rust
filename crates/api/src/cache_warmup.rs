@@ -526,15 +526,74 @@ async fn pre_warm_prechecks(
                     publisher_id, vertical_slug
                 );
 
-                // Pre-warm by calling get_or_insert_with (matches carina.rs cache key format)
+                // Pre-warm by running the actual prechecks query (not a placeholder)
+                let publisher_id_clone = publisher_id;
+                let vertical_slug_clone = vertical_slug.clone();
+                let pool_clone = pool.clone();
                 let _ = cache
                     .get_or_insert_with(&cache_key, 300, || async {
-                        // This will trigger the actual pre-check query in carina.rs
-                        // For warmup, we just want to cache the result structure
-                        // The actual query will be cached when first request comes in
-                        Ok::<(Option<uuid::Uuid>, Option<uuid::Uuid>, bool), anyhow::Error>((
-                            None, None, false,
-                        ))
+                        // Run the actual prechecks query to get real results
+                        sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+                            r#"
+                            SELECT 
+                                c.id AS campaign_id,
+                                COALESCE(
+                                    c.buyer_id,
+                                    b_ping_tree.buyer_id,
+                                    b_vertical.id
+                                ) AS effective_buyer_id,
+                                EXISTS(
+                                    SELECT 1 FROM ping_tree_publishers ptp
+                                    INNER JOIN ping_trees pt ON pt.id = ptp.ping_tree_id
+                                    WHERE ptp.publisher_id = $1 
+                                      AND ptp.vertical = $2
+                                      AND pt.status = 'active'
+                                      AND pt.deleted_at IS NULL
+                                ) AS has_ping_tree
+                            FROM (VALUES (true)) AS dummy
+                            LEFT JOIN campaigns c ON (
+                                (c.campaign_token = $3 AND $3 != '' AND c.publisher_id = $1) OR 
+                                (c.vertical = $2 AND c.publisher_id = $1 AND c.buyer_id IN (
+                                    SELECT b.id FROM buyers b 
+                                    WHERE b.vertical_id = (
+                                        SELECT v.id FROM verticals v 
+                                        WHERE v.slug = $2 AND v.is_active = true
+                                    ) AND b.deleted_at IS NULL
+                                ))
+                            ) AND c.deleted_at IS NULL
+                            LEFT JOIN LATERAL (
+                                SELECT c_pt.buyer_id
+                                FROM ping_tree_publishers ptp_pt
+                                INNER JOIN ping_trees pt_pt ON pt_pt.id = ptp_pt.ping_tree_id
+                                INNER JOIN ping_tree_campaigns ptc ON ptc.ping_tree_id = pt_pt.id
+                                INNER JOIN campaigns c_pt ON c_pt.id = ptc.campaign_id
+                                WHERE ptp_pt.publisher_id = $1
+                                  AND ptp_pt.vertical = $2
+                                  AND pt_pt.status = 'active'
+                                  AND pt_pt.deleted_at IS NULL
+                                  AND ptc.enabled = true
+                                  AND c_pt.status = 'active'
+                                  AND c_pt.deleted_at IS NULL
+                                  AND c_pt.buyer_id IS NOT NULL
+                                LIMIT 1
+                            ) b_ping_tree ON TRUE
+                            LEFT JOIN buyers b_vertical ON 
+                                b_vertical.vertical_id = (
+                                    SELECT v2.id FROM verticals v2 
+                                    WHERE v2.slug = $2 AND v2.is_active = true
+                                ) 
+                                AND (c.id IS NULL OR c.buyer_id IS NULL)
+                                AND b_ping_tree.buyer_id IS NULL
+                                AND b_vertical.deleted_at IS NULL
+                            LIMIT 1
+                            "#,
+                        )
+                        .bind(publisher_id_clone)
+                        .bind(vertical_slug_clone)
+                        .bind("") // Empty campaign_token for warmup
+                        .fetch_optional(&pool_clone)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Database error during warmup: {}", e))
                     })
                     .await;
                 warmed += 1;
