@@ -7,6 +7,11 @@
 #   ./autotests.sh --no-neon    # Run tests without creating Neon branch (uses existing DATABASE_URL)
 #   ./autotests.sh --unit-only  # Run only unit tests (no DB needed)
 #
+# 💡 WSL Users: Script auto-detects WSL and applies safer defaults:
+#    - Skips release builds for migrations (prevents crashes)
+#    - Uses shorter timeouts to fail fast and prevent hangs
+#    - All cargo operations are wrapped with timeouts
+#
 # Requirements:
 #   - NEON_API_KEY and NEON_PROJECT_ID in .env.local or environment
 #   - npx (for neonctl)
@@ -15,6 +20,13 @@
 set -uo pipefail
 # Don't use -e here - we want to handle errors explicitly in each test section
 # This prevents premature cleanup when tests timeout or fail
+
+# Auto-detect WSL to apply safer defaults
+if [ -f /proc/version ] && grep -qi microsoft /proc/version; then
+    IS_WSL=true
+else
+    IS_WSL=false
+fi
 
 # Parse flags
 USE_NEON=true
@@ -177,19 +189,29 @@ if [ "$USE_NEON" = true ]; then
     echo "Running database migrations..."
     # Set TEST_MODE for ephemeral test databases to enable automatic cleanup of inconsistent migrations
     export TEST_MODE=true
-    if cargo run --release --bin run-migrations --locked 2>/dev/null; then
-        echo "✅ Migrations applied successfully"
+    
+    # In WSL, skip release build for migrations (use debug build or let tests handle it)
+    if [ "$IS_WSL" = "true" ]; then
+        echo "   ⚠️  WSL detected: Skipping release build for migrations (tests will apply migrations automatically)"
+        echo "   ⚠️  This prevents WSL crashes from resource-intensive release builds"
     else
-        echo "⚠️  Migration binary not built or failed (tests will apply migrations automatically)"
-        echo "   Building migration binary..."
-        if cargo build --release --bin run-migrations --locked 2>/dev/null; then
-            echo "   Running migrations..."
-            export TEST_MODE=true
-            cargo run --release --bin run-migrations --locked || {
-                echo "⚠️  Manual migration failed, but sqlx::test will apply migrations automatically"
-            }
+        if cargo run --release --bin run-migrations --locked 2>/dev/null; then
+            echo "✅ Migrations applied successfully"
         else
-            echo "⚠️  Could not build migration binary (tests will apply migrations via sqlx::test)"
+            echo "⚠️  Migration binary not built or failed (tests will apply migrations automatically)"
+            echo "   Building migration binary..."
+            # In WSL, skip release build to prevent crashes
+            if [ "$IS_WSL" = "true" ]; then
+                echo "   ⚠️  Skipping release build in WSL (tests will apply migrations via sqlx::test)"
+            elif timeout 300 cargo build --release --bin run-migrations --locked 2>/dev/null; then
+                echo "   Running migrations..."
+                export TEST_MODE=true
+                timeout 60 cargo run --release --bin run-migrations --locked || {
+                    echo "⚠️  Manual migration failed, but sqlx::test will apply migrations automatically"
+                }
+            else
+                echo "⚠️  Could not build migration binary (tests will apply migrations via sqlx::test)"
+            fi
         fi
     fi
     echo ""
@@ -209,12 +231,28 @@ if [ "$UNIT_ONLY" = true ]; then
     echo "Running unit tests only (no database required)..."
     echo ""
     
+    # Use shorter timeout in WSL to prevent crashes
+    TIMEOUT_UNIT=$([ "$IS_WSL" = "true" ] && echo "180" || echo "300")
     if command -v cargo-nextest > /dev/null 2>&1; then
         echo "Using cargo-nextest for parallel execution..."
-        cargo nextest run --lib --locked --all-features
+        timeout "$TIMEOUT_UNIT" cargo nextest run --lib --locked --all-features || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (WSL may have crashed or tests too slow)"
+                exit 1
+            fi
+            exit $EXIT_CODE
+        }
     else
         echo "Using cargo test (install cargo-nextest for faster tests)..."
-        cargo test --lib --locked --all-features
+        timeout "$TIMEOUT_UNIT" cargo test --lib --locked --all-features || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (WSL may have crashed or tests too slow)"
+                exit 1
+            fi
+            exit $EXIT_CODE
+        }
     fi
 else
     echo "Running full test suite (unit + integration + E2E)..."
@@ -233,10 +271,26 @@ else
     
     # 1. Unit tests (fast, parallel)
     echo "1️⃣  Running unit tests..."
+    # Use shorter timeout in WSL to prevent crashes
+    TIMEOUT_UNIT=$([ "$IS_WSL" = "true" ] && echo "180" || echo "300")
     if [ "$HAS_NEXTEST" = true ]; then
-        cargo nextest run --lib --locked --all-features
+        timeout "$TIMEOUT_UNIT" cargo nextest run --lib --locked --all-features || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (WSL may have crashed or tests too slow)"
+                exit 1
+            fi
+            exit $EXIT_CODE
+        }
     else
-        cargo test --lib --locked --all-features
+        timeout "$TIMEOUT_UNIT" cargo test --lib --locked --all-features || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (WSL may have crashed or tests too slow)"
+                exit 1
+            fi
+            exit $EXIT_CODE
+        }
     fi
     echo "✅ Unit tests passed"
     echo ""
@@ -246,7 +300,9 @@ else
     echo "   ⚠️  Health and routes tests - quick, can run in parallel (matches CI)"
     # These tests should be fast, but add timeout as safety measure
     # Run in parallel (--test-threads=2) to match CI execution
-    if timeout 60 bash -c "
+    # Use shorter timeout in WSL to fail fast
+    TIMEOUT_NON_DB=$([ "$IS_WSL" = "true" ] && echo "45" || echo "60")
+    if timeout "$TIMEOUT_NON_DB" bash -c "
         if [ \"$HAS_NEXTEST\" = true ]; then
             cargo nextest run --locked --all-features --test integration_health --test integration_routes --test-threads=2
         else
@@ -276,9 +332,11 @@ else
     
     # Run with timeout wrapper to catch hanging tests
     # Use 150 seconds (2.5 minutes) to allow for slow CI databases
+    # Use shorter timeout in WSL to fail fast and prevent crashes
     # Add --nocapture to see test output in real-time (helps debug hanging tests)
     # Use unbuffered output to see progress immediately
-    timeout 150 cargo test --test integration_auth --locked --all-features -- --test-threads=1 --nocapture 2>&1 | tee /tmp/integration_auth_test.log
+    TIMEOUT_AUTH=$([ "$IS_WSL" = "true" ] && echo "120" || echo "150")
+    timeout "$TIMEOUT_AUTH" cargo test --test integration_auth --locked --all-features -- --test-threads=1 --nocapture 2>&1 | tee /tmp/integration_auth_test.log
     TEST_EXIT_CODE=${PIPESTATUS[0]}
     
     # If timeout killed the process, the test was hanging - show diagnostic info
@@ -348,8 +406,9 @@ else
         echo "   ⚠️  Watch for migration table race conditions and PoolTimedOut errors"
         
         # Run with timeout wrapper to catch hanging tests
-        # Use 120 seconds timeout for CRUD tests
-        timeout 120 cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/publisher_crud_test.log
+        # Use 120 seconds timeout for CRUD tests (shorter in WSL)
+        TIMEOUT_CRUD=$([ "$IS_WSL" = "true" ] && echo "90" || echo "120")
+        timeout "$TIMEOUT_CRUD" cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/publisher_crud_test.log
         TEST_EXIT_CODE=${PIPESTATUS[0]}
         
         # Check for timeout (exit code 124 from timeout command)
@@ -414,8 +473,10 @@ else
         
         # Run with timeout wrapper to catch hanging tests
         # Use 200 seconds timeout for E2E tests (they're the slowest)
+        # Use shorter timeout in WSL to fail fast and prevent crashes
         # Run with --ignored flag to include tests marked with #[ignore] (matches CI)
-        timeout 200 cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored 2>&1 | tee /tmp/e2e_test.log
+        TIMEOUT_E2E=$([ "$IS_WSL" = "true" ] && echo "150" || echo "200")
+        timeout "$TIMEOUT_E2E" cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored 2>&1 | tee /tmp/e2e_test.log
         TEST_EXIT_CODE=${PIPESTATUS[0]}
         
         # Check for timeout (exit code 124 from timeout command)
@@ -480,14 +541,16 @@ else
     
     # Run with timeout wrapper to catch hanging tests
     # Use 420 seconds (7 minutes) timeout for library tests
+    # Use shorter timeout in WSL to fail fast and prevent crashes
     # Calculation: 39 tests × ~10s average + 30s overhead = ~420s
     # Some tests (async_persistence, duplicate_post) take 30-40s each, so we need extra buffer
     # Run with --ignored flag to include tests marked with #[ignore] (matches CI)
     # Use nextest if available for better output, but must run sequentially
+    TIMEOUT_LIB=$([ "$IS_WSL" = "true" ] && echo "300" || echo "420")
     if [ "$HAS_NEXTEST" = true ]; then
-        timeout 420 cargo nextest run --lib --locked --all-features --test-threads=1 --run-ignored only 2>&1 | tee /tmp/lib_tests.log
+        timeout "$TIMEOUT_LIB" cargo nextest run --lib --locked --all-features --test-threads=1 --run-ignored only 2>&1 | tee /tmp/lib_tests.log
     else
-        timeout 420 cargo test --lib --all-features --locked -- --test-threads=1 --ignored 2>&1 | tee /tmp/lib_tests.log
+        timeout "$TIMEOUT_LIB" cargo test --lib --all-features --locked -- --test-threads=1 --ignored 2>&1 | tee /tmp/lib_tests.log
     fi
     TEST_EXIT_CODE=${PIPESTATUS[0]}
     
@@ -550,18 +613,21 @@ else
     echo "   ⚠️  Matches CI execution for 90% test coverage goal"
     
     # Run optimization tests (in core crate)
+    # Use shorter timeouts in WSL to fail fast and prevent crashes
+    TIMEOUT_OPT=$([ "$IS_WSL" = "true" ] && echo "120" || echo "180")
+    TIMEOUT_ENDPOINT=$([ "$IS_WSL" = "true" ] && echo "90" || echo "120")
     if [ "$HAS_NEXTEST" = true ]; then
-        timeout 180 cargo nextest run --package leadsnebula_core --lib --locked --all-features --test-threads=1 --run-ignored only -- optimization_tests 2>&1 | tee /tmp/optimization_tests.log || true
+        timeout "$TIMEOUT_OPT" cargo nextest run --package leadsnebula_core --lib --locked --all-features --test-threads=1 --run-ignored only -- optimization_tests 2>&1 | tee /tmp/optimization_tests.log || true
     else
-        timeout 180 cargo test --package leadsnebula_core --lib --locked --all-features -- --test-threads=1 --ignored optimization_tests 2>&1 | tee /tmp/optimization_tests.log || true
+        timeout "$TIMEOUT_OPT" cargo test --package leadsnebula_core --lib --locked --all-features -- --test-threads=1 --ignored optimization_tests 2>&1 | tee /tmp/optimization_tests.log || true
     fi
     
     # Run endpoint integration tests (in api crate)
     if cargo test --test integration_leads_endpoint --list 2>/dev/null | grep -q "test.*"; then
         if [ "$HAS_NEXTEST" = true ]; then
-            timeout 120 cargo nextest run --test integration_leads_endpoint --locked --all-features --test-threads=1 --run-ignored only 2>&1 | tee /tmp/leads_endpoint_tests.log || true
+            timeout "$TIMEOUT_ENDPOINT" cargo nextest run --test integration_leads_endpoint --locked --all-features --test-threads=1 --run-ignored only 2>&1 | tee /tmp/leads_endpoint_tests.log || true
         else
-            timeout 120 cargo test --test integration_leads_endpoint --locked --all-features -- --test-threads=1 --ignored 2>&1 | tee /tmp/leads_endpoint_tests.log || true
+            timeout "$TIMEOUT_ENDPOINT" cargo test --test integration_leads_endpoint --locked --all-features -- --test-threads=1 --ignored 2>&1 | tee /tmp/leads_endpoint_tests.log || true
         fi
     fi
     

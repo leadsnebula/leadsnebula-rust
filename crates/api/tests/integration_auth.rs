@@ -219,93 +219,173 @@ async fn test_otp_enable_and_disable() -> sqlx::Result<()> {
         eprintln!("⚠️  DATABASE_URL not set - skipping test_otp_enable_and_disable");
         return Ok(());
     }
+    eprintln!("[test_otp_enable_and_disable] Starting test...");
+
     // Retry pool acquisition to handle transient pool exhaustion
+    eprintln!("[test_otp_enable_and_disable] Creating test pool...");
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
+    eprintln!("[test_otp_enable_and_disable] Pool created, beginning transaction...");
 
-    // Retry transaction begin with exponential backoff
+    // Retry transaction begin with exponential backoff and timeout
+    // Wrap pool.begin() in a timeout to catch hangs (pool exhaustion)
     let mut tx = {
         let mut retries = 0;
-        let max_retries = 3;
+        let max_retries = 5; // Increased retries
         loop {
-            match pool.begin().await {
-                Ok(tx) => break Ok(tx),
-                Err(sqlx::Error::PoolTimedOut) if retries < max_retries => {
+            // Wrap pool.begin() in a timeout to catch hangs
+            match tokio::time::timeout(tokio::time::Duration::from_secs(30), pool.begin()).await {
+                Ok(Ok(tx)) => {
+                    eprintln!("[test_otp_enable_and_disable] Transaction started");
+                    break Ok(tx);
+                }
+                Ok(Err(sqlx::Error::PoolTimedOut)) if retries < max_retries => {
                     retries += 1;
-                    let delay_ms = 100 * (1 << retries); // 200ms, 400ms, 800ms
+                    let delay_ms = 200 * retries; // 200ms, 400ms, 600ms, 800ms, 1000ms
+                    eprintln!("[test_otp_enable_and_disable] Pool timeout, retrying in {}ms (attempt {}/{})...", delay_ms, retries, max_retries);
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
-                Err(e) => break Err(e),
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "[test_otp_enable_and_disable] Failed to begin transaction: {}",
+                        e
+                    );
+                    break Err(e);
+                }
+                Err(_) => {
+                    // Timeout occurred - pool.begin() hung (pool is exhausted)
+                    eprintln!("[test_otp_enable_and_disable] pool.begin() timed out after 30 seconds - pool is likely exhausted");
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay_ms = 1000 * retries; // Wait longer for connections to be released
+                        eprintln!("[test_otp_enable_and_disable] Waiting {}ms for connections to be released (attempt {}/{})...", delay_ms, retries, max_retries);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    } else {
+                        eprintln!(
+                            "[test_otp_enable_and_disable] Max retries reached - pool is exhausted"
+                        );
+                        eprintln!("[test_otp_enable_and_disable] This usually means previous tests didn't release connections properly");
+                        break Err(sqlx::Error::PoolTimedOut);
+                    }
+                }
             }
         }
     }?;
+
+    eprintln!("[test_otp_enable_and_disable] Creating test user...");
     let user_id = create_test_user(&mut *tx, "otp_enable_test@example.com").await;
+    eprintln!(
+        "[test_otp_enable_and_disable] Test user created: {}",
+        user_id
+    );
 
     // Create OTP setting (disabled)
+    // Use a timeout to prevent hanging indefinitely
+    eprintln!("[test_otp_enable_and_disable] Inserting OTP settings...");
     let secret = "JBSWY3DPEHPK3PXP";
-    sqlx::query(
-        r#"
-        INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, enabled, created_at, updated_at)
-        VALUES ($1, $2, false, NOW(), NOW())
-        ON CONFLICT (instance_user_id) DO UPDATE
-        SET secret_encrypted = EXCLUDED.secret_encrypted, updated_at = NOW()
-        "#,
+
+    // Wrap the INSERT in a timeout to catch hanging operations
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        sqlx::query(
+            r#"
+            INSERT INTO user_otp_settings (instance_user_id, secret_encrypted, enabled, created_at, updated_at)
+            VALUES ($1, $2, false, NOW(), NOW())
+            ON CONFLICT (instance_user_id) DO UPDATE
+            SET secret_encrypted = EXCLUDED.secret_encrypted, updated_at = NOW()
+            "#,
+        )
+        .bind(user_id)
+        .bind(secret)
+        .execute(&mut *tx)
     )
-    .bind(user_id)
-    .bind(secret)
-    .execute(&mut *tx)
-    .await?;
+    .await
+    {
+        Ok(Ok(_)) => {
+            eprintln!("[test_otp_enable_and_disable] OTP settings inserted");
+        }
+        Ok(Err(e)) => {
+            eprintln!("[test_otp_enable_and_disable] INSERT failed: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            eprintln!("[test_otp_enable_and_disable] INSERT timed out after 30 seconds - possible deadlock or lock conflict");
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+    }
 
     // Verify OTP is disabled
+    eprintln!("[test_otp_enable_and_disable] Verifying OTP is disabled...");
     let enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
             .flatten();
+    eprintln!(
+        "[test_otp_enable_and_disable] Enabled status: {:?}",
+        enabled
+    );
 
     assert_eq!(enabled, Some(false));
 
     // Enable OTP
+    eprintln!("[test_otp_enable_and_disable] Enabling OTP...");
     sqlx::query(
         "UPDATE user_otp_settings SET enabled = true, updated_at = NOW() WHERE instance_user_id = $1",
     )
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    eprintln!("[test_otp_enable_and_disable] OTP enabled");
 
     // Verify OTP is enabled
+    eprintln!("[test_otp_enable_and_disable] Verifying OTP is enabled...");
     let enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
             .flatten();
+    eprintln!(
+        "[test_otp_enable_and_disable] Enabled status: {:?}",
+        enabled
+    );
 
     assert_eq!(enabled, Some(true));
 
     // Disable OTP
+    eprintln!("[test_otp_enable_and_disable] Disabling OTP...");
     sqlx::query(
         "UPDATE user_otp_settings SET enabled = false, updated_at = NOW() WHERE instance_user_id = $1",
     )
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    eprintln!("[test_otp_enable_and_disable] OTP disabled");
 
     // Verify OTP is disabled again
+    eprintln!("[test_otp_enable_and_disable] Verifying OTP is disabled again...");
     let enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM user_otp_settings WHERE instance_user_id = $1")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
             .flatten();
+    eprintln!(
+        "[test_otp_enable_and_disable] Enabled status: {:?}",
+        enabled
+    );
 
     assert_eq!(enabled, Some(false));
 
     // Rollback transaction to prevent test data from persisting
+    eprintln!("[test_otp_enable_and_disable] Rolling back transaction...");
     tx.rollback().await?;
+    eprintln!("[test_otp_enable_and_disable] Test completed successfully");
     Ok(())
 }
 

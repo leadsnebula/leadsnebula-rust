@@ -24,16 +24,16 @@ async fn test_vertical_validation_logic() {
         eprintln!("⚠️  DATABASE_URL not set - skipping test");
         return;
     }
-    
+
     let pool = create_test_pool().await.unwrap();
-    
+
     // Test that non-existent vertical is detected
     let vertical_result = leadsnebula_core::models::vertical::Vertical::find_by_slug(
         &pool,
         "nonexistent_vertical_12345",
     )
     .await;
-    
+
     assert!(vertical_result.is_ok());
     assert!(vertical_result.unwrap().is_none());
 }
@@ -47,17 +47,15 @@ async fn test_post_request_validation_requires_promise_id() {
         eprintln!("⚠️  DATABASE_URL not set - skipping test");
         return;
     }
-    
+
     let pool = create_test_pool().await.unwrap();
-    
+
     // Test that finding lead by promise_id works
     let nonexistent_promise_id = format!("PROMISE_{}", Uuid::new_v4());
-    let lead_result = leadsnebula_core::models::lead::Lead::find_by_promise_id(
-        &pool,
-        &nonexistent_promise_id,
-    )
-    .await;
-    
+    let lead_result =
+        leadsnebula_core::models::lead::Lead::find_by_promise_id(&pool, &nonexistent_promise_id)
+            .await;
+
     assert!(lead_result.is_ok());
     assert!(lead_result.unwrap().is_none());
 }
@@ -67,7 +65,7 @@ async fn test_post_request_validation_requires_promise_id() {
 async fn test_error_mapping_to_user_friendly_messages() {
     // Test error mapping logic used by the endpoint
     // This verifies that database errors are mapped to user-friendly messages
-    
+
     // Test various error patterns
     let test_cases = vec![
         ("submitted_at", "Server misconfiguration"),
@@ -76,16 +74,25 @@ async fn test_error_mapping_to_user_friendly_messages() {
         ("post_id", "Post could not be created"),
         ("permission denied", "Server permission error"),
     ];
-    
+
     for (error_text, expected_keyword) in test_cases {
         // Import the error mapping function from leads.rs
         // Since we can't import from binary crate, we'll test the pattern matching logic
         let lower = error_text.to_lowercase();
-        let contains_keyword = lower.contains(expected_keyword.to_lowercase().split_whitespace().next().unwrap());
-        
+        let contains_keyword = lower.contains(
+            expected_keyword
+                .to_lowercase()
+                .split_whitespace()
+                .next()
+                .unwrap(),
+        );
+
         // Verify error pattern detection works
         assert!(
-            contains_keyword || error_text.contains("submitted_at") || error_text.contains("buyer_id") || error_text.contains("campaign_id"),
+            contains_keyword
+                || error_text.contains("submitted_at")
+                || error_text.contains("buyer_id")
+                || error_text.contains("campaign_id"),
             "Error pattern '{}' should be detected",
             error_text
         );

@@ -18,10 +18,19 @@
 # For full test suite including database integration tests:
 #   ./autotests.sh          # Creates ephemeral DB and runs all tests
 #
-# 💡 WSL Users: If WSL crashes during validation, try:
-#    SKIP_RELEASE_BUILD=true SKIP_CLEANUP=true ./validate.sh
+# 💡 WSL Users: Script auto-detects WSL and applies safer defaults:
+#    - SKIP_CLEANUP=true (skips incremental artifact cleanup)
+#    - SKIP_RELEASE_BUILD=true (skips resource-intensive release build)
+#    Override with: SKIP_CLEANUP=false SKIP_RELEASE_BUILD=false ./validate.sh
 
 set -e
+
+# Auto-detect WSL to apply safer defaults
+if [ -f /proc/version ] && grep -qi microsoft /proc/version; then
+    IS_WSL=true
+else
+    IS_WSL=false
+fi
 
 # Parse flags
 STRICT_MODE=${CI:-false}  # Auto-enable in CI, default off locally
@@ -30,6 +39,22 @@ for arg in "$@"; do
         STRICT_MODE=true
     fi
 done
+
+# WSL-specific defaults: skip cleanup and release build by default to prevent crashes
+# Users can override with SKIP_CLEANUP=false SKIP_RELEASE_BUILD=false if needed
+if [ "$IS_WSL" = "true" ] && [ -z "${SKIP_CLEANUP:-}" ]; then
+    export SKIP_CLEANUP=true
+    echo "🔧 WSL detected: Auto-enabling SKIP_CLEANUP=true to prevent crashes"
+    echo "   Override with: SKIP_CLEANUP=false ./validate.sh"
+    echo ""
+fi
+
+if [ "$IS_WSL" = "true" ] && [ -z "${SKIP_RELEASE_BUILD:-}" ]; then
+    export SKIP_RELEASE_BUILD=true
+    echo "🔧 WSL detected: Auto-enabling SKIP_RELEASE_BUILD=true to prevent crashes"
+    echo "   Override with: SKIP_RELEASE_BUILD=false ./validate.sh"
+    echo ""
+fi
 
 # Check for jq dependency
 if ! command -v jq > /dev/null 2>&1; then
@@ -95,6 +120,7 @@ ERRORS=0
 # Corrupt incremental compilation artifacts can cause cargo commands to hang or crash WSL
 # This is especially important in WSL where filesystem issues can corrupt these files
 # SKIP_CLEANUP can be set to skip this step if it causes issues
+# In WSL, this is skipped by default to prevent crashes
 if [ "${SKIP_CLEANUP:-false}" != "true" ] && [ -d "target" ]; then
     echo "0️⃣  Cleaning corrupt incremental compilation artifacts (prevents WSL crashes)..."
     # Remove corrupt incremental artifacts that can cause WSL crashes
@@ -102,16 +128,25 @@ if [ "${SKIP_CLEANUP:-false}" != "true" ] && [ -d "target" ]; then
     # Use timeout to prevent hanging if filesystem is in bad state
     # Only remove specific corrupt files, not entire directories
     # Use very short timeout and wrap in subshell to prevent WSL crashes
-    (timeout 5 sh -c 'find target/debug/incremental target/release/incremental -name "dep-graph.bin" -type f -delete 2>/dev/null || true' 2>/dev/null || true) || true
-    (timeout 5 sh -c 'find target/debug/incremental target/release/incremental -name "*.lock" -type f -delete 2>/dev/null || true' 2>/dev/null || true) || true
+    # Use even more defensive approach: check if find works first
+    if command -v find > /dev/null 2>&1; then
+        (timeout 3 sh -c 'find target/debug/incremental target/release/incremental -name "dep-graph.bin" -type f -delete 2>/dev/null || true' 2>/dev/null || true) || true
+        (timeout 3 sh -c 'find target/debug/incremental target/release/incremental -name "*.lock" -type f -delete 2>/dev/null || true' 2>/dev/null || true) || true
+    fi
     echo "✅ Incremental artifacts cleaned (if any were found)"
+    echo ""
+elif [ "${SKIP_CLEANUP:-false}" = "true" ]; then
+    echo "0️⃣  Cleaning corrupt incremental compilation artifacts (SKIPPED - SKIP_CLEANUP=true)..."
+    echo "   ⚠️  Cleanup skipped. If you experience WSL crashes, try: SKIP_CLEANUP=false ./validate.sh"
     echo ""
 fi
 
 # 1. Format check
 echo "1️⃣  Checking formatting..."
 # Add timeout to prevent WSL crashes from hanging cargo commands
-if ! timeout 180 cargo fmt --all -- --check; then
+# Use shorter timeout in WSL to fail fast
+TIMEOUT_FMT=$([ "$IS_WSL" = "true" ] && echo "120" || echo "180")
+if ! timeout "$TIMEOUT_FMT" cargo fmt --all -- --check; then
     EXIT_CODE=$?
     if [ $EXIT_CODE -eq 124 ]; then
         echo "❌ Formatting check timed out (3 minutes). This may indicate WSL/filesystem issues."
@@ -129,7 +164,9 @@ echo ""
 # 2. Clippy check
 echo "2️⃣  Running clippy (warnings as errors)..."
 # Add timeout to prevent WSL crashes from hanging cargo commands
-if ! timeout 300 cargo clippy --all-targets --all-features -- -D warnings; then
+# Use shorter timeout in WSL to fail fast
+TIMEOUT_CLIPPY=$([ "$IS_WSL" = "true" ] && echo "240" || echo "300")
+if ! timeout "$TIMEOUT_CLIPPY" cargo clippy --all-targets --all-features -- -D warnings; then
     EXIT_CODE=$?
     if [ $EXIT_CODE -eq 124 ]; then
         echo "❌ Clippy check timed out (5 minutes). This may indicate WSL/filesystem issues."
@@ -217,8 +254,9 @@ echo "4️⃣  Running unit tests (with --locked)..."
 
 if command -v cargo-nextest > /dev/null 2>&1; then
     echo "   Using cargo-nextest for faster parallel test execution..."
-    # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-    if ! timeout 600 cargo nextest run --lib --locked --all-features; then
+    # Add timeout to prevent WSL crashes (10 minutes for unit tests, shorter in WSL)
+    TIMEOUT_TESTS=$([ "$IS_WSL" = "true" ] && echo "480" || echo "600")
+    if ! timeout "$TIMEOUT_TESTS" cargo nextest run --lib --locked --all-features; then
         EXIT_CODE=$?
         if [ $EXIT_CODE -eq 124 ]; then
             echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
@@ -233,8 +271,9 @@ if command -v cargo-nextest > /dev/null 2>&1; then
     fi
 else
     echo "   Using cargo test (install cargo-nextest for faster tests: cargo install cargo-nextest)"
-    # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-    if ! timeout 600 cargo test --lib --locked --all-features; then
+    # Add timeout to prevent WSL crashes (10 minutes for unit tests, shorter in WSL)
+    TIMEOUT_TESTS=$([ "$IS_WSL" = "true" ] && echo "480" || echo "600")
+    if ! timeout "$TIMEOUT_TESTS" cargo test --lib --locked --all-features; then
         EXIT_CODE=$?
         if [ $EXIT_CODE -eq 124 ]; then
             echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
@@ -262,9 +301,11 @@ if [ "${SKIP_RELEASE_BUILD:-false}" = "true" ]; then
 else
     echo "5️⃣  Building release (with --locked, limited parallelism for WSL stability)..."
     # Limit parallelism to reduce memory/CPU usage and prevent WSL crashes
-    # Use 2 jobs instead of all cores to be more conservative in WSL
+    # Use 1 job in WSL, 2 jobs elsewhere to be more conservative
     # Add timeout to prevent WSL crashes from hanging cargo commands
-    if ! timeout 600 sh -c 'CARGO_BUILD_JOBS=2 cargo build --release --locked'; then
+    BUILD_JOBS=$([ "$IS_WSL" = "true" ] && echo "1" || echo "2")
+    TIMEOUT_BUILD=$([ "$IS_WSL" = "true" ] && echo "480" || echo "600")
+    if ! timeout "$TIMEOUT_BUILD" sh -c "CARGO_BUILD_JOBS=$BUILD_JOBS cargo build --release --locked"; then
         EXIT_CODE=$?
         if [ $EXIT_CODE -eq 124 ]; then
             echo "❌ Build timed out (10 minutes). This may indicate WSL/filesystem issues."

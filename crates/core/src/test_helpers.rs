@@ -505,7 +505,7 @@ pub fn should_run_heavy_tests() -> bool {
     // Load .env.local if present (non-fatal)
     let _ = dotenvy::from_filename(".env.local");
     let _ = dotenvy::dotenv();
-    
+
     // Check if RUN_HEAVY_TESTS is explicitly set to "true"
     std::env::var("RUN_HEAVY_TESTS")
         .map(|v| v == "true" || v == "1")

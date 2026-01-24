@@ -71,22 +71,20 @@ mod optimization_tests {
 
         // Test sequential execution
         let sequential_start = Instant::now();
-        let buyer_name_seq: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM buyers WHERE id = $1",
-        )
-        .bind(buyer_id)
-        .fetch_optional(&pool)
-        .await
-        .unwrap()
-        .flatten();
-        let campaign_name_seq: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM campaigns WHERE id = $1",
-        )
-        .bind(campaign_id)
-        .fetch_optional(&pool)
-        .await
-        .unwrap()
-        .flatten();
+        let buyer_name_seq: Option<String> =
+            sqlx::query_scalar("SELECT name FROM buyers WHERE id = $1")
+                .bind(buyer_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
+        let campaign_name_seq: Option<String> =
+            sqlx::query_scalar("SELECT name FROM campaigns WHERE id = $1")
+                .bind(campaign_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
         let sequential_duration = sequential_start.elapsed();
 
         // Test parallel execution
@@ -318,8 +316,8 @@ mod optimization_tests {
             return;
         }
 
-        use crate::ssm::SsmService;
         use crate::services::ssm_key_cache::get_ssm_parameter_cached;
+        use crate::ssm::SsmService;
 
         // Create SSM service (may fail in local dev without AWS credentials - that's OK)
         let ssm = match SsmService::new("dev".to_string(), None).await {
@@ -343,9 +341,20 @@ mod optimization_tests {
         let second_duration = second_start.elapsed();
 
         // Verify results are the same
-        assert_eq!(first_result.is_ok(), second_result.is_ok());
-        if first_result.is_ok() && second_result.is_ok() {
-            assert_eq!(first_result.unwrap(), second_result.unwrap());
+        match (first_result.as_ref(), second_result.as_ref()) {
+            (Ok(first_val), Ok(second_val)) => {
+                assert_eq!(first_val, second_val);
+            }
+            (Err(e1), Err(e2)) => {
+                // Both failed, which is acceptable if SSM is not configured
+                eprintln!("Both SSM calls failed: e1={:?}, e2={:?}", e1, e2);
+            }
+            _ => {
+                panic!(
+                    "Mismatched SSM call results: first={:?}, second={:?}",
+                    first_result, second_result
+                );
+            }
         }
 
         // On slow systems (like CI with network latency), SSM calls can be slow
