@@ -1114,7 +1114,11 @@ async fn create_lead(
                                 r#"
                         SELECT 
                             c.id AS campaign_id,
-                            COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
+                            COALESCE(
+                                c.buyer_id,
+                                b_ping_tree.buyer_id,
+                                b_vertical.id
+                            ) AS effective_buyer_id,
                             EXISTS(
                                 SELECT 1 FROM ping_tree_publishers ptp
                                 INNER JOIN ping_trees pt ON pt.id = ptp.ping_tree_id
@@ -1134,12 +1138,28 @@ async fn create_lead(
                                 ) AND b.deleted_at IS NULL
                             ))
                         ) AND c.deleted_at IS NULL
+                        LEFT JOIN LATERAL (
+                            SELECT c_pt.buyer_id
+                            FROM ping_tree_publishers ptp_pt
+                            INNER JOIN ping_trees pt_pt ON pt_pt.id = ptp_pt.ping_tree_id
+                            INNER JOIN ping_tree_campaigns ptc ON ptc.ping_tree_id = pt_pt.id
+                            INNER JOIN campaigns c_pt ON c_pt.id = ptc.campaign_id
+                            WHERE ptp_pt.publisher_id = $1
+                              AND ptp_pt.vertical = $2
+                              AND pt_pt.status = 'active'
+                              AND pt_pt.deleted_at IS NULL
+                              AND ptc.enabled = true
+                              AND c_pt.status = 'active'
+                              AND c_pt.deleted_at IS NULL
+                            LIMIT 1
+                        ) b_ping_tree ON c.id IS NULL OR c.buyer_id IS NULL
                         LEFT JOIN buyers b_vertical ON 
                             b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
                                 WHERE v2.slug = $2 AND v2.is_active = true
                             ) 
                             AND (c.id IS NULL OR c.buyer_id IS NULL)
+                            AND b_ping_tree.buyer_id IS NULL
                             AND b_vertical.deleted_at IS NULL
                         LIMIT 1
                         "#,
@@ -1171,15 +1191,23 @@ async fn create_lead(
                         metrics.record_cache_miss();
                         // Fallback to direct DB query
                         let db_start = std::time::Instant::now();
-                        let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
-                    r#"
+                        let result =
+                            sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+                                r#"
                     SELECT 
                         c.id AS campaign_id,
-                        COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
+                        COALESCE(
+                            c.buyer_id,
+                            b_ping_tree.buyer_id,
+                            b_vertical.id
+                        ) AS effective_buyer_id,
                         EXISTS(
                             SELECT 1 FROM ping_trees pt
                             INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id
-                            WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL
+                            WHERE ptp.publisher_id = $1 
+                              AND ptp.vertical = $2
+                              AND pt.status = 'active'
+                              AND pt.deleted_at IS NULL
                         ) AS has_ping_tree
                     FROM (VALUES (true)) AS dummy
                     LEFT JOIN campaigns c ON (
@@ -1192,21 +1220,37 @@ async fn create_lead(
                             ) AND b.deleted_at IS NULL
                         ))
                     ) AND c.deleted_at IS NULL
+                    LEFT JOIN LATERAL (
+                        SELECT c_pt.buyer_id
+                        FROM ping_tree_publishers ptp_pt
+                        INNER JOIN ping_trees pt_pt ON pt_pt.id = ptp_pt.ping_tree_id
+                        INNER JOIN ping_tree_campaigns ptc ON ptc.ping_tree_id = pt_pt.id
+                        INNER JOIN campaigns c_pt ON c_pt.id = ptc.campaign_id
+                        WHERE ptp_pt.publisher_id = $1
+                          AND ptp_pt.vertical = $2
+                          AND pt_pt.status = 'active'
+                          AND pt_pt.deleted_at IS NULL
+                          AND ptc.enabled = true
+                          AND c_pt.status = 'active'
+                          AND c_pt.deleted_at IS NULL
+                        LIMIT 1
+                    ) b_ping_tree ON c.id IS NULL OR c.buyer_id IS NULL
                     LEFT JOIN buyers b_vertical ON 
                         b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
                                     WHERE v2.slug = $2 AND v2.is_active = true
                         ) 
                         AND (c.id IS NULL OR c.buyer_id IS NULL)
+                        AND b_ping_tree.buyer_id IS NULL
                         AND b_vertical.deleted_at IS NULL
                     LIMIT 1
                     "#,
-                )
-                .bind(publisher.id)
-                .bind(vertical.slug.clone())
-                .bind(campaign_token)
-                .fetch_optional(&*state.db_pool)
-                .await;
+                            )
+                            .bind(publisher.id)
+                            .bind(vertical.slug.clone())
+                            .bind(campaign_token)
+                            .fetch_optional(&*state.db_pool)
+                            .await;
                         metrics.record_query(db_start.elapsed().as_millis() as u64);
                         (result, false)
                     }
@@ -1218,7 +1262,11 @@ async fn create_lead(
                     r#"
             SELECT 
                 c.id AS campaign_id,
-                COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
+                COALESCE(
+                    c.buyer_id,
+                    b_ping_tree.buyer_id,
+                    b_vertical.id
+                ) AS effective_buyer_id,
                 EXISTS(
                     SELECT 1 FROM ping_trees pt
                     INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id
@@ -1238,12 +1286,28 @@ async fn create_lead(
                     ) AND b.deleted_at IS NULL
                 ))
             ) AND c.deleted_at IS NULL
+            LEFT JOIN LATERAL (
+                SELECT c_pt.buyer_id
+                FROM ping_tree_publishers ptp_pt
+                INNER JOIN ping_trees pt_pt ON pt_pt.id = ptp_pt.ping_tree_id
+                INNER JOIN ping_tree_campaigns ptc ON ptc.ping_tree_id = pt_pt.id
+                INNER JOIN campaigns c_pt ON c_pt.id = ptc.campaign_id
+                WHERE ptp_pt.publisher_id = $1
+                  AND ptp_pt.vertical = $2
+                  AND pt_pt.status = 'active'
+                  AND pt_pt.deleted_at IS NULL
+                  AND ptc.enabled = true
+                  AND c_pt.status = 'active'
+                  AND c_pt.deleted_at IS NULL
+                LIMIT 1
+            ) b_ping_tree ON c.id IS NULL OR c.buyer_id IS NULL
             LEFT JOIN buyers b_vertical ON 
                 b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
                                     WHERE v2.slug = $2 AND v2.is_active = true
                 ) 
                 AND (c.id IS NULL OR c.buyer_id IS NULL)
+                AND b_ping_tree.buyer_id IS NULL
                 AND b_vertical.deleted_at IS NULL
             LIMIT 1
             "#,
