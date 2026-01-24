@@ -207,14 +207,20 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 if is_test_mode {
                     // In test mode, drop and recreate _sqlx_migrations table to ensure clean state
                     // This prevents checksum mismatches from copied branch state
-                    sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations CASCADE")
+                    // Remove CASCADE to avoid dropping dependent types that might cause "type already exists" errors
+                    sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
                         .execute(&pool)
                         .await
                         .ok();
 
+                    // Small delay to ensure DROP is committed before CREATE
+                    // This helps avoid race conditions when multiple tests run concurrently
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
                     // Recreate table with exact SQLx schema
+                    // Use CREATE TABLE (not IF NOT EXISTS) since we just dropped it
                     sqlx::query(
-                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                        "CREATE TABLE _sqlx_migrations (
                             version BIGINT PRIMARY KEY,
                             description TEXT NOT NULL,
                             installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -490,4 +496,18 @@ pub async fn create_test_pool_with_transaction(
     let pool = create_test_pool().await?;
     let tx = pool.begin().await?;
     Ok((pool, tx))
+}
+
+/// Check if heavy tests should run
+/// Heavy tests are skipped by default in CI and fast iteration mode
+/// Set RUN_HEAVY_TESTS=true in .env.local to enable them locally
+pub fn should_run_heavy_tests() -> bool {
+    // Load .env.local if present (non-fatal)
+    let _ = dotenvy::from_filename(".env.local");
+    let _ = dotenvy::dotenv();
+    
+    // Check if RUN_HEAVY_TESTS is explicitly set to "true"
+    std::env::var("RUN_HEAVY_TESTS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }

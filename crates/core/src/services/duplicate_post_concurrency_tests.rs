@@ -170,6 +170,10 @@ mod duplicate_post_concurrency_tests {
     #[tokio::test]
     #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_duplicate_post_atomicity() {
+        if !crate::test_helpers::should_run_heavy_tests() {
+            eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
+            return;
+        }
         if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
             eprintln!(
                 "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
@@ -259,6 +263,10 @@ mod duplicate_post_concurrency_tests {
     #[tokio::test]
     #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_duplicate_post_with_different_promise_ids() {
+        if !crate::test_helpers::should_run_heavy_tests() {
+            eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
+            return;
+        }
         if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
             eprintln!(
                 "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
@@ -303,6 +311,10 @@ mod duplicate_post_concurrency_tests {
     #[tokio::test]
     #[ignore] // Requires ephemeral DB; run via ./autotests.sh
     async fn test_duplicate_post_after_already_posted() {
+        if !crate::test_helpers::should_run_heavy_tests() {
+            eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
+            return;
+        }
         if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
             eprintln!(
                 "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"

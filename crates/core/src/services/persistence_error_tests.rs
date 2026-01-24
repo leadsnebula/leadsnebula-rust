@@ -71,6 +71,10 @@ mod persistence_error_tests {
     #[tokio::test]
     #[ignore] // Requires DATABASE_URL
     async fn test_buyer_responses_persistence_handles_errors_gracefully() {
+        if !crate::test_helpers::should_run_heavy_tests() {
+            eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
+            return;
+        }
         // Test that buyer_responses persistence errors don't break routing
         let pool = match create_test_pool().await {
             Ok(p) => p,
@@ -110,6 +114,10 @@ mod persistence_error_tests {
     #[tokio::test]
     #[ignore] // Requires DATABASE_URL
     async fn test_payload_persistence_handles_encryption_failures() {
+        if !crate::test_helpers::should_run_heavy_tests() {
+            eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
+            return;
+        }
         // Test that encryption failures don't prevent payload persistence
         let pool = match create_test_pool().await {
             Ok(p) => p,

@@ -13,3 +13,6 @@ pub mod write_behind_queue;
 
 #[cfg(test)]
 mod ping_tree_router_loom_tests;
+
+#[cfg(test)]
+mod optimization_tests;
