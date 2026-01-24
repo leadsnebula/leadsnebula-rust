@@ -96,6 +96,13 @@ jobs:
             cargo clippy ${{ steps.changed-rust.outputs.packages }} --all-targets --all-features -- -D warnings
           fi
 
+      - name: Clean build artifacts
+        if: always()  # Clean even if previous steps failed
+        run: |
+          echo "🧹 Cleaning build artifacts to prevent accumulation..."
+          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
+          echo "✅ Build artifacts cleaned"
+
       - name: Show sccache statistics
         if: steps.changed-rust.outputs.has_rust_changes == 'true'
         run: |
@@ -327,6 +334,13 @@ jobs:
             sccache --show-stats || true
           fi
 
+      - name: Clean build artifacts
+        if: always()  # Clean even if tests failed
+        run: |
+          echo "🧹 Cleaning build artifacts to prevent accumulation..."
+          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
+          echo "✅ Build artifacts cleaned"
+
       - name: Cleanup ephemeral Neon branch
         if: always() && steps.needs-integration.outputs.needs_tests == 'true'
         run: |
@@ -510,6 +524,13 @@ jobs:
       - name: Build release
         if: steps.needs-build.outputs.needs_build == 'true'
         run: cargo build --release --locked
+
+      - name: Clean build artifacts
+        if: always() && steps.needs-build.outputs.needs_build == 'true'
+        run: |
+          echo "🧹 Cleaning build artifacts to prevent accumulation..."
+          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
+          echo "✅ Build artifacts cleaned"
 
       - name: Show sccache statistics
         if: steps.needs-build.outputs.needs_build == 'true'
@@ -703,6 +724,13 @@ jobs:
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
           CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
+
+      - name: Clean build artifacts
+        if: always()  # Clean even if coverage failed
+        run: |
+          echo "🧹 Cleaning build artifacts to prevent accumulation..."
+          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
+          echo "✅ Build artifacts cleaned"
 
       - name: Cleanup ephemeral Neon branch (coverage)
         if: always() && steps.needs-coverage.outputs.needs_coverage == 'true'
