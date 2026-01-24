@@ -1106,19 +1106,22 @@ async fn create_lead(
             if let Some(cache) = &state.cache {
                 // Use cached lookup with 300s TTL
                 match cache
-            .get_or_insert_with(
-                &prechecks_cache_key,
-                300, // 5 minutes
-                || async {
-                    sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
-                        r#"
+                    .get_or_insert_with(
+                        &prechecks_cache_key,
+                        300, // 5 minutes
+                        || async {
+                            sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+                                r#"
                         SELECT 
                             c.id AS campaign_id,
                             COALESCE(c.buyer_id, b_vertical.id) AS effective_buyer_id,
                             EXISTS(
                                 SELECT 1 FROM ping_tree_publishers ptp
                                 INNER JOIN ping_trees pt ON pt.id = ptp.ping_tree_id
-                                WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL
+                                WHERE ptp.publisher_id = $1 
+                                  AND ptp.vertical = $2
+                                  AND pt.status = 'active'
+                                  AND pt.deleted_at IS NULL
                             ) AS has_ping_tree
                         FROM (VALUES (true)) AS dummy
                         LEFT JOIN campaigns c ON (
@@ -1140,32 +1143,35 @@ async fn create_lead(
                             AND b_vertical.deleted_at IS NULL
                         LIMIT 1
                         "#,
+                            )
+                            .bind(publisher.id)
+                            .bind(vertical.slug.clone())
+                            .bind(campaign_token)
+                            .fetch_optional(&*state.db_pool)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                        },
                     )
-                    .bind(publisher.id)
-                    .bind(vertical.slug.clone())
-                    .bind(campaign_token)
-                    .fetch_optional(&*state.db_pool)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Database error: {}", e))
-                },
-            )
-            .await
-        {
-            Ok(r) => {
-                let cache_hit = prechecks_start.elapsed().as_millis() < 10; // Very fast = cache hit
-                if cache_hit {
-                    metrics.record_cache_hit();
-                } else {
-                    metrics.record_cache_miss();
-                }
-                (Ok(r), cache_hit)
-            }
-            Err(e) => {
-                tracing::warn!("Cache lookup failed for prechecks, falling back to DB: {}", e);
-                metrics.record_cache_miss();
-                // Fallback to direct DB query
-                let db_start = std::time::Instant::now();
-                let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
+                {
+                    Ok(r) => {
+                        let cache_hit = prechecks_start.elapsed().as_millis() < 10; // Very fast = cache hit
+                        if cache_hit {
+                            metrics.record_cache_hit();
+                        } else {
+                            metrics.record_cache_miss();
+                        }
+                        (Ok(r), cache_hit)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cache lookup failed for prechecks, falling back to DB: {}",
+                            e
+                        );
+                        metrics.record_cache_miss();
+                        // Fallback to direct DB query
+                        let db_start = std::time::Instant::now();
+                        let result = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>, bool)>(
                     r#"
                     SELECT 
                         c.id AS campaign_id,
@@ -1201,10 +1207,10 @@ async fn create_lead(
                 .bind(campaign_token)
                 .fetch_optional(&*state.db_pool)
                 .await;
-                metrics.record_query(db_start.elapsed().as_millis() as u64);
-                (result, false)
-            }
-        }
+                        metrics.record_query(db_start.elapsed().as_millis() as u64);
+                        (result, false)
+                    }
+                }
             } else {
                 // No cache available, use direct DB query
                 let db_start = std::time::Instant::now();
@@ -1216,7 +1222,10 @@ async fn create_lead(
                 EXISTS(
                     SELECT 1 FROM ping_trees pt
                     INNER JOIN ping_tree_publishers ptp ON pt.id = ptp.ping_tree_id
-                    WHERE ptp.publisher_id = $1 AND pt.vertical = $2 AND pt.deleted_at IS NULL
+                    WHERE ptp.publisher_id = $1 
+                      AND ptp.vertical = $2
+                      AND pt.status = 'active'
+                      AND pt.deleted_at IS NULL
                 ) AS has_ping_tree
             FROM (VALUES (true)) AS dummy
             LEFT JOIN campaigns c ON (
