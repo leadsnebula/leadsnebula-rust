@@ -135,8 +135,26 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     || std::env::var("NEON_BRANCH").is_ok()
                     || std::env::var("CI").is_ok(); // CI=1 is set in GitHub Actions
 
+                // Ensure _sqlx_migrations table exists before any migration operations
+                // This is critical - sqlx::migrate requires this table to exist
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                        version BIGINT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        success BOOLEAN NOT NULL,
+                        checksum BYTEA NOT NULL,
+                        execution_time BIGINT NOT NULL
+                    )",
+                )
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to ensure _sqlx_migrations table exists: {}", e)
+                })?;
+
                 if is_test_mode {
-                    // Drop and recreate _sqlx_migrations table to ensure clean state
+                    // In test mode, drop and recreate _sqlx_migrations table to ensure clean state
                     // This prevents checksum mismatches from copied branch state
                     sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations CASCADE")
                         .execute(&pool)
@@ -157,7 +175,10 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     .execute(&pool)
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to create _sqlx_migrations table: {}", e)
+                        anyhow::anyhow!(
+                            "Failed to recreate _sqlx_migrations table in test mode: {}",
+                            e
+                        )
                     })?;
 
                     // Clean up partially applied migrations - fix inconsistent database state
@@ -237,16 +258,19 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 }
 
                 // Check if migrations are already applied before running (optimization to avoid 45+ second delays)
+                // The _sqlx_migrations table should exist at this point (created above)
                 let migrations_check = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     sqlx::query_scalar::<_, i64>(
                         "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
                     )
-                    .fetch_optional(&pool),
+                    .fetch_one(&pool),
                 )
                 .await;
-                let migrations_already_applied =
-                    matches!(migrations_check, Ok(Ok(Some(count))) if count > 0);
+                let migrations_already_applied = match migrations_check {
+                    Ok(Ok(count)) => count > 0,
+                    _ => false, // If query fails or times out, assume migrations not applied
+                };
 
                 if !migrations_already_applied {
                     // Run migrations - simple and clean, no retries needed after reset
