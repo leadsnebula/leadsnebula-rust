@@ -48,7 +48,26 @@ pub async fn hmac_verification_middleware(
         .get("X-HMAC-Signature")
         .and_then(|h| h.to_str().ok())
     {
-        // Get request body
+        // Get HMAC secret from publisher (for now, use shared secret from env)
+        // TODO: Support per-publisher HMAC secrets
+        let hmac_secret = match std::env::var("HMAC_SECRET")
+            .or_else(|_| std::env::var("CARINA_HMAC_SECRET"))
+        {
+            Ok(secret) => secret,
+            Err(_) => {
+                // If secret is not configured, only fail if publisher requires HMAC
+                if publisher.require_hmac() {
+                    warn!("HMAC header present and publisher requires HMAC, but secret not configured");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                } else {
+                    // Publisher doesn't require HMAC, so we can skip verification
+                    warn!("HMAC header present but secret not configured (publisher doesn't require HMAC, skipping verification)");
+                    return next.run(request).await;
+                }
+            }
+        };
+
+        // Get request body (only if we have a secret to verify with)
         let (parts, body) = request.into_parts();
         let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
             Ok(bytes) => bytes,
@@ -56,17 +75,6 @@ pub async fn hmac_verification_middleware(
                 return StatusCode::BAD_REQUEST.into_response();
             }
         };
-
-        // Get HMAC secret from publisher (for now, use shared secret from env)
-        // TODO: Support per-publisher HMAC secrets
-        let hmac_secret =
-            match std::env::var("HMAC_SECRET").or_else(|_| std::env::var("CARINA_HMAC_SECRET")) {
-                Ok(secret) => secret,
-                Err(_) => {
-                    warn!("HMAC header present but secret not configured");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
 
         // Parse signature (support "sha256=<hex>" or just "<hex>")
         let provided_signature = hmac_header
