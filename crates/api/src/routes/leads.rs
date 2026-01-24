@@ -1152,7 +1152,7 @@ async fn create_lead(
                               AND c_pt.status = 'active'
                               AND c_pt.deleted_at IS NULL
                             LIMIT 1
-                        ) b_ping_tree ON c.id IS NULL OR c.buyer_id IS NULL
+                        ) b_ping_tree ON TRUE
                         LEFT JOIN buyers b_vertical ON 
                             b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
@@ -1234,7 +1234,7 @@ async fn create_lead(
                           AND c_pt.status = 'active'
                           AND c_pt.deleted_at IS NULL
                         LIMIT 1
-                    ) b_ping_tree ON c.id IS NULL OR c.buyer_id IS NULL
+                    ) b_ping_tree ON TRUE
                     LEFT JOIN buyers b_vertical ON 
                         b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
@@ -1300,7 +1300,7 @@ async fn create_lead(
                   AND c_pt.status = 'active'
                   AND c_pt.deleted_at IS NULL
                 LIMIT 1
-            ) b_ping_tree ON c.id IS NULL OR c.buyer_id IS NULL
+            ) b_ping_tree ON TRUE
             LEFT JOIN buyers b_vertical ON 
                 b_vertical.vertical_id = (
                                 SELECT v2.id FROM verticals v2 
