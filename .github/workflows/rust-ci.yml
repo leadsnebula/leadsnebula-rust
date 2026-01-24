@@ -1,0 +1,685 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for change detection
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Detect changed Rust files
+        id: changed-rust
+        run: |
+          # Get list of changed files
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || echo "")
+          else
+            # For push events, compare with previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
+          fi
+          
+          # Filter for Rust files (.rs, Cargo.toml, etc.)
+          RUST_FILES=$(echo "$CHANGED_FILES" | grep -E '\.(rs|toml)$|^Cargo\.toml$|^Cargo\.lock$' || echo "")
+          
+          if [ -z "$RUST_FILES" ]; then
+            echo "has_rust_changes=false" >> $GITHUB_OUTPUT
+            echo "No Rust files changed - skipping lint/format"
+          else
+            echo "has_rust_changes=true" >> $GITHUB_OUTPUT
+            # Extract unique crate directory names from changed files
+            CHANGED_CRATES=$(echo "$RUST_FILES" | grep -o '^crates/[^/]*' | sort -u | tr '\n' ' ' | xargs || echo "")
+            
+            if [ -z "$CHANGED_CRATES" ]; then
+              # Changes in root (Cargo.toml, etc.) - run all
+              echo "packages=" >> $GITHUB_OUTPUT
+              echo "run_all=true" >> $GITHUB_OUTPUT
+            else
+              # Map directory names to actual package names
+              declare -A PKG_MAP=(
+                ["core"]="leadsnebula_core"
+                ["api"]="leadsnebula-api"
+                ["utils"]="leadsnebula-utils"
+              )
+              
+              PACKAGES=""
+              for dir in $CHANGED_CRATES; do
+                pkg_dir="${dir#crates/}"
+                pkg_name="${PKG_MAP[$pkg_dir]:-$pkg_dir}"
+                PACKAGES="$PACKAGES -p $pkg_name"
+              done
+              
+              echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+              echo "run_all=false" >> $GITHUB_OUTPUT
+            fi
+            echo "Changed Rust files detected"
+          fi
+
+      - name: Check formatting
+        if: steps.changed-rust.outputs.has_rust_changes == 'true'
+        run: |
+          if [ "${{ steps.changed-rust.outputs.run_all }}" == "true" ] || [ -z "${{ steps.changed-rust.outputs.packages }}" ]; then
+            cargo fmt --all --check
+          else
+            cargo fmt ${{ steps.changed-rust.outputs.packages }} --check
+          fi
+
+      - name: Run clippy
+        if: steps.changed-rust.outputs.has_rust_changes == 'true'
+        run: |
+          if [ "${{ steps.changed-rust.outputs.run_all }}" == "true" ] || [ -z "${{ steps.changed-rust.outputs.packages }}" ]; then
+            cargo clippy --workspace --all-targets --all-features -- -D warnings
+          else
+            cargo clippy ${{ steps.changed-rust.outputs.packages }} --all-targets --all-features -- -D warnings
+          fi
+
+      - name: Show sccache statistics
+        if: steps.changed-rust.outputs.has_rust_changes == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Lint Job) ==="
+            sccache --show-stats || true
+          fi
+
+  test-integration:
+    name: Integration Tests (ephemeral Neon branch)
+    runs-on: ubuntu-latest
+    needs: test-unit
+
+    # Note: we use Neon branches as ephemeral Postgres instances for CI runs.
+    # The previous Postgres service container is intentionally omitted.
+
+    env:
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for change detection
+
+      - name: Detect if integration tests needed
+        id: needs-integration
+        run: |
+          # Get list of changed files
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || echo "")
+          else
+            # For push events, compare with previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
+          fi
+          
+          # Integration tests are in crates/api/tests/ and test API/core functionality
+          # Run if API or core crates changed, or if integration test files themselves changed
+          NEEDS_TESTS=false
+          if echo "$CHANGED_FILES" | grep -qE '^crates/(api|core)/'; then
+            NEEDS_TESTS=true
+          elif echo "$CHANGED_FILES" | grep -qE '^crates/api/tests/'; then
+            NEEDS_TESTS=true
+          elif echo "$CHANGED_FILES" | grep -qE 'migrations/'; then
+            # Schema changes require integration tests
+            NEEDS_TESTS=true
+          fi
+          
+          if [ "$NEEDS_TESTS" == "true" ]; then
+            echo "needs_tests=true" >> $GITHUB_OUTPUT
+            echo "✅ Integration tests needed (API/core/migrations changed)"
+          else
+            echo "needs_tests=false" >> $GITHUB_OUTPUT
+            echo "⏭️  Skipping integration tests (no relevant changes)"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Cache cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-nextest-${{ runner.os }}-
+
+      - name: Install cargo-nextest
+        run: |
+          if [ -f ~/.cargo/bin/cargo-nextest ]; then
+            echo "✅ Using cached cargo-nextest"
+          elif ! command -v cargo-nextest &> /dev/null; then
+            cargo install cargo-nextest --locked
+          fi
+
+      - name: Cache npm (for neonctl)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-neonctl
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      - name: Install Neon CLI (neonctl)
+        run: |
+          # Use npx to run neonctl (no global install needed)
+          # The correct package is 'neonctl', not '@neondatabase/api-client'
+          echo "Setting up Neon CLI via npx..."
+          echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
+          # Verify it works (npm cache will speed this up)
+          npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
+          echo "✅ neonctl ready via npx"
+
+      - name: Verify neonctl installed
+        run: |
+          echo "NEONCTL_CMD is: $NEONCTL_CMD"
+          $NEONCTL_CMD --version || (echo "neonctl verification failed" && exit 1)
+
+      - name: Authenticate Neon CLI
+        run: |
+          if [ -z "$NEON_API_KEY" ]; then
+            echo "NEON_API_KEY secret is missing" && exit 1
+          fi
+          if [ -z "$NEON_PROJECT_ID" ]; then
+            echo "NEON_PROJECT_ID secret is missing" && exit 1
+          fi
+          # neonctl uses NEON_API_KEY environment variable for non-interactive auth
+          # Also set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
+          echo "NEON_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
+          # Try to verify authentication (works with personal keys, may fail with restricted org keys)
+          # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" --output json > /dev/null 2>&1; then
+            echo "✅ Authenticated with Neon (verified via branches list)"
+          else
+            echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
+            echo "✅ Proceeding - authentication will be verified by actual branch operations"
+          fi
+
+      - name: Create ephemeral Neon branch
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        id: neon_create
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          BRANCH_NAME=ci-${GITHUB_RUN_ID}
+          echo "Creating Neon branch: $BRANCH_NAME"
+          echo "Executing: $NEONCTL_CMD branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID --api-key ***"
+          if ! $NEONCTL_CMD branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"; then
+            echo "Failed to create Neon branch $BRANCH_NAME" >&2
+            exit 1
+          fi
+          echo "Branch created: $BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Wait for Neon branch ready
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          BRANCH_NAME=ci-${{ github.run_id }}
+          echo "Branch $BRANCH_NAME created - endpoints are typically ready immediately"
+          # neonctl branches create returns when branch is created and ready to use
+          # No explicit wait needed - connection-string will work immediately
+
+      - name: Export DATABASE_URL from Neon branch
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          BRANCH_NAME=ci-${{ github.run_id }}
+          echo "Using ephemeral Neon branch: $BRANCH_NAME"
+          CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
+
+      - name: Run integration tests (light DB only; heavy/concurrency run locally)
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        env:
+          CI: "true"
+        run: |
+          echo "DATABASE_URL is set (ephemeral Neon branch)"
+          # Use cargo-nextest for parallel execution (faster than sequential cargo test)
+          # Health tests - quick, can run in parallel
+          cargo nextest run --test integration_health --locked --all-features --test-threads=2 || \
+            cargo test --test integration_health --locked --all-features -- --test-threads=2
+          
+          # Auth tests - some may need sequential execution due to DB state
+          # Use 2 threads to balance speed and isolation
+          cargo nextest run --test integration_auth --locked --all-features --test-threads=2 || \
+            cargo test --test integration_auth --locked --all-features -- --test-threads=2
+          
+          # Publisher CRUD tests
+          cargo nextest run --test integration_publisher_crud --locked --all-features --test-threads=2 || \
+            cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=2
+          
+          # E2E tests - run with --run-ignored flag to include tests marked with #[ignore]
+          cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=2 --run-ignored only || \
+            cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=2 --ignored
+          
+          # NOTE: Some heavy lib tests (duplicate_post, ping_tree_*_db, async_persistence) are
+          # still skipped in CI to keep runtime reasonable; run locally via ./autotests.sh for full coverage.
+
+      - name: Show sccache statistics
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Integration Tests) ==="
+            sccache --show-stats || true
+          fi
+
+      - name: Cleanup ephemeral Neon branch
+        if: always() && steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          BRANCH_NAME=ci-${{ github.run_id }}
+          echo "Cleaning up Neon branch: $BRANCH_NAME"
+          $NEONCTL_CMD branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" || true
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for change detection
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Build validate-config binary
+        run: cargo build --release --bin validate-config
+
+      - name: Cache cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-nextest-${{ runner.os }}-
+
+      - name: Install cargo-nextest
+        run: |
+          if [ -f ~/.cargo/bin/cargo-nextest ]; then
+            echo "Using cached cargo-nextest"
+          elif ! command -v cargo-nextest &> /dev/null; then
+            cargo install cargo-nextest --locked
+          fi
+
+      - name: Detect changed crates
+        id: changed-crates
+        run: |
+          # Get list of changed files
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || echo "")
+          else
+            # For push events, compare with previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
+          fi
+          
+          # Extract unique crate directory names from changed files
+          CHANGED_CRATES=$(echo "$CHANGED_FILES" | grep -o '^crates/[^/]*' | sort -u | tr '\n' ' ' | xargs || echo "")
+          
+          if [ -z "$CHANGED_CRATES" ]; then
+            # No crate-specific changes, run all tests
+            echo "packages=" >> $GITHUB_OUTPUT
+            echo "run_all=true" >> $GITHUB_OUTPUT
+            echo "Changed crates: none (running all tests)"
+          else
+            # Map directory names to actual package names
+            declare -A PKG_MAP=(
+              ["core"]="leadsnebula_core"
+              ["api"]="leadsnebula-api"
+              ["utils"]="leadsnebula-utils"
+            )
+            
+            # Build package filter arguments, filtering out binary-only packages for --lib tests
+            # leadsnebula-api and leadsnebula-utils are binary-only (no lib.rs), so skip them for --lib tests
+            PACKAGES=""
+            LIB_PACKAGES=""
+            for dir in $CHANGED_CRATES; do
+              pkg_dir="${dir#crates/}"  # Remove "crates/" prefix
+              pkg_name="${PKG_MAP[$pkg_dir]:-$pkg_dir}"  # Map or fallback to directory name
+              PACKAGES="$PACKAGES -p $pkg_name"
+              # Skip binary-only packages for --lib tests
+              if [ "$pkg_name" != "leadsnebula-api" ] && [ "$pkg_name" != "leadsnebula-utils" ]; then
+                LIB_PACKAGES="$LIB_PACKAGES -p $pkg_name"
+              fi
+            done
+            
+            echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+            echo "lib_packages=$LIB_PACKAGES" >> $GITHUB_OUTPUT
+            echo "run_all=false" >> $GITHUB_OUTPUT
+            echo "Changed crates: $CHANGED_CRATES"
+            echo "Package filter: $PACKAGES"
+            echo "Library package filter: $LIB_PACKAGES"
+          fi
+
+      - name: Run unit tests with nextest
+        run: |
+          # Run unit tests (lib tests) in parallel with nextest
+          # Use all available CPU cores for maximum parallelization
+          if [ "${{ steps.changed-crates.outputs.run_all }}" == "true" ] || [ -z "${{ steps.changed-crates.outputs.packages }}" ]; then
+            echo "Running all unit tests (no crate-specific changes detected)"
+            cargo nextest run --lib --locked --all-features \
+              --retries 2
+          else
+            # Use lib_packages which excludes binary-only crates
+            LIB_PACKAGES="${{ steps.changed-crates.outputs.lib_packages }}"
+            if [ -n "$LIB_PACKAGES" ]; then
+              echo "Running tests for changed library crates: $LIB_PACKAGES"
+              cargo nextest run --lib $LIB_PACKAGES --locked --all-features \
+                --retries 2 || \
+              # Fallback: if filtered tests fail, run all tests to ensure nothing broke
+              (echo "⚠️ Filtered tests had issues, running full test suite..." && \
+               cargo nextest run --lib --locked --all-features --retries 2)
+            else
+              # Binary-only crates changed - still run all lib tests to catch regressions
+              # Binary crates may depend on library crates that need testing
+              echo "Binary-only crates changed - running all library tests to catch regressions"
+              cargo nextest run --lib --locked --all-features --retries 2
+            fi
+          fi
+
+      - name: Show sccache statistics
+        if: steps.changed-crates.outputs.has_rust_changes == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Unit Tests) ==="
+            sccache --show-stats || true
+          fi
+
+  build:
+    name: Build Release
+    runs-on: ubuntu-latest
+    needs: [lint, test-unit, test-integration]
+    # Only build release if we're on a branch that will deploy
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for change detection
+
+      - name: Detect if build needed
+        id: needs-build
+        run: |
+          # Get list of changed files
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || echo "")
+          else
+            # For push events, compare with previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
+          fi
+          
+          # Build if any Rust code changed
+          NEEDS_BUILD=false
+          if echo "$CHANGED_FILES" | grep -qE '\.(rs|toml)$|^Cargo\.toml$|^Cargo\.lock$'; then
+            NEEDS_BUILD=true
+          fi
+          
+          if [ "$NEEDS_BUILD" == "true" ]; then
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "✅ Build needed (Rust code changed)"
+          else
+            echo "needs_build=false" >> $GITHUB_OUTPUT
+            echo "⏭️  Skipping build (no Rust code changes)"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.needs-build.outputs.needs_build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        if: steps.needs-build.outputs.needs_build == 'true'
+        uses: ./.github/actions/setup-sccache
+
+      - name: Cache Rust dependencies
+        if: steps.needs-build.outputs.needs_build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Build release
+        if: steps.needs-build.outputs.needs_build == 'true'
+        run: cargo build --release --locked
+
+      - name: Show sccache statistics
+        if: steps.needs-build.outputs.needs_build == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics ==="
+            sccache --show-stats || true
+          fi
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: [lint, test-unit, test-integration]
+    continue-on-error: true
+
+    env:
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for change detection
+
+      - name: Detect if coverage needed
+        id: needs-coverage
+        run: |
+          # Get list of changed files
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD || echo "")
+          else
+            # For push events, compare with previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD || echo "")
+          fi
+          
+          # Run coverage if any Rust code changed
+          NEEDS_COVERAGE=false
+          if echo "$CHANGED_FILES" | grep -qE '\.(rs|toml)$|^Cargo\.toml$|^Cargo\.lock$'; then
+            NEEDS_COVERAGE=true
+          fi
+          
+          if [ "$NEEDS_COVERAGE" == "true" ]; then
+            echo "needs_coverage=true" >> $GITHUB_OUTPUT
+            echo "✅ Coverage needed (Rust code changed)"
+          else
+            echo "needs_coverage=false" >> $GITHUB_OUTPUT
+            echo "⏭️  Skipping coverage (no Rust code changes)"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Setup sccache
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        uses: ./.github/actions/setup-sccache
+
+      - name: Cache Rust dependencies
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Cache npm (for neonctl)
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-neonctl
+          restore-keys: |
+            npm-${{ runner.os }}-
+
+      - name: Install Neon CLI (neonctl)
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          # Use npx to run neonctl (no global install needed)
+          # The correct package is 'neonctl', not '@neondatabase/api-client'
+          echo "Setting up Neon CLI via npx..."
+          echo "NEONCTL_CMD=npx --yes neonctl" >> $GITHUB_ENV
+          # Verify it works (npm cache will speed this up)
+          npx --yes neonctl --version || (echo "❌ Failed to verify neonctl" && exit 1)
+          echo "✅ neonctl ready via npx"
+
+      - name: Verify neonctl installed
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          echo "NEONCTL_CMD is: $NEONCTL_CMD"
+          $NEONCTL_CMD --version || (echo "neonctl verification failed" && exit 1)
+
+      - name: Authenticate Neon CLI
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          if [ -z "$NEON_API_KEY" ]; then
+            echo "NEON_API_KEY secret is missing" && exit 1
+          fi
+          if [ -z "$NEON_PROJECT_ID" ]; then
+            echo "NEON_PROJECT_ID secret is missing" && exit 1
+          fi
+          # neonctl uses NEON_API_KEY environment variable for non-interactive auth
+          # Also set via $GITHUB_ENV for subsequent steps (though job-level env should handle it)
+          echo "NEON_API_KEY=$NEON_API_KEY" >> $GITHUB_ENV
+          # Try to verify authentication (works with personal keys, may fail with restricted org keys)
+          # If verification fails due to key restrictions, we'll proceed anyway - actual operations will verify auth
+          if $NEONCTL_CMD branches list --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" --output json > /dev/null 2>&1; then
+            echo "✅ Authenticated with Neon (verified via branches list)"
+          else
+            echo "⚠️  Could not verify via branches list (key may be restricted, but create/delete should still work)"
+            echo "✅ Proceeding - authentication will be verified by actual branch operations"
+          fi
+
+      - name: Install cargo-llvm-cov
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          if ! command -v cargo-llvm-cov &> /dev/null; then
+            cargo install cargo-llvm-cov --locked
+          else
+            echo "cargo-llvm-cov already installed"
+          fi
+          cargo llvm-cov --version
+
+      - name: Generate coverage report
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        env:
+          RUST_TEST_THREADS: 1
+        run: |
+          # Clean old coverage artifacts (optional but recommended)
+          cargo llvm-cov clean --workspace || true
+          
+          # Generate coverage report - continue even if tests fail
+          # Use --no-fail-fast to run all tests, and || true to continue even on failure
+          cargo llvm-cov --locked --all-features \
+            --lcov --output-path lcov.info \
+            --workspace \
+            --no-fail-fast || true
+          
+          # Verify lcov.info was generated
+          if [ ! -f lcov.info ]; then
+            echo "❌ Error: lcov.info was not generated"
+            echo "   This usually means all tests failed or coverage instrumentation failed"
+            exit 1
+          fi
+          
+          # Show coverage summary
+          echo "📊 Coverage report generated successfully"
+          echo "File size: $(du -h lcov.info | cut -f1)"
+
+      - name: Show sccache statistics
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          if command -v sccache &> /dev/null; then
+            echo "=== sccache Statistics (Coverage) ==="
+            sccache --show-stats || true
+          fi
+
+      - name: Upload coverage to artifacts
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+      - name: Create ephemeral Neon branch for coverage
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          BRANCH_NAME=ci-${GITHUB_RUN_ID}-coverage
+          echo "Creating Neon branch: $BRANCH_NAME"
+          echo "Executing: $NEONCTL_CMD branches create --name $BRANCH_NAME --project $NEON_PROJECT_ID --api-key ***"
+          if ! $NEONCTL_CMD branches create --name "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY"; then
+            echo "Failed to create Neon branch $BRANCH_NAME" >&2
+            exit 1
+          fi
+          echo "Branch created: $BRANCH_NAME"
+
+      - name: Wait for Neon branch ready
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          BRANCH_NAME=ci-${{ github.run_id }}-coverage
+          echo "Branch $BRANCH_NAME created - endpoints are typically ready immediately"
+          # neonctl branches create returns when branch is created and ready to use
+          # No explicit wait needed - connection-string will work immediately
+
+      - name: Export DATABASE_URL from Neon branch
+        if: steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          BRANCH_NAME=ci-${{ github.run_id }}-coverage
+          echo "Using ephemeral Neon branch: $BRANCH_NAME"
+          CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
+
+      - name: Cleanup ephemeral Neon branch (coverage)
+        if: always() && steps.needs-coverage.outputs.needs_coverage == 'true'
+        run: |
+          BRANCH_NAME=ci-${{ github.run_id }}-coverage
+          echo "Cleaning up Neon branch: $BRANCH_NAME"
+          $NEONCTL_CMD branches delete "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY" || true
+
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    if: false  # disabled; run locally: cargo bench --bench ping_auction_bench
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo bench --bench ping_auction_bench --locked --all-features
