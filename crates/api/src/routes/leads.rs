@@ -96,7 +96,6 @@ async fn handle_lead_submission(
     PublisherExtractor(publisher): PublisherExtractor,
     Json(payload): Json<LeadRequest>,
 ) -> Result<Json<LeadResponse>, StatusCode> {
-
     // For now, return a "not implemented" response
     // TODO: Implement full lead processing logic similar to Ruby LeadsProcessing::Ingester
     tracing::warn!(
@@ -115,7 +114,9 @@ async fn handle_lead_submission(
         promise_id: None,
         price: None,
         bid: None,
-        message: Some("Lead submission endpoint is not yet fully implemented in Rust API".to_string()),
+        message: Some(
+            "Lead submission endpoint is not yet fully implemented in Rust API".to_string(),
+        ),
         error: Some("NotImplemented".to_string()),
         reason: Some("This endpoint is being migrated from Ruby to Rust".to_string()),
     }))
