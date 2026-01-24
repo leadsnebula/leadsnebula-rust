@@ -197,10 +197,66 @@ async fn run_migrations(pool: &PgPool, migrations_dir: &Path, _test_mode: bool) 
     run_migrations_inner(pool, migrator).await
 }
 
+/// Check for pending migrations
+async fn check_pending_migrations(
+    pool: &PgPool,
+    migrator: &Migrator,
+) -> Result<Vec<(i64, String)>> {
+    use std::collections::HashSet;
+
+    // Get applied migrations from database
+    let applied_versions: HashSet<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = true")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+
+    // Get all migrations from migrator
+    let mut pending = Vec::new();
+    for migration in migrator.iter() {
+        let version = migration.version;
+        let name = migration.description.to_string();
+        if !applied_versions.contains(&version) {
+            pending.push((version, name));
+        }
+    }
+
+    Ok(pending)
+}
+
 async fn run_migrations_inner(pool: &PgPool, migrator: Migrator) -> Result<()> {
+    // Check for pending migrations before running
+    let pending = check_pending_migrations(pool, &migrator).await?;
+
+    if pending.is_empty() {
+        info!("✅ No pending migrations - database is up to date");
+        return Ok(());
+    }
+
+    info!(
+        "⚠️  Found {} pending migration(s), applying now...",
+        pending.len()
+    );
+    for (version, name) in &pending {
+        info!("   - {} (version: {})", name, version);
+    }
+
     // Run migrations - SQLx will automatically skip already-applied ones
     match migrator.run(pool).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // Verify all pending migrations were applied
+            let still_pending = check_pending_migrations(pool, &migrator).await?;
+            if !still_pending.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Migration run completed but {} migration(s) are still pending: {:?}",
+                    still_pending.len(),
+                    still_pending
+                ));
+            }
+            info!("✅ All {} migration(s) applied successfully", pending.len());
+            Ok(())
+        }
         Err(e) => {
             let error_msg = e.to_string();
             if error_msg.contains("was previously applied but is missing") {

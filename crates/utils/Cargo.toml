@@ -14,6 +14,10 @@ name = "run-migrations"
 path = "src/bin/run-migrations.rs"
 
 [[bin]]
+name = "check-migrations"
+path = "src/bin/check-migrations.rs"
+
+[[bin]]
 name = "update-password"
 path = "src/bin/update-password.rs"
 
