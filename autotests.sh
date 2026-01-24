@@ -124,6 +124,30 @@ if [ "$USE_NEON" = true ]; then
     export EPHEMERAL_DB=1
     echo "✅ DATABASE_URL and EPHEMERAL_DB set (ephemeral branch; no litter in main)"
     
+    # Wait a moment for DNS to propagate and database to be fully ready
+    echo "Waiting for database to be ready..."
+    sleep 3
+    
+    # Verify connection works before proceeding
+    if command -v psql > /dev/null 2>&1; then
+        MAX_RETRIES=5
+        RETRY_COUNT=0
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if timeout 10 psql "$CONNECTION" -c "SELECT 1;" > /dev/null 2>&1; then
+                echo "✅ Database connection verified"
+                break
+            else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                    echo "   Waiting for database to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+                    sleep 2
+                else
+                    echo "⚠️  Could not verify database connection, but continuing anyway (tests will retry)"
+                fi
+            fi
+        done
+    fi
+    
     # Run migrations on the ephemeral branch
     echo "Running database migrations..."
     # Set TEST_MODE for ephemeral test databases to enable automatic cleanup of inconsistent migrations

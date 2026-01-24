@@ -3,17 +3,20 @@
 # Run this before every commit to ensure CI will pass
 #
 # Usage:
-#   ./validate.sh          # Full validation (all tests) - USE BEFORE COMMITTING
-#   ./validate.sh --fast    # Fast validation (unit tests only) - DEVELOPMENT ONLY
+#   ./validate.sh          # Validation checks (formatting, linting, unit tests, configs)
 #
 # Environment variables (for WSL stability):
 #   SKIP_CLEANUP=true      # Skip incremental artifact cleanup (if it causes issues)
 #   SKIP_RELEASE_BUILD=true # Skip resource-intensive release build (recommended in WSL)
 #
-# ⚠️  IMPORTANT: Fast mode skips database integration tests!
-#    - Use './validate.sh' (without --fast) before committing
-#    - CI will run full tests, but fast commits waste CI resources
-#    - Fast mode is intended for rapid development iteration only
+# This script focuses on CI-style validation checks:
+#   - Code formatting and linting
+#   - Unit tests (no database required)
+#   - Config validation (Cargo.toml, Dockerfile, workflows, Fly.io)
+#   - Build verification
+#
+# For full test suite including database integration tests:
+#   ./autotests.sh          # Creates ephemeral DB and runs all tests
 #
 # 💡 WSL Users: If WSL crashes during validation, try:
 #    SKIP_RELEASE_BUILD=true SKIP_CLEANUP=true ./validate.sh
@@ -21,12 +24,9 @@
 set -e
 
 # Parse flags
-FAST_MODE=false
 STRICT_MODE=${CI:-false}  # Auto-enable in CI, default off locally
 for arg in "$@"; do
-    if [ "$arg" = "--fast" ]; then
-        FAST_MODE=true
-    elif [ "$arg" = "--strict" ]; then
+    if [ "$arg" = "--strict" ]; then
         STRICT_MODE=true
     fi
 done
@@ -83,51 +83,11 @@ if [ ! -f "$VALIDATE_CONFIG_BIN" ]; then
     USE_FALLBACK=true
 fi
 
-# Safety warnings for fast mode
-if [ "$FAST_MODE" = true ]; then
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "⚠️  WARNING: Fast mode skips database integration tests!"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "   Fast mode will skip:"
-    echo "   • OTP setup/enable/disable tests"
-    echo "   • Passkey credential storage tests"
-    echo "   • User password verification tests"
-    echo "   • User status management tests"
-    echo "   • Publisher CRUD operations"
-    echo ""
-    echo "   ⚠️  Use './validate.sh' (without --fast) before committing!"
-    echo "   CI will run full tests, but fast commits waste CI resources."
-    echo ""
-    
-    # Check if we're in a git repository and warn
-    if git rev-parse --git-dir > /dev/null 2>&1; then
-        # Check if there are uncommitted changes
-        if ! git diff-index --quiet HEAD -- 2>/dev/null; then
-            echo "   ⚠️  You have uncommitted changes in a git repository."
-            echo "   Consider running full validation before committing."
-            echo ""
-            # Only prompt interactively if stdin is a TTY (not in CI/scripts)
-            if [ -t 0 ]; then
-                read -p "   Continue with fast mode anyway? (y/N) " -n 1 -r
-                echo ""
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    echo "   Aborted. Run './validate.sh' for full validation."
-                    exit 1
-                fi
-            else
-                echo "   (Non-interactive mode: continuing with fast mode)"
-                echo ""
-            fi
-        fi
-    fi
-    
-    echo "🚀 Running fast validation (unit tests only, skipping slow database tests)..."
-    echo ""
-else
-    echo "🔍 Running pre-commit validation checks..."
-    echo ""
-fi
+echo "🔍 Running pre-commit validation checks..."
+echo ""
+echo "   This script validates code quality and runs unit tests (no database required)."
+echo "   For full test suite including database integration tests, run: ./autotests.sh"
+echo ""
 
 ERRORS=0
 
@@ -244,408 +204,46 @@ if [ -f ".config/nextest.toml" ]; then
     echo ""
 fi
 
-# 4. Test check (use nextest if available, otherwise cargo test)
-echo "4️⃣  Running tests (with --locked)..."
-# Check if DATABASE_URL is set for database-dependent tests
-HAS_DATABASE_URL=false
-DATABASE_URL_IS_SET=false
-IS_EPHEMERAL_DB=false
-if [ "$FAST_MODE" = false ]; then
-    # Only check for DATABASE_URL if not in fast mode
-    if [ -n "$DATABASE_URL" ]; then
-        DATABASE_URL_IS_SET=true
-        HAS_DATABASE_URL=true
-    elif [ -f ".env.local" ] && grep -q "^DATABASE_URL=" .env.local 2>/dev/null; then
-        # Try to load DATABASE_URL from .env.local
-        export $(grep "^DATABASE_URL=" .env.local | xargs)
-        if [ -n "$DATABASE_URL" ]; then
-            DATABASE_URL_IS_SET=true
-            HAS_DATABASE_URL=true
-        fi
-    fi
-    
-    # Check if we're using an ephemeral DB (required for tests)
-    if [ "$HAS_DATABASE_URL" = true ]; then
-        if [ -n "${EPHEMERAL_DB:-}" ] && [ "$EPHEMERAL_DB" = "1" ]; then
-            IS_EPHEMERAL_DB=true
-        elif echo "$DATABASE_URL" | grep -qE "(ci-|ci-local-)"; then
-            IS_EPHEMERAL_DB=true
-        elif [ -n "${CI:-}" ] && [ "$CI" = "true" ]; then
-            IS_EPHEMERAL_DB=true
-        fi
-        
-        if [ "$IS_EPHEMERAL_DB" = false ]; then
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⚠️  WARNING: DATABASE_URL appears to be main DB (not ephemeral)"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo ""
-            echo "   Tests cannot run against main database to prevent test data pollution."
-            echo "   Database-dependent tests will be SKIPPED."
-            echo ""
-            echo "   To run full test suite with database tests:"
-            echo "   ./autotests.sh"
-            echo ""
-            echo "   Or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL"
-            echo ""
-            HAS_DATABASE_URL=false  # Disable DB tests
-        fi
-    fi
-fi
-
-# Clean up leftover test databases before running tests
-# This prevents "database is being accessed by other users" errors from sqlx::test
-# Skip cleanup in fast mode (no database tests)
-# NOTE: Added timeouts to prevent WSL crashes from hanging psql commands
-if [ "$FAST_MODE" = false ] && [ "$HAS_DATABASE_URL" = true ] && command -v psql > /dev/null 2>&1; then
-    # Extract base database URL (replace database name with 'postgres')
-    CLEANUP_DB_URL=$(echo "$DATABASE_URL" | sed 's|/[^/]*$|/postgres|')
-    if [ -n "$CLEANUP_DB_URL" ]; then
-        # Quick connectivity test with timeout (5 seconds max) before attempting cleanup
-        # This prevents WSL crashes from hanging psql connections
-        if timeout 5 psql "$CLEANUP_DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
-            echo "   Cleaning up leftover test databases..."
-            # Terminate connections to test databases (with 10 second timeout)
-            timeout 10 psql "$CLEANUP_DB_URL" -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname LIKE '_sqlx_test_%' AND pid <> pg_backend_pid();" > /dev/null 2>&1 || true
-            sleep 1
-            # Drop test databases (with 15 second timeout for the entire operation)
-            # Use a temporary file to avoid pipe hanging issues in WSL
-            DROP_SQL=$(timeout 10 psql "$CLEANUP_DB_URL" -t -c "SELECT 'DROP DATABASE IF EXISTS ' || quote_ident(datname) || ';' FROM pg_database WHERE datname LIKE '_sqlx_test_%';" 2>/dev/null | grep -v "^$" || true)
-            if [ -n "$DROP_SQL" ]; then
-                echo "$DROP_SQL" | timeout 15 psql "$CLEANUP_DB_URL" > /dev/null 2>&1 || true
-            fi
-        else
-            echo "   ⚠️  Skipping database cleanup (connection test failed or timed out)"
-        fi
-    fi
-fi
+# 4. Unit tests only (no database required)
+echo "4️⃣  Running unit tests (with --locked)..."
+echo "   Note: This script runs unit tests only. For full test suite including database"
+echo "   integration tests, run: ./autotests.sh"
+echo ""
 
 if command -v cargo-nextest > /dev/null 2>&1; then
     echo "   Using cargo-nextest for faster parallel test execution..."
-    if [ "$FAST_MODE" = true ]; then
-        # Fast mode: only run unit tests (no database required)
-        echo "   Fast mode: Running unit tests only (skipping database integration tests)..."
-        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-        if ! timeout 600 cargo nextest run --lib --locked --all-features; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Unit tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
+    # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+    if ! timeout 600 cargo nextest run --lib --locked --all-features; then
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+            echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+            ERRORS=$((ERRORS + 1))
         else
-            echo "✅ Unit tests OK (nextest, fast mode)"
+            echo "❌ Unit tests failed. Fix all failing tests before committing."
+            ERRORS=$((ERRORS + 1))
         fi
-    elif [ "$HAS_DATABASE_URL" = true ]; then
-        echo "   DATABASE_URL is set - running all tests including database-dependent ones..."
-        
-        # Run unit tests first with nextest (fast, parallel) for quick feedback
-        echo "   Running unit tests in parallel (nextest)..."
-        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-        if ! timeout 600 cargo nextest run --lib --locked --all-features; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Unit tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
-        else
-            echo "✅ Unit tests OK (nextest)"
-        fi
-        
-        # Run non-database integration tests in parallel with nextest
-        echo "   Running non-database integration tests in parallel (nextest)..."
-        # Add timeout to prevent WSL crashes (15 minutes for integration tests)
-        if ! timeout 900 cargo nextest run --locked --all-features --test integration_health --test integration_routes; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Integration tests timed out (15 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Integration tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
-        else
-            echo "✅ Non-database integration tests OK (nextest)"
-        fi
-        
-        # Run database-dependent tests sequentially to avoid conflicts
-        # sqlx::test creates/drops test databases which can conflict when run in parallel
-        # Note: If tests fail with "database is being accessed by other users", wait a few seconds
-        # and retry - this is a known sqlx::test limitation with leftover test databases
-        echo "   Running database-dependent tests sequentially..."
-        MAX_RETRIES=2
-        RETRY_COUNT=0
-        TEST_PASSED=false
-        
-        while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$TEST_PASSED" = false ]; do
-            if [ $RETRY_COUNT -gt 0 ]; then
-                echo "   Waiting 5 seconds before retry (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
-                sleep 5
-            fi
-            
-            # Run integration_auth test
-            # Add timeout to prevent WSL crashes (15 minutes for integration tests)
-            TEST_OUTPUT=$(timeout 900 cargo test --test integration_auth --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/test_output.log)
-            TEST_EXIT_CODE=${PIPESTATUS[0]}
-            
-            # Check if tests timed out
-            if [ $TEST_EXIT_CODE -eq 124 ]; then
-                echo "❌ Integration tests timed out (15 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                TEST_PASSED=false
-            # Check if tests were skipped due to missing DATABASE_URL
-            elif grep -q "⚠️.*DATABASE_URL not set.*skipping" /tmp/test_output.log; then
-                echo "   ⚠️  Database integration tests skipped (DATABASE_URL not set)"
-                echo "   This is expected in coverage runs or when DATABASE_URL is not configured"
-                TEST_PASSED=true  # Mark as passed since tests gracefully skipped
-            elif [ $TEST_EXIT_CODE -eq 0 ]; then
-                # Run integration_publisher_crud test if it exists
-                if [ -f "crates/api/tests/integration_publisher_crud.rs" ] || [ -f "tests/integration_publisher_crud.rs" ]; then
-                    echo "   Running integration_publisher_crud tests..."
-                    # Add timeout to prevent WSL crashes (15 minutes for integration tests)
-                    PUB_CRUD_OUTPUT=$(timeout 900 cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee -a /tmp/test_output.log)
-                    TEST_EXIT_CODE=${PIPESTATUS[0]}
-                    
-                    # Check if publisher tests were skipped
-                    if grep -q "⚠️.*DATABASE_URL not set.*skipping" /tmp/test_output.log; then
-                        echo "   ⚠️  Publisher CRUD tests skipped (DATABASE_URL not set)"
-                        TEST_EXIT_CODE=0  # Treat skipped as success
-                    fi
-                fi
-                
-                if [ $TEST_EXIT_CODE -eq 0 ]; then
-                    TEST_PASSED=true
-                    echo "✅ Database integration tests OK"
-                else
-                    # Check if failure is due to database access conflicts
-                    if grep -q "database.*is being accessed by other users\|55006" /tmp/test_output.log; then
-                        RETRY_COUNT=$((RETRY_COUNT + 1))
-                        if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                            echo "   ⚠️  Test databases locked by previous runs, retrying..."
-                            continue
-                        else
-                            echo "   ⚠️  Database tests failed due to leftover test databases."
-                            echo "   This is a known sqlx::test limitation in local development."
-                            echo "   CI/production will not be affected (fresh databases each run)."
-                            echo "   To fix locally: wait a few minutes or restart PostgreSQL."
-                            echo "⚠️  Database integration tests skipped (non-blocking for CI/deployment)."
-                            # Don't count this as an error since it's a local dev issue
-                            TEST_PASSED=true  # Mark as passed to continue validation
-                        fi
-                    else
-                        echo "❌ Database integration tests failed. Fix all failing tests before committing."
-                        ERRORS=$((ERRORS + 1))
-                        break
-                    fi
-                fi
-            else
-                # Check if failure is due to database access conflicts
-                if grep -q "database.*is being accessed by other users\|55006" /tmp/test_output.log; then
-                    RETRY_COUNT=$((RETRY_COUNT + 1))
-                    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                        echo "   ⚠️  Test databases locked by previous runs, retrying..."
-                        continue
-                    else
-                        echo "   ⚠️  Database tests failed due to leftover test databases."
-                        echo "   This is a known sqlx::test limitation in local development."
-                        echo "   CI/production will not be affected (fresh databases each run)."
-                        echo "   To fix locally: wait a few minutes or restart PostgreSQL."
-                        echo "⚠️  Database integration tests skipped (non-blocking for CI/deployment)."
-                        # Don't count this as an error since it's a local dev issue
-                        TEST_PASSED=true  # Mark as passed to continue validation
-                    fi
-                elif grep -q "⚠️.*DATABASE_URL not set.*skipping" /tmp/test_output.log; then
-                    echo "   ⚠️  Database integration tests skipped (DATABASE_URL not set)"
-                    echo "   This is expected in coverage runs or when DATABASE_URL is not configured"
-                    TEST_PASSED=true  # Mark as passed since tests gracefully skipped
-                else
-                    echo "❌ Database integration tests failed. Fix all failing tests before committing."
-                    ERRORS=$((ERRORS + 1))
-                    break
-                fi
-            fi
-        done
-        
-        # Run E2E tests if they exist (full API flow tests; validates routing, schema constraints, etc.)
-        # These tests catch critical issues like:
-        # - Missing required fields (session_id, buyer_id NOT NULL constraints)
-        # - Transaction isolation issues (router not seeing uncommitted data)
-        # - Ping tree routing logic errors
-        # Add short timeout to prevent hanging (30 seconds should be enough for --list)
-        if timeout 30 cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
-            echo "   Running E2E tests (full API flow - validates routing, schema constraints)..."
-            # Use cargo-nextest if available (matches CI), otherwise fallback to cargo test
-            if command -v cargo-nextest > /dev/null 2>&1; then
-                # Add timeout to prevent WSL crashes (20 minutes for E2E tests)
-                E2E_OUTPUT=$(timeout 1200 cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only 2>&1)
-                E2E_EXIT_CODE=${PIPESTATUS[0]}
-                if [ $E2E_EXIT_CODE -ne 0 ]; then
-                    echo "❌ E2E tests failed. Fix all failing tests before committing."
-                    echo "$E2E_OUTPUT" | tail -50  # Show last 50 lines of output
-                    # Check for common error patterns and provide helpful hints
-                    if echo "$E2E_OUTPUT" | grep -q "null value in column.*violates not-null constraint"; then
-                        echo "   💡 Hint: Check that test setup provides all required fields (session_id, buyer_id, etc.)"
-                    fi
-                    if echo "$E2E_OUTPUT" | grep -q "assertion failed: result.is_ok()"; then
-                        echo "   💡 Hint: Router may not see test data - ensure transaction is committed before routing"
-                        echo "   💡 Hint: Check that ping_tree_publishers entry exists and ping tree is found"
-                    fi
-                    if echo "$E2E_OUTPUT" | grep -q "Router error"; then
-                        echo "   💡 Hint: Check router error output above - may be database constraint or missing data"
-                    fi
-                    if echo "$E2E_OUTPUT" | grep -qE "relation.*does not exist|ping_tree_publishers.*does not exist|ping_tree_publishers table does not exist|migrations may not have run"; then
-                        echo "   💡 Hint: Database table missing - migrations may not have run"
-                        echo "   💡 Hint: Check that create_test_pool() runs migrations successfully"
-                        echo "   💡 Hint: Verify migrations directory is found and migrations are applied"
-                        echo "   💡 Hint: ping_tree_publishers table missing - migration 20260120000002 may not have run"
-                        echo "   💡 Hint: In CI, ensure CI=1 is set so is_test_mode=true and migrations run"
-                    fi
-                    ERRORS=$((ERRORS + 1))
-                else
-                    echo "✅ E2E tests OK (nextest)"
-                fi
-            else
-                # Fallback to cargo test (matches CI fallback)
-                # Add timeout to prevent WSL crashes (20 minutes for E2E tests)
-                E2E_OUTPUT=$(timeout 1200 cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored 2>&1)
-                E2E_EXIT_CODE=${PIPESTATUS[0]}
-                if [ $E2E_EXIT_CODE -eq 124 ]; then
-                    echo "❌ E2E tests timed out (20 minutes). This may indicate WSL/filesystem issues."
-                    echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                    ERRORS=$((ERRORS + 1))
-                elif [ $E2E_EXIT_CODE -ne 0 ]; then
-                    echo "❌ E2E tests failed. Fix all failing tests before committing."
-                    echo "$E2E_OUTPUT" | tail -50  # Show last 50 lines of output
-                    # Check for common error patterns and provide helpful hints
-                    if echo "$E2E_OUTPUT" | grep -q "null value in column.*violates not-null constraint"; then
-                        echo "   💡 Hint: Check that test setup provides all required fields (session_id, buyer_id, etc.)"
-                    fi
-                    if echo "$E2E_OUTPUT" | grep -q "assertion failed: result.is_ok()"; then
-                        echo "   💡 Hint: Router may not see test data - ensure transaction is committed before routing"
-                        echo "   💡 Hint: Check that ping_tree_publishers entry exists and ping tree is found"
-                    fi
-                    if echo "$E2E_OUTPUT" | grep -q "Router error"; then
-                        echo "   💡 Hint: Check router error output above - may be database constraint or missing data"
-                    fi
-                    if echo "$E2E_OUTPUT" | grep -qE "relation.*does not exist|ping_tree_publishers.*does not exist|ping_tree_publishers table does not exist|migrations may not have run"; then
-                        echo "   💡 Hint: Database table missing - migrations may not have run"
-                        echo "   💡 Hint: Check that create_test_pool() runs migrations successfully"
-                        echo "   💡 Hint: Verify migrations directory is found and migrations are applied"
-                        echo "   💡 Hint: ping_tree_publishers table missing - migration 20260120000002 may not have run"
-                        echo "   💡 Hint: In CI, ensure CI=1 is set so is_test_mode=true and migrations run"
-                    fi
-                    ERRORS=$((ERRORS + 1))
-                else
-                    echo "✅ E2E tests OK (cargo test)"
-                fi
-            fi
-        fi
-        # NOTE: async_persistence, duplicate_post, ping_tree_router_* (--ignored) require
-        # ephemeral DB and are heavy; run via ./autotests.sh to avoid main-DB litter.
     else
-        if [ "$DATABASE_URL_IS_SET" = true ]; then
-            echo "   DATABASE_URL is set but not ephemeral - running unit tests only..."
-            echo "   (Database integration tests skipped to prevent main DB pollution)"
-            echo "   (Use ./autotests.sh or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL for full tests)"
-        else
-            echo "   DATABASE_URL not set - running unit tests only..."
-            echo "   (Set DATABASE_URL to run full test suite including database integration tests)"
-        fi
-        # Run only unit tests (lib tests) to avoid database-dependent test failures
-        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-        if ! timeout 600 cargo nextest run --lib --locked --all-features; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Unit tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
-        else
-            if [ "$DATABASE_URL_IS_SET" = true ]; then
-                echo "✅ Unit tests OK (integration tests skipped - DATABASE_URL is not ephemeral)"
-            else
-                echo "✅ Unit tests OK (integration tests skipped - set DATABASE_URL to run them)"
-            fi
-        fi
+        echo "✅ Unit tests OK"
     fi
 else
     echo "   Using cargo test (install cargo-nextest for faster tests: cargo install cargo-nextest)"
-    if [ "$FAST_MODE" = true ]; then
-        # Fast mode: only run unit tests (no database required)
-        echo "   Fast mode: Running unit tests only (skipping database integration tests)..."
-        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-        if ! timeout 600 cargo test --lib --locked --all-features; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Unit tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
+    # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+    if ! timeout 600 cargo test --lib --locked --all-features; then
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+            echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+            ERRORS=$((ERRORS + 1))
         else
-            echo "✅ Unit tests OK (fast mode)"
-        fi
-    elif [ "$HAS_DATABASE_URL" = true ]; then
-        echo "   DATABASE_URL is set - running all tests including database-dependent ones..."
-        # Use limited parallelism (2 threads) to reduce database conflicts while maintaining performance
-        # sqlx::test creates/drops test databases which can conflict when too many run in parallel
-        # Automatic cleanup (above) handles leftover databases, but we still need limited parallelism
-        # Add timeout to prevent WSL crashes (20 minutes for full test suite)
-        if ! timeout 1200 cargo test --locked --all-features -- --test-threads=2; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Tests timed out (20 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
-        else
-            echo "✅ Tests OK"
+            echo "❌ Unit tests failed. Fix all failing tests before committing."
+            ERRORS=$((ERRORS + 1))
         fi
     else
-        if [ "$DATABASE_URL_IS_SET" = true ]; then
-            echo "   DATABASE_URL is set but not ephemeral - running unit tests only..."
-            echo "   (Database integration tests skipped to prevent main DB pollution)"
-            echo "   (Use ./autotests.sh or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL for full tests)"
-        else
-            echo "   DATABASE_URL not set - running unit tests only..."
-            echo "   (Set DATABASE_URL to run full test suite including integration tests)"
-        fi
-        # Run only unit tests (lib tests) to avoid database-dependent test failures
-        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
-        if ! timeout 600 cargo test --lib --locked --all-features; then
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
-                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
-                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
-                ERRORS=$((ERRORS + 1))
-            else
-                echo "❌ Unit tests failed. Fix all failing tests before committing."
-                ERRORS=$((ERRORS + 1))
-            fi
-        else
-            if [ "$DATABASE_URL_IS_SET" = true ]; then
-                echo "✅ Unit tests OK (integration tests skipped - DATABASE_URL is not ephemeral)"
-            else
-                echo "✅ Unit tests OK (integration tests skipped - set DATABASE_URL to run them)"
-            fi
-        fi
+        echo "✅ Unit tests OK"
     fi
 fi
+echo ""
 echo ""
 
 # 5. Build check
@@ -1218,8 +816,21 @@ echo ""
         echo "   Running cargo-audit (vulnerabilities)..."
         # Ignore RUSTSEC-2023-0071 (rsa Marvin Attack): transitive via sqlx-mysql, no fix available
         # Add timeout to prevent WSL crashes from hanging network operations
-        if ! timeout 60 cargo audit --ignore RUSTSEC-2023-0071 2>&1; then
-            echo "⚠️  cargo-audit found issues, timed out, or failed. Review and fix vulnerabilities." || true
+        # Use set +e temporarily to capture exit code without triggering set -e
+        set +e
+        AUDIT_OUTPUT=$(timeout 60 cargo audit --ignore RUSTSEC-2023-0071 2>&1)
+        AUDIT_EXIT=$?
+        set -e
+        if [ $AUDIT_EXIT -ne 0 ]; then
+            # Check for read-only filesystem errors (common in WSL)
+            if echo "$AUDIT_OUTPUT" | grep -qE "read-only|failed to obtain lock"; then
+                echo "⚠️  cargo-audit skipped (read-only filesystem - common in WSL)"
+                echo "   💡 Hint: This is expected in WSL with read-only cargo cache"
+            elif [ $AUDIT_EXIT -eq 124 ]; then
+                echo "⚠️  cargo-audit timed out (60s). This may indicate network/filesystem issues."
+            else
+                echo "⚠️  cargo-audit found issues. Review and fix vulnerabilities." || true
+            fi
         else
             echo "✅ cargo-audit OK (with documented exceptions: RUSTSEC-2023-0071)"
         fi
@@ -1230,8 +841,21 @@ echo ""
     if command -v cargo-deny > /dev/null 2>&1; then
         echo "   Running cargo-deny (policies)..."
         # Add timeout to prevent WSL crashes from hanging operations
-        if ! timeout 60 cargo deny check 2>&1; then
-            echo "⚠️  cargo-deny reported policy issues, timed out, or failed. Review deny.toml and fixes." || true
+        # Use set +e temporarily to capture exit code without triggering set -e
+        set +e
+        DENY_OUTPUT=$(timeout 60 cargo deny check 2>&1)
+        DENY_EXIT=$?
+        set -e
+        if [ $DENY_EXIT -ne 0 ]; then
+            # Check for read-only filesystem errors (common in WSL)
+            if echo "$DENY_OUTPUT" | grep -qE "read-only|failed to obtain lock|failed to acquire.*lock"; then
+                echo "⚠️  cargo-deny skipped (read-only filesystem - common in WSL)"
+                echo "   💡 Hint: This is expected in WSL with read-only cargo cache"
+            elif [ $DENY_EXIT -eq 124 ]; then
+                echo "⚠️  cargo-deny timed out (60s). This may indicate network/filesystem issues."
+            else
+                echo "⚠️  cargo-deny reported policy issues. Review deny.toml and fixes." || true
+            fi
         else
             echo "✅ cargo-deny OK"
         fi

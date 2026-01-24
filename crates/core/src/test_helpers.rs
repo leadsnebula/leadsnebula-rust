@@ -244,10 +244,15 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                             Ok(_) => break, // Table exists and is visible
                             Err(e) if retries < max_retries => {
                                 let error_str = e.to_string();
-                                if error_str.contains("does not exist") || error_str.contains("relation") {
+                                if error_str.contains("does not exist")
+                                    || error_str.contains("relation")
+                                {
                                     retries += 1;
                                     let delay_ms = 50 * (1 << retries); // 100ms, 200ms, 400ms, 800ms, 1600ms
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                                        delay_ms,
+                                    ))
+                                    .await;
                                     // Try recreating the table in case it was dropped by another concurrent test
                                     let _ = sqlx::query(
                                         "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
