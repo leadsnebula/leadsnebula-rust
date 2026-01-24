@@ -206,9 +206,14 @@ fi
 
 # 4. Unit tests only (no database required)
 echo "4️⃣  Running unit tests (with --locked)..."
-echo "   Note: This script runs unit tests only. For full test suite including database"
-echo "   integration tests, run: ./autotests.sh"
-echo ""
+        echo "   Note: This script runs unit tests only. For full test suite including database"
+        echo "   integration tests, run: ./autotests.sh"
+        echo ""
+        echo "   ⚠️  Database tests may fail with:"
+        echo "      - Migration table race conditions (_sqlx_migrations does not exist)"
+        echo "      - PoolTimedOut errors (tests taking >60 seconds)"
+        echo "      Run ./autotests.sh to catch these issues before pushing"
+        echo ""
 
 if command -v cargo-nextest > /dev/null 2>&1; then
     echo "   Using cargo-nextest for faster parallel test execution..."
@@ -346,6 +351,20 @@ fi
 if grep -q "^Cargo.lock$" .gitignore 2>/dev/null; then
     echo "❌ Cargo.lock is in .gitignore. Remove it - applications must commit Cargo.lock."
     ERRORS=$((ERRORS + 1))
+fi
+
+# Validate test helper configuration (check for proper timeout settings)
+if [ -f "crates/core/src/test_helpers.rs" ]; then
+    echo "3️⃣a️⃣  Validating test helper configuration..."
+    if grep -q "acquire_timeout.*120.*CI\|120.*CI.*acquire_timeout" crates/core/src/test_helpers.rs && \
+       grep -q "max_connections.*50.*CI\|50.*CI.*max_connections" crates/core/src/test_helpers.rs; then
+        echo "✅ Test helpers have proper CI timeout settings (120s timeout, 50 max connections)"
+    else
+        echo "⚠️  Test helpers may not have optimal CI timeout settings"
+        echo "   Expected: acquire_timeout=120s and max_connections=50 for CI"
+        echo "   Check: crates/core/src/test_helpers.rs"
+    fi
+    echo ""
 fi
 echo ""
 

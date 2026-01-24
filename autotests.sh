@@ -122,7 +122,13 @@ if [ "$USE_NEON" = true ]; then
     
     export DATABASE_URL="$CONNECTION"
     export EPHEMERAL_DB=1
+    # Set CI environment variable for test helpers to use CI-specific pool settings
+    export CI=1
+    # Increase pool size and timeout for CI (Neon free-tier can be very slow)
+    export TEST_POOL_MAX_CONNECTIONS="${TEST_POOL_MAX_CONNECTIONS:-50}"
+    export TEST_POOL_ACQUIRE_TIMEOUT_SECS="${TEST_POOL_ACQUIRE_TIMEOUT_SECS:-120}"
     echo "✅ DATABASE_URL and EPHEMERAL_DB set (ephemeral branch; no litter in main)"
+    echo "   Pool settings: max_connections=$TEST_POOL_MAX_CONNECTIONS, acquire_timeout=${TEST_POOL_ACQUIRE_TIMEOUT_SECS}s"
     
     # Wait a moment for DNS to propagate and database to be fully ready
     echo "Waiting for database to be ready..."
@@ -218,39 +224,185 @@ else
     
     # 2. Non-database integration tests
     echo "2️⃣  Running non-database integration tests..."
-    if [ "$HAS_NEXTEST" = true ]; then
-        cargo nextest run --locked --all-features --test integration_health --test integration_routes
+    # These tests should be fast, but add timeout as safety measure
+    if timeout 60 bash -c "
+        if [ \"$HAS_NEXTEST\" = true ]; then
+            cargo nextest run --locked --all-features --test integration_health --test integration_routes
+        else
+            cargo test --locked --all-features --test integration_health --test integration_routes
+        fi
+    "; then
+        echo "✅ Non-database integration tests passed"
     else
-        cargo test --locked --all-features --test integration_health --test integration_routes
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "❌ Non-database integration tests timed out after 60 seconds"
+            echo "   This should not happen - these tests don't use a database"
+            exit 1
+        else
+            echo "❌ Non-database integration tests failed"
+            exit $EXIT_CODE
+        fi
     fi
-    echo "✅ Non-database integration tests passed"
     echo ""
     
     # 3. Database integration tests (sequential to avoid conflicts)
     echo "3️⃣  Running database integration tests..."
-    cargo test --test integration_auth --locked --all-features -- --test-threads=1
+    echo "   ⚠️  These tests can take up to 2 minutes in CI (Neon free-tier is slow)"
+    echo "   ⚠️  Watch for migration table race conditions and PoolTimedOut errors"
+    
+    # Run with timeout wrapper to catch hanging tests
+    # Use 150 seconds (2.5 minutes) to allow for slow CI databases
+    timeout 150 cargo test --test integration_auth --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/integration_auth_test.log
+    TEST_EXIT_CODE=${PIPESTATUS[0]}
+    
+    # Check for timeout (exit code 124 from timeout command)
+    if [ $TEST_EXIT_CODE -eq 124 ]; then
+        echo ""
+        echo "❌ Database integration tests timed out after 150 seconds"
+        echo "   Error: Tests are taking too long, likely due to database slowness or pool exhaustion"
+        echo "   Fix: Increase TEST_POOL_MAX_CONNECTIONS and TEST_POOL_ACQUIRE_TIMEOUT_SECS"
+        echo "   Or: Database (Neon free-tier) is too slow - consider upgrading or using faster database"
+        echo ""
+        echo "Last 30 lines of test output:"
+        tail -30 /tmp/integration_auth_test.log
+        exit 1
+    fi
+    
+    # Check for specific error patterns
+    if [ $TEST_EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "❌ Database integration tests failed (exit code: $TEST_EXIT_CODE)"
+        
+        # Check for migration table race conditions
+        if grep -q "relation.*_sqlx_migrations.*does not exist\|duplicate key value violates unique constraint.*pg_type_typname_nsp_index" /tmp/integration_auth_test.log; then
+            echo ""
+            echo "🔍 Detected migration table race condition:"
+            echo "   Error: Multiple tests trying to create _sqlx_migrations table concurrently"
+            echo "   Fix: Ensure tests run with --test-threads=1 and add retry logic in create_test_pool()"
+            echo ""
+            grep -E "_sqlx_migrations|pg_type_typname_nsp_index" /tmp/integration_auth_test.log | head -5
+        fi
+        
+        # Check for PoolTimedOut errors
+        if grep -q "PoolTimedOut\|has been running for over 60 seconds" /tmp/integration_auth_test.log; then
+            echo ""
+            echo "🔍 Detected test timeout or pool exhaustion:"
+            echo "   Error: Tests taking longer than 60 seconds or database pool exhausted"
+            echo "   Fix: Increase TEST_POOL_MAX_CONNECTIONS and TEST_POOL_ACQUIRE_TIMEOUT_SECS"
+            echo "   Or: Database is too slow (Neon free-tier can be very slow in CI)"
+            echo ""
+            grep -E "PoolTimedOut|has been running for over" /tmp/integration_auth_test.log | head -5
+        fi
+        
+        # Show last 20 lines of test output for context
+        echo ""
+        echo "Last 20 lines of test output:"
+        tail -20 /tmp/integration_auth_test.log
+        exit $TEST_EXIT_CODE
+    fi
+    
     echo "✅ Database integration tests passed"
     echo ""
     
     # 4. Publisher CRUD tests (if they exist)
     if cargo test --test integration_publisher_crud --list 2>/dev/null | grep -q "test.*"; then
         echo "4️⃣  Running publisher CRUD tests..."
-        cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1
-        echo "✅ Publisher CRUD tests passed"
+        # Use 120 seconds timeout for CRUD tests
+        if timeout 120 cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/publisher_crud_test.log; then
+            echo "✅ Publisher CRUD tests passed"
+        else
+            EXIT_CODE=${PIPESTATUS[0]}
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Publisher CRUD tests timed out after 120 seconds"
+                tail -20 /tmp/publisher_crud_test.log
+                exit 1
+            else
+                echo "❌ Publisher CRUD tests failed"
+                tail -20 /tmp/publisher_crud_test.log
+                exit $EXIT_CODE
+            fi
+        fi
         echo ""
     fi
     
     # 5. E2E tests
     if cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
         echo "5️⃣  Running E2E tests..."
-        cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1
-        echo "✅ E2E tests passed"
+        echo "   ⚠️  E2E tests can take up to 3 minutes in CI (Neon free-tier is slow)"
+        # Use 200 seconds timeout for E2E tests (they're the slowest)
+        if timeout 200 cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/e2e_test.log; then
+            echo "✅ E2E tests passed"
+        else
+            EXIT_CODE=${PIPESTATUS[0]}
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ E2E tests timed out after 200 seconds"
+                tail -20 /tmp/e2e_test.log
+                exit 1
+            else
+                echo "❌ E2E tests failed"
+                tail -20 /tmp/e2e_test.log
+                exit $EXIT_CODE
+            fi
+        fi
         echo ""
     fi
     
     # 6. Database-backed library tests (ignored by default)
     echo "6️⃣  Running database-backed library tests (--ignored)..."
-    cargo test --lib --all-features --locked -- --ignored
+    echo "   ⚠️  These tests can take up to 2 minutes in CI (Neon free-tier is slow)"
+    
+    # Run with timeout wrapper to catch hanging tests
+    # Use 180 seconds (3 minutes) for library tests which can be slower
+    timeout 180 cargo test --lib --all-features --locked -- --ignored 2>&1 | tee /tmp/lib_tests.log
+    TEST_EXIT_CODE=${PIPESTATUS[0]}
+    
+    # Check for timeout (exit code 124 from timeout command)
+    if [ $TEST_EXIT_CODE -eq 124 ]; then
+        echo ""
+        echo "❌ Database-backed library tests timed out after 180 seconds"
+        echo "   Error: Tests are taking too long, likely due to database slowness or pool exhaustion"
+        echo "   Fix: Increase TEST_POOL_MAX_CONNECTIONS and TEST_POOL_ACQUIRE_TIMEOUT_SECS"
+        echo "   Or: Database (Neon free-tier) is too slow - consider upgrading or using faster database"
+        echo ""
+        echo "Last 30 lines of test output:"
+        tail -30 /tmp/lib_tests.log
+        exit 1
+    fi
+    
+    # Check for specific error patterns
+    if [ $TEST_EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "❌ Database-backed library tests failed (exit code: $TEST_EXIT_CODE)"
+        
+        # Check for migration table race conditions
+        if grep -q "relation.*_sqlx_migrations.*does not exist\|duplicate key value violates unique constraint.*pg_type_typname_nsp_index" /tmp/lib_tests.log; then
+            echo ""
+            echo "🔍 Detected migration table race condition:"
+            echo "   Error: Multiple tests trying to create _sqlx_migrations table concurrently"
+            echo "   Fix: Ensure tests run with --test-threads=1 and add retry logic in create_test_pool()"
+            echo ""
+            grep -E "_sqlx_migrations|pg_type_typname_nsp_index" /tmp/lib_tests.log | head -5
+        fi
+        
+        # Check for PoolTimedOut errors
+        if grep -q "PoolTimedOut\|has been running for over 60 seconds" /tmp/lib_tests.log; then
+            echo ""
+            echo "🔍 Detected test timeout or pool exhaustion:"
+            echo "   Error: Tests taking longer than 60 seconds or database pool exhausted"
+            echo "   Fix: Increase TEST_POOL_MAX_CONNECTIONS and TEST_POOL_ACQUIRE_TIMEOUT_SECS"
+            echo "   Or: Database is too slow (Neon free-tier can be very slow in CI)"
+            echo ""
+            grep -E "PoolTimedOut|has been running for over" /tmp/lib_tests.log | head -5
+        fi
+        
+        # Show last 20 lines of test output for context
+        echo ""
+        echo "Last 20 lines of test output:"
+        tail -20 /tmp/lib_tests.log
+        exit $TEST_EXIT_CODE
+    fi
+    
     echo "✅ Database-backed library tests passed"
     echo ""
 fi
