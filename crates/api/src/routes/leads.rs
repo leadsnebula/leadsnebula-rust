@@ -1151,6 +1151,7 @@ async fn create_lead(
                               AND ptc.enabled = true
                               AND c_pt.status = 'active'
                               AND c_pt.deleted_at IS NULL
+                              AND c_pt.buyer_id IS NOT NULL
                             LIMIT 1
                         ) b_ping_tree ON TRUE
                         LEFT JOIN buyers b_vertical ON 
@@ -1233,6 +1234,7 @@ async fn create_lead(
                           AND ptc.enabled = true
                           AND c_pt.status = 'active'
                           AND c_pt.deleted_at IS NULL
+                          AND c_pt.buyer_id IS NOT NULL
                         LIMIT 1
                     ) b_ping_tree ON TRUE
                     LEFT JOIN buyers b_vertical ON 
@@ -1299,6 +1301,7 @@ async fn create_lead(
                   AND ptc.enabled = true
                   AND c_pt.status = 'active'
                   AND c_pt.deleted_at IS NULL
+                  AND c_pt.buyer_id IS NOT NULL
                 LIMIT 1
             ) b_ping_tree ON TRUE
             LEFT JOIN buyers b_vertical ON 
@@ -1371,6 +1374,16 @@ async fn create_lead(
             campaign_id_opt = campaign_id;
             buyer_id_opt = effective_buyer_id;
 
+            // Debug logging to diagnose buyer detection issues
+            tracing::debug!(
+                publisher_id = %publisher.id,
+                vertical = %vertical.slug,
+                campaign_id = ?campaign_id,
+                effective_buyer_id = ?effective_buyer_id,
+                has_ping_tree = has_ping_tree,
+                "Prechecks query results"
+            );
+
             // Log ping tree status
             if !has_ping_tree {
                 tracing::info!(
@@ -1383,6 +1396,14 @@ async fn create_lead(
                 preproblems.push("No campaign configured for this publisher/vertical".to_string());
             }
             if buyer_id_opt.is_none() {
+                // Log detailed debug info when buyer is not found
+                tracing::warn!(
+                    publisher_id = %publisher.id,
+                    vertical = %vertical.slug,
+                    campaign_id = ?campaign_id,
+                    has_ping_tree = has_ping_tree,
+                    "Buyer not found in prechecks - query returned NULL buyer_id"
+                );
                 preproblems.push("No buyer configured for this publisher/vertical".to_string());
             }
         }
