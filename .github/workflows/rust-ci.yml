@@ -256,6 +256,40 @@ jobs:
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
           CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
+          echo "EPHEMERAL_DB=1" >> $GITHUB_ENV
+          echo "TEST_MODE=true" >> $GITHUB_ENV
+          # Set pool settings for CI (Neon free-tier can be slow)
+          echo "TEST_POOL_MAX_CONNECTIONS=50" >> $GITHUB_ENV
+          echo "TEST_POOL_ACQUIRE_TIMEOUT_SECS=120" >> $GITHUB_ENV
+          
+      - name: Verify database connection
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          echo "Verifying database connection..."
+          # Check if psql is available (it may not be installed in GitHub Actions)
+          if command -v psql > /dev/null 2>&1; then
+            MAX_RETRIES=5
+            RETRY_COUNT=0
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              if timeout 10 psql "$DATABASE_URL" -c "SELECT 1;" > /dev/null 2>&1; then
+                echo "✅ Database connection verified"
+                break
+              else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  echo "   Waiting for database to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+                  sleep 2
+                else
+                  echo "⚠️  Could not verify database connection, but continuing anyway (tests will retry)"
+                fi
+              fi
+            done
+          else
+            echo "⚠️  psql not available, skipping connection verification (tests will verify connection)"
+          fi
+          # Small delay to ensure database is fully ready before tests start
+          echo "Waiting 3 seconds for database to stabilize..."
+          sleep 3
 
       - name: Run integration tests (light DB only; heavy/concurrency run locally)
         if: steps.needs-integration.outputs.needs_tests == 'true'
@@ -268,10 +302,11 @@ jobs:
           cargo nextest run --test integration_health --locked --all-features --test-threads=2 || \
             cargo test --test integration_health --locked --all-features -- --test-threads=2
           
-          # Auth tests - some may need sequential execution due to DB state
-          # Use 2 threads to balance speed and isolation
-          cargo nextest run --test integration_auth --locked --all-features --test-threads=2 || \
-            cargo test --test integration_auth --locked --all-features -- --test-threads=2
+          # Auth tests - MUST run sequentially (--test-threads=1) to avoid migration table race conditions
+          # Multiple concurrent tests trying to create _sqlx_migrations table causes "duplicate key" errors
+          # Also add timeout wrapper to catch hanging tests (150s = 2.5 minutes)
+          timeout 150 cargo nextest run --test integration_auth --locked --all-features --test-threads=1 || \
+            timeout 150 cargo test --test integration_auth --locked --all-features -- --test-threads=1
           
           # Publisher CRUD tests
           cargo nextest run --test integration_publisher_crud --locked --all-features --test-threads=2 || \
