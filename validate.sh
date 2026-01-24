@@ -6,10 +6,17 @@
 #   ./validate.sh          # Full validation (all tests) - USE BEFORE COMMITTING
 #   ./validate.sh --fast    # Fast validation (unit tests only) - DEVELOPMENT ONLY
 #
+# Environment variables (for WSL stability):
+#   SKIP_CLEANUP=true      # Skip incremental artifact cleanup (if it causes issues)
+#   SKIP_RELEASE_BUILD=true # Skip resource-intensive release build (recommended in WSL)
+#
 # ⚠️  IMPORTANT: Fast mode skips database integration tests!
 #    - Use './validate.sh' (without --fast) before committing
 #    - CI will run full tests, but fast commits waste CI resources
 #    - Fast mode is intended for rapid development iteration only
+#
+# 💡 WSL Users: If WSL crashes during validation, try:
+#    SKIP_RELEASE_BUILD=true SKIP_CLEANUP=true ./validate.sh
 
 set -e
 
@@ -56,9 +63,17 @@ if [ ! -f "$VALIDATE_CONFIG_BIN" ] || [ "$VALIDATE_CONFIG_SRC" -nt "$VALIDATE_CO
     echo "Building validate-config..."
     # Build with visible output (remove --quiet) so we can see what's happening
     # Redirect stderr to stdout so errors are visible
-    if ! cargo build --release --bin validate-config 2>&1 | tee /tmp/validate-config-build.log; then
-        echo "⚠️  validate-config build failed, using fallback parsing"
-        echo "   Build output saved to /tmp/validate-config-build.log"
+    # Add timeout to prevent WSL crashes (5 minutes for validate-config build)
+    if ! timeout 300 cargo build --release --bin validate-config 2>&1 | tee /tmp/validate-config-build.log; then
+        EXIT_CODE=${PIPESTATUS[0]}
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "⚠️  validate-config build timed out (5 minutes). This may indicate WSL/filesystem issues."
+            echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+            echo "   Using fallback parsing"
+        else
+            echo "⚠️  validate-config build failed, using fallback parsing"
+            echo "   Build output saved to /tmp/validate-config-build.log"
+        fi
         USE_FALLBACK=true
     fi
 fi
@@ -116,11 +131,36 @@ fi
 
 ERRORS=0
 
+# 0. Clean corrupt incremental artifacts (prevents WSL crashes)
+# Corrupt incremental compilation artifacts can cause cargo commands to hang or crash WSL
+# This is especially important in WSL where filesystem issues can corrupt these files
+# SKIP_CLEANUP can be set to skip this step if it causes issues
+if [ "${SKIP_CLEANUP:-false}" != "true" ] && [ -d "target" ]; then
+    echo "0️⃣  Cleaning corrupt incremental compilation artifacts (prevents WSL crashes)..."
+    # Remove corrupt incremental artifacts that can cause WSL crashes
+    # Cargo will regenerate these automatically on next build
+    # Use timeout to prevent hanging if filesystem is in bad state
+    # Only remove specific corrupt files, not entire directories
+    # Use very short timeout and wrap in subshell to prevent WSL crashes
+    (timeout 5 sh -c 'find target/debug/incremental target/release/incremental -name "dep-graph.bin" -type f -delete 2>/dev/null || true' 2>/dev/null || true) || true
+    (timeout 5 sh -c 'find target/debug/incremental target/release/incremental -name "*.lock" -type f -delete 2>/dev/null || true' 2>/dev/null || true) || true
+    echo "✅ Incremental artifacts cleaned (if any were found)"
+    echo ""
+fi
+
 # 1. Format check
 echo "1️⃣  Checking formatting..."
-if ! cargo fmt --all -- --check; then
-    echo "❌ Formatting check failed. Run 'cargo fmt --all' to fix."
-    ERRORS=$((ERRORS + 1))
+# Add timeout to prevent WSL crashes from hanging cargo commands
+if ! timeout 180 cargo fmt --all -- --check; then
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 124 ]; then
+        echo "❌ Formatting check timed out (3 minutes). This may indicate WSL/filesystem issues."
+        echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+        ERRORS=$((ERRORS + 1))
+    else
+        echo "❌ Formatting check failed. Run 'cargo fmt --all' to fix."
+        ERRORS=$((ERRORS + 1))
+    fi
 else
     echo "✅ Formatting OK"
 fi
@@ -128,9 +168,17 @@ echo ""
 
 # 2. Clippy check
 echo "2️⃣  Running clippy (warnings as errors)..."
-if ! cargo clippy --all-targets --all-features -- -D warnings; then
-    echo "❌ Clippy check failed. Fix all warnings before committing."
-    ERRORS=$((ERRORS + 1))
+# Add timeout to prevent WSL crashes from hanging cargo commands
+if ! timeout 300 cargo clippy --all-targets --all-features -- -D warnings; then
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 124 ]; then
+        echo "❌ Clippy check timed out (5 minutes). This may indicate WSL/filesystem issues."
+        echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+        ERRORS=$((ERRORS + 1))
+    else
+        echo "❌ Clippy check failed. Fix all warnings before committing."
+        ERRORS=$((ERRORS + 1))
+    fi
 else
     echo "✅ Clippy OK"
 fi
@@ -200,15 +248,18 @@ fi
 echo "4️⃣  Running tests (with --locked)..."
 # Check if DATABASE_URL is set for database-dependent tests
 HAS_DATABASE_URL=false
+DATABASE_URL_IS_SET=false
 IS_EPHEMERAL_DB=false
 if [ "$FAST_MODE" = false ]; then
     # Only check for DATABASE_URL if not in fast mode
     if [ -n "$DATABASE_URL" ]; then
+        DATABASE_URL_IS_SET=true
         HAS_DATABASE_URL=true
     elif [ -f ".env.local" ] && grep -q "^DATABASE_URL=" .env.local 2>/dev/null; then
         # Try to load DATABASE_URL from .env.local
         export $(grep "^DATABASE_URL=" .env.local | xargs)
         if [ -n "$DATABASE_URL" ]; then
+            DATABASE_URL_IS_SET=true
             HAS_DATABASE_URL=true
         fi
     fi
@@ -244,16 +295,27 @@ fi
 # Clean up leftover test databases before running tests
 # This prevents "database is being accessed by other users" errors from sqlx::test
 # Skip cleanup in fast mode (no database tests)
+# NOTE: Added timeouts to prevent WSL crashes from hanging psql commands
 if [ "$FAST_MODE" = false ] && [ "$HAS_DATABASE_URL" = true ] && command -v psql > /dev/null 2>&1; then
     # Extract base database URL (replace database name with 'postgres')
     CLEANUP_DB_URL=$(echo "$DATABASE_URL" | sed 's|/[^/]*$|/postgres|')
     if [ -n "$CLEANUP_DB_URL" ]; then
-        echo "   Cleaning up leftover test databases..."
-        # Terminate connections to test databases
-        psql "$CLEANUP_DB_URL" -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname LIKE '_sqlx_test_%' AND pid <> pg_backend_pid();" > /dev/null 2>&1 || true
-        sleep 1
-        # Drop test databases
-        psql "$CLEANUP_DB_URL" -t -c "SELECT 'DROP DATABASE IF EXISTS ' || quote_ident(datname) || ';' FROM pg_database WHERE datname LIKE '_sqlx_test_%';" 2>/dev/null | grep -v "^$" | psql "$CLEANUP_DB_URL" > /dev/null 2>&1 || true
+        # Quick connectivity test with timeout (5 seconds max) before attempting cleanup
+        # This prevents WSL crashes from hanging psql connections
+        if timeout 5 psql "$CLEANUP_DB_URL" -c "SELECT 1;" > /dev/null 2>&1; then
+            echo "   Cleaning up leftover test databases..."
+            # Terminate connections to test databases (with 10 second timeout)
+            timeout 10 psql "$CLEANUP_DB_URL" -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname LIKE '_sqlx_test_%' AND pid <> pg_backend_pid();" > /dev/null 2>&1 || true
+            sleep 1
+            # Drop test databases (with 15 second timeout for the entire operation)
+            # Use a temporary file to avoid pipe hanging issues in WSL
+            DROP_SQL=$(timeout 10 psql "$CLEANUP_DB_URL" -t -c "SELECT 'DROP DATABASE IF EXISTS ' || quote_ident(datname) || ';' FROM pg_database WHERE datname LIKE '_sqlx_test_%';" 2>/dev/null | grep -v "^$" || true)
+            if [ -n "$DROP_SQL" ]; then
+                echo "$DROP_SQL" | timeout 15 psql "$CLEANUP_DB_URL" > /dev/null 2>&1 || true
+            fi
+        else
+            echo "   ⚠️  Skipping database cleanup (connection test failed or timed out)"
+        fi
     fi
 fi
 
@@ -262,9 +324,17 @@ if command -v cargo-nextest > /dev/null 2>&1; then
     if [ "$FAST_MODE" = true ]; then
         # Fast mode: only run unit tests (no database required)
         echo "   Fast mode: Running unit tests only (skipping database integration tests)..."
-        if ! cargo nextest run --lib --locked --all-features; then
-            echo "❌ Unit tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+        if ! timeout 600 cargo nextest run --lib --locked --all-features; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Unit tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
         else
             echo "✅ Unit tests OK (nextest, fast mode)"
         fi
@@ -273,18 +343,34 @@ if command -v cargo-nextest > /dev/null 2>&1; then
         
         # Run unit tests first with nextest (fast, parallel) for quick feedback
         echo "   Running unit tests in parallel (nextest)..."
-        if ! cargo nextest run --lib --locked --all-features; then
-            echo "❌ Unit tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+        if ! timeout 600 cargo nextest run --lib --locked --all-features; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Unit tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
         else
             echo "✅ Unit tests OK (nextest)"
         fi
         
         # Run non-database integration tests in parallel with nextest
         echo "   Running non-database integration tests in parallel (nextest)..."
-        if ! cargo nextest run --locked --all-features --test integration_health --test integration_routes; then
-            echo "❌ Integration tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        # Add timeout to prevent WSL crashes (15 minutes for integration tests)
+        if ! timeout 900 cargo nextest run --locked --all-features --test integration_health --test integration_routes; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Integration tests timed out (15 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Integration tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
         else
             echo "✅ Non-database integration tests OK (nextest)"
         fi
@@ -305,11 +391,17 @@ if command -v cargo-nextest > /dev/null 2>&1; then
             fi
             
             # Run integration_auth test
-            TEST_OUTPUT=$(cargo test --test integration_auth --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/test_output.log)
+            # Add timeout to prevent WSL crashes (15 minutes for integration tests)
+            TEST_OUTPUT=$(timeout 900 cargo test --test integration_auth --locked --all-features -- --test-threads=1 2>&1 | tee /tmp/test_output.log)
             TEST_EXIT_CODE=${PIPESTATUS[0]}
             
+            # Check if tests timed out
+            if [ $TEST_EXIT_CODE -eq 124 ]; then
+                echo "❌ Integration tests timed out (15 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                TEST_PASSED=false
             # Check if tests were skipped due to missing DATABASE_URL
-            if grep -q "⚠️.*DATABASE_URL not set.*skipping" /tmp/test_output.log; then
+            elif grep -q "⚠️.*DATABASE_URL not set.*skipping" /tmp/test_output.log; then
                 echo "   ⚠️  Database integration tests skipped (DATABASE_URL not set)"
                 echo "   This is expected in coverage runs or when DATABASE_URL is not configured"
                 TEST_PASSED=true  # Mark as passed since tests gracefully skipped
@@ -317,7 +409,8 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                 # Run integration_publisher_crud test if it exists
                 if [ -f "crates/api/tests/integration_publisher_crud.rs" ] || [ -f "tests/integration_publisher_crud.rs" ]; then
                     echo "   Running integration_publisher_crud tests..."
-                    PUB_CRUD_OUTPUT=$(cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee -a /tmp/test_output.log)
+                    # Add timeout to prevent WSL crashes (15 minutes for integration tests)
+                    PUB_CRUD_OUTPUT=$(timeout 900 cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1 2>&1 | tee -a /tmp/test_output.log)
                     TEST_EXIT_CODE=${PIPESTATUS[0]}
                     
                     # Check if publisher tests were skipped
@@ -385,11 +478,13 @@ if command -v cargo-nextest > /dev/null 2>&1; then
         # - Missing required fields (session_id, buyer_id NOT NULL constraints)
         # - Transaction isolation issues (router not seeing uncommitted data)
         # - Ping tree routing logic errors
-        if cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
+        # Add short timeout to prevent hanging (30 seconds should be enough for --list)
+        if timeout 30 cargo test --test integration_carina_e2e --list 2>/dev/null | grep -q "test.*"; then
             echo "   Running E2E tests (full API flow - validates routing, schema constraints)..."
             # Use cargo-nextest if available (matches CI), otherwise fallback to cargo test
             if command -v cargo-nextest > /dev/null 2>&1; then
-                E2E_OUTPUT=$(cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only 2>&1)
+                # Add timeout to prevent WSL crashes (20 minutes for E2E tests)
+                E2E_OUTPUT=$(timeout 1200 cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only 2>&1)
                 E2E_EXIT_CODE=${PIPESTATUS[0]}
                 if [ $E2E_EXIT_CODE -ne 0 ]; then
                     echo "❌ E2E tests failed. Fix all failing tests before committing."
@@ -418,9 +513,14 @@ if command -v cargo-nextest > /dev/null 2>&1; then
                 fi
             else
                 # Fallback to cargo test (matches CI fallback)
-                E2E_OUTPUT=$(cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored 2>&1)
+                # Add timeout to prevent WSL crashes (20 minutes for E2E tests)
+                E2E_OUTPUT=$(timeout 1200 cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored 2>&1)
                 E2E_EXIT_CODE=${PIPESTATUS[0]}
-                if [ $E2E_EXIT_CODE -ne 0 ]; then
+                if [ $E2E_EXIT_CODE -eq 124 ]; then
+                    echo "❌ E2E tests timed out (20 minutes). This may indicate WSL/filesystem issues."
+                    echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                    ERRORS=$((ERRORS + 1))
+                elif [ $E2E_EXIT_CODE -ne 0 ]; then
                     echo "❌ E2E tests failed. Fix all failing tests before committing."
                     echo "$E2E_OUTPUT" | tail -50  # Show last 50 lines of output
                     # Check for common error patterns and provide helpful hints
@@ -450,14 +550,32 @@ if command -v cargo-nextest > /dev/null 2>&1; then
         # NOTE: async_persistence, duplicate_post, ping_tree_router_* (--ignored) require
         # ephemeral DB and are heavy; run via ./autotests.sh to avoid main-DB litter.
     else
-        echo "   DATABASE_URL not set - running unit tests only..."
-        echo "   (Set DATABASE_URL to run full test suite including database integration tests)"
-        # Run only unit tests (lib tests) to avoid database-dependent test failures
-        if ! cargo nextest run --lib --locked --all-features; then
-            echo "❌ Unit tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        if [ "$DATABASE_URL_IS_SET" = true ]; then
+            echo "   DATABASE_URL is set but not ephemeral - running unit tests only..."
+            echo "   (Database integration tests skipped to prevent main DB pollution)"
+            echo "   (Use ./autotests.sh or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL for full tests)"
         else
-            echo "✅ Unit tests OK (integration tests skipped - set DATABASE_URL to run them)"
+            echo "   DATABASE_URL not set - running unit tests only..."
+            echo "   (Set DATABASE_URL to run full test suite including database integration tests)"
+        fi
+        # Run only unit tests (lib tests) to avoid database-dependent test failures
+        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+        if ! timeout 600 cargo nextest run --lib --locked --all-features; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Unit tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
+        else
+            if [ "$DATABASE_URL_IS_SET" = true ]; then
+                echo "✅ Unit tests OK (integration tests skipped - DATABASE_URL is not ephemeral)"
+            else
+                echo "✅ Unit tests OK (integration tests skipped - set DATABASE_URL to run them)"
+            fi
         fi
     fi
 else
@@ -465,9 +583,17 @@ else
     if [ "$FAST_MODE" = true ]; then
         # Fast mode: only run unit tests (no database required)
         echo "   Fast mode: Running unit tests only (skipping database integration tests)..."
-        if ! cargo test --lib --locked --all-features; then
-            echo "❌ Unit tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+        if ! timeout 600 cargo test --lib --locked --all-features; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Unit tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
         else
             echo "✅ Unit tests OK (fast mode)"
         fi
@@ -476,35 +602,81 @@ else
         # Use limited parallelism (2 threads) to reduce database conflicts while maintaining performance
         # sqlx::test creates/drops test databases which can conflict when too many run in parallel
         # Automatic cleanup (above) handles leftover databases, but we still need limited parallelism
-        if ! cargo test --locked --all-features -- --test-threads=2; then
-            echo "❌ Tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        # Add timeout to prevent WSL crashes (20 minutes for full test suite)
+        if ! timeout 1200 cargo test --locked --all-features -- --test-threads=2; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Tests timed out (20 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
         else
             echo "✅ Tests OK"
         fi
     else
-        echo "   DATABASE_URL not set - running unit tests only..."
-        echo "   (Set DATABASE_URL to run full test suite including integration tests)"
-        # Run only unit tests (lib tests) to avoid database-dependent test failures
-        if ! cargo test --lib --locked --all-features; then
-            echo "❌ Unit tests failed. Fix all failing tests before committing."
-            ERRORS=$((ERRORS + 1))
+        if [ "$DATABASE_URL_IS_SET" = true ]; then
+            echo "   DATABASE_URL is set but not ephemeral - running unit tests only..."
+            echo "   (Database integration tests skipped to prevent main DB pollution)"
+            echo "   (Use ./autotests.sh or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL for full tests)"
         else
-            echo "✅ Unit tests OK (integration tests skipped - set DATABASE_URL to run them)"
+            echo "   DATABASE_URL not set - running unit tests only..."
+            echo "   (Set DATABASE_URL to run full test suite including integration tests)"
+        fi
+        # Run only unit tests (lib tests) to avoid database-dependent test failures
+        # Add timeout to prevent WSL crashes (10 minutes for unit tests)
+        if ! timeout 600 cargo test --lib --locked --all-features; then
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+                echo "❌ Unit tests timed out (10 minutes). This may indicate WSL/filesystem issues."
+                echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+                ERRORS=$((ERRORS + 1))
+            else
+                echo "❌ Unit tests failed. Fix all failing tests before committing."
+                ERRORS=$((ERRORS + 1))
+            fi
+        else
+            if [ "$DATABASE_URL_IS_SET" = true ]; then
+                echo "✅ Unit tests OK (integration tests skipped - DATABASE_URL is not ephemeral)"
+            else
+                echo "✅ Unit tests OK (integration tests skipped - set DATABASE_URL to run them)"
+            fi
         fi
     fi
 fi
 echo ""
 
 # 5. Build check
-echo "5️⃣  Building release (with --locked)..."
-if ! cargo build --release --locked; then
-    echo "❌ Build failed. Fix compilation errors before committing."
-    ERRORS=$((ERRORS + 1))
+# SKIP_RELEASE_BUILD can be set to skip the resource-intensive release build
+# This is useful in WSL where full release builds can cause crashes
+if [ "${SKIP_RELEASE_BUILD:-false}" = "true" ]; then
+    echo "5️⃣  Build check (SKIPPED - SKIP_RELEASE_BUILD=true)..."
+    echo "   ⚠️  Release build skipped. Use 'cargo build --release' manually to verify."
+    echo "   (This is recommended in WSL to prevent resource exhaustion)"
+    echo ""
 else
-    echo "✅ Build OK"
+    echo "5️⃣  Building release (with --locked, limited parallelism for WSL stability)..."
+    # Limit parallelism to reduce memory/CPU usage and prevent WSL crashes
+    # Use 2 jobs instead of all cores to be more conservative in WSL
+    # Add timeout to prevent WSL crashes from hanging cargo commands
+    if ! timeout 600 sh -c 'CARGO_BUILD_JOBS=2 cargo build --release --locked'; then
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "❌ Build timed out (10 minutes). This may indicate WSL/filesystem issues."
+            echo "   💡 Hint: Try SKIP_RELEASE_BUILD=true ./validate.sh to skip release build"
+            echo "   💡 Hint: Or try SKIP_CLEANUP=true ./validate.sh or restart WSL"
+            ERRORS=$((ERRORS + 1))
+        else
+            echo "❌ Build failed. Fix compilation errors before committing."
+            ERRORS=$((ERRORS + 1))
+        fi
+    else
+        echo "✅ Build OK"
+    fi
+    echo ""
 fi
-echo ""
 
 # 6. Cargo.lock validation
 echo "6️⃣  Validating Cargo.lock..."
@@ -615,9 +787,17 @@ if [ "$USE_FALLBACK" = "false" ] && [ -f "$VALIDATE_CONFIG_BIN" ]; then
     fi
 else
     # Fallback: basic cargo check
-    if ! cargo check --workspace > /dev/null 2>&1; then
-        echo "❌ Cargo.toml has issues. Check for version conflicts or missing dependencies."
-        CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+    # Add timeout to prevent WSL crashes
+    if ! timeout 300 cargo check --workspace > /dev/null 2>&1; then
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "❌ Cargo check timed out (5 minutes). This may indicate WSL/filesystem issues."
+            echo "   Try: SKIP_CLEANUP=true ./validate.sh or restart WSL"
+            CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+        else
+            echo "❌ Cargo.toml has issues. Check for version conflicts or missing dependencies."
+            CARGO_TOML_ERRORS=$((CARGO_TOML_ERRORS + 1))
+        fi
     else
         echo "✅ Cargo.toml OK"
     fi
@@ -896,9 +1076,10 @@ echo ""
 
 # 11. Check for duplicate dependencies
 echo "1️⃣1️⃣  Checking for duplicate dependencies..."
-if cargo tree --duplicates 2>/dev/null | grep -q "(*)$"; then
+# Add timeout to prevent WSL crashes
+if timeout 60 cargo tree --duplicates 2>/dev/null | grep -q "(*)$"; then
     # Count types of duplicates
-    DUPS_OUTPUT=$(cargo tree --duplicates 2>/dev/null)
+    DUPS_OUTPUT=$(timeout 60 cargo tree --duplicates 2>/dev/null)
     WINDOWS_DUPS=$(echo "$DUPS_OUTPUT" | grep "windows_" | wc -l)
     
     echo "✅ Duplicate dependencies found (normal for complex projects)"
@@ -1036,8 +1217,9 @@ echo ""
     if command -v cargo-audit > /dev/null 2>&1; then
         echo "   Running cargo-audit (vulnerabilities)..."
         # Ignore RUSTSEC-2023-0071 (rsa Marvin Attack): transitive via sqlx-mysql, no fix available
-        if ! cargo audit --ignore RUSTSEC-2023-0071; then
-            echo "⚠️  cargo-audit found issues. Review and fix vulnerabilities." || true
+        # Add timeout to prevent WSL crashes from hanging network operations
+        if ! timeout 60 cargo audit --ignore RUSTSEC-2023-0071 2>&1; then
+            echo "⚠️  cargo-audit found issues, timed out, or failed. Review and fix vulnerabilities." || true
         else
             echo "✅ cargo-audit OK (with documented exceptions: RUSTSEC-2023-0071)"
         fi
@@ -1047,8 +1229,9 @@ echo ""
 
     if command -v cargo-deny > /dev/null 2>&1; then
         echo "   Running cargo-deny (policies)..."
-        if ! cargo deny check; then
-            echo "⚠️  cargo-deny reported policy issues. Review deny.toml and fixes." || true
+        # Add timeout to prevent WSL crashes from hanging operations
+        if ! timeout 60 cargo deny check 2>&1; then
+            echo "⚠️  cargo-deny reported policy issues, timed out, or failed. Review deny.toml and fixes." || true
         else
             echo "✅ cargo-deny OK"
         fi
@@ -1061,8 +1244,9 @@ echo ""
     echo "1️⃣5️⃣  Optional SQLX prepare / migrations (if DATABASE_URL set)"
     if [ -n "${DATABASE_URL:-}" ] && command -v cargo-sqlx > /dev/null 2>&1; then
         echo "   Preparing SQLX (cargo sqlx prepare)..."
-        if ! cargo sqlx prepare -- --lib; then
-            echo "⚠️  cargo sqlx prepare failed - ensure DATABASE_URL points to a writable DB or skip this check." || true
+        # Add timeout to prevent WSL crashes from hanging database connections
+        if ! timeout 30 cargo sqlx prepare -- --lib 2>&1; then
+            echo "⚠️  cargo sqlx prepare failed or timed out - ensure DATABASE_URL points to a writable DB or skip this check." || true
         else
             echo "✅ cargo sqlx prepare OK"
         fi
@@ -1132,19 +1316,19 @@ echo ""
         
         # Check if neonctl is available (via npx)
         if command -v npx > /dev/null 2>&1; then
-            # Test neonctl version
-            if npx --yes neonctl --version > /dev/null 2>&1; then
+            # Test neonctl version (with timeout to prevent WSL crashes from hanging network calls)
+            if timeout 15 npx --yes neonctl --version > /dev/null 2>&1; then
                 echo "   ✅ neonctl available via npx"
                 
-                # Test authentication by listing branches
-                if npx --yes neonctl branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
+                # Test authentication by listing branches (with timeout to prevent WSL crashes)
+                if timeout 20 npx --yes neonctl branches list --project "$NEON_PROJECT_ID" --output json > /dev/null 2>&1; then
                     echo "   ✅ Neon CLI authentication OK (can list branches)"
                 else
-                    echo "   ⚠️  Neon CLI authentication failed or key lacks permissions"
+                    echo "   ⚠️  Neon CLI authentication failed, timed out, or key lacks permissions"
                     echo "      (This may be OK if using a restricted org key - create/delete should still work)"
                 fi
             else
-                echo "   ⚠️  neonctl not available via npx (install: npm install -g neonctl or use npx)"
+                echo "   ⚠️  neonctl not available via npx or timed out (install: npm install -g neonctl or use npx)"
             fi
         else
             echo "   ⚠️  npx not available - cannot test neonctl (install: npm install -g npm)"

@@ -123,20 +123,57 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
         )
         .execute(&pool)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("Failed to ensure _sqlx_migrations table exists: {}", e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("Failed to ensure _sqlx_migrations table exists: {}", e))?;
 
         // Verify the table exists by querying it (ensures it's committed and visible)
-        sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to verify _sqlx_migrations table exists (table may not be visible yet): {}",
-                    e
-                )
-            })?;
+        // Retry with exponential backoff to handle race conditions when multiple tests
+        // create the table concurrently or when there are visibility delays
+        let mut retries = 0;
+        let max_retries = 5;
+        loop {
+            match sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+            {
+                Ok(_) => break, // Table exists and is visible
+                Err(e) if retries < max_retries => {
+                    // Check if it's a "does not exist" error (relation not found)
+                    let error_str = e.to_string();
+                    if error_str.contains("does not exist") || error_str.contains("relation") {
+                        retries += 1;
+                        let delay_ms = 50 * (1 << retries); // 100ms, 200ms, 400ms, 800ms, 1600ms
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        // Try recreating the table in case it was dropped by another concurrent test
+                        let _ = sqlx::query(
+                            "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                                version BIGINT PRIMARY KEY,
+                                description TEXT NOT NULL,
+                                installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                success BOOLEAN NOT NULL,
+                                checksum BYTEA NOT NULL,
+                                execution_time BIGINT NOT NULL
+                            )",
+                        )
+                        .execute(&pool)
+                        .await;
+                        continue;
+                    } else {
+                        // Different error - fail immediately
+                        return Err(anyhow::anyhow!(
+                            "Failed to verify _sqlx_migrations table exists: {}",
+                            e
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to verify _sqlx_migrations table exists after {} retries: {}",
+                        max_retries,
+                        e
+                    ));
+                }
+            }
+        }
 
         let mut should_run = true;
         {
@@ -196,15 +233,51 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     })?;
 
                     // Verify the table exists after recreation
-                    sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
-                        .fetch_optional(&pool)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to verify _sqlx_migrations table exists after recreation: {}",
-                                e
-                            )
-                        })?;
+                    // Retry with exponential backoff to handle race conditions
+                    let mut retries = 0;
+                    let max_retries = 5;
+                    loop {
+                        match sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
+                            .fetch_optional(&pool)
+                            .await
+                        {
+                            Ok(_) => break, // Table exists and is visible
+                            Err(e) if retries < max_retries => {
+                                let error_str = e.to_string();
+                                if error_str.contains("does not exist") || error_str.contains("relation") {
+                                    retries += 1;
+                                    let delay_ms = 50 * (1 << retries); // 100ms, 200ms, 400ms, 800ms, 1600ms
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                    // Try recreating the table in case it was dropped by another concurrent test
+                                    let _ = sqlx::query(
+                                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                                            version BIGINT PRIMARY KEY,
+                                            description TEXT NOT NULL,
+                                            installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                            success BOOLEAN NOT NULL,
+                                            checksum BYTEA NOT NULL,
+                                            execution_time BIGINT NOT NULL
+                                        )",
+                                    )
+                                    .execute(&pool)
+                                    .await;
+                                    continue;
+                                } else {
+                                    return Err(anyhow::anyhow!(
+                                        "Failed to verify _sqlx_migrations table exists after recreation: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "Failed to verify _sqlx_migrations table exists after recreation (after {} retries): {}",
+                                    max_retries,
+                                    e
+                                ));
+                            }
+                        }
+                    }
 
                     // Clean up partially applied migrations - fix inconsistent database state
                     // This handles cases where tables exist but are missing required columns
