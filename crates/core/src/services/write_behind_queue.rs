@@ -9,9 +9,133 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// Async logging helpers - fire-and-forget to avoid blocking operations
+/// All logging is spawned as separate tasks to ensure 0ms impact on critical path
+mod async_log {
+    use super::*;
+
+    /// Log batch flush summary (async, non-blocking)
+    pub fn log_batch_flush(
+        batch_size: usize,
+        flush_duration_ms: u64,
+        pulsar_count: usize,
+        buyer_count: usize,
+        lead_count: usize,
+        payload_count: usize,
+        creation_count: usize,
+    ) {
+        tokio::spawn(async move {
+            // Must have: Batch flush timing (especially if slow)
+            if flush_duration_ms > 500 {
+                tracing::warn!(
+                    target: "write_behind_queue",
+                    operation = "batch_flush",
+                    batch_size = batch_size,
+                    flush_duration_ms = flush_duration_ms,
+                    pulsar_logs = pulsar_count,
+                    buyer_responses = buyer_count,
+                    lead_updates = lead_count,
+                    payload_updates = payload_count,
+                    lead_creations = creation_count,
+                    "Slow background DB batch flush"
+                );
+            } else {
+                // Nice to have: Batch flush frequency (info level for monitoring)
+                tracing::info!(
+                    target: "write_behind_queue",
+                    operation = "batch_flush",
+                    batch_size = batch_size,
+                    flush_duration_ms = flush_duration_ms,
+                    "Background DB batch flushed"
+                );
+            }
+        });
+    }
+
+    /// Log lead creation duration (async, non-blocking)
+    pub fn log_lead_creation(lead_uuid: Uuid, duration_ms: u64) {
+        tokio::spawn(async move {
+            // Must have: Lead creation duration (especially if slow)
+            if duration_ms > 500 {
+                tracing::warn!(
+                    target: "write_behind_queue",
+                    operation = "lead_creation",
+                    lead_id = %lead_uuid,
+                    duration_ms = duration_ms,
+                    "Slow lead creation (encryption/DB write)"
+                );
+            } else {
+                // Nice to have: Per-operation duration when fast (debug level)
+                tracing::debug!(
+                    target: "write_behind_queue",
+                    operation = "lead_creation",
+                    lead_id = %lead_uuid,
+                    duration_ms = duration_ms,
+                    "Lead created in background"
+                );
+            }
+        });
+    }
+
+    /// Log lead update (async, non-blocking)
+    pub fn log_lead_update(lead_id: Uuid, status: LeadStatus, duration_ms: u64) {
+        tokio::spawn(async move {
+            // Must have: Lead status changes (especially Sold transitions)
+            let is_sold = matches!(status, LeadStatus::Sold);
+            let is_slow = duration_ms > 200;
+
+            if is_sold || is_slow {
+                tracing::info!(
+                    target: "write_behind_queue",
+                    operation = "lead_update",
+                    lead_id = %lead_id,
+                    status = ?status,
+                    duration_ms = duration_ms,
+                    "Lead updated in background"
+                );
+            } else {
+                // Nice to have: Per-operation duration when fast (debug level)
+                tracing::debug!(
+                    target: "write_behind_queue",
+                    operation = "lead_update",
+                    lead_id = %lead_id,
+                    status = ?status,
+                    duration_ms = duration_ms,
+                    "Lead updated"
+                );
+            }
+        });
+    }
+
+    /// Log buyer response batch insert (async, non-blocking)
+    pub fn log_buyer_responses_batch(count: usize, duration_ms: u64) {
+        tokio::spawn(async move {
+            // Must have: Batch sizes (helps spot batching issues)
+            // Nice to have: Per-operation duration when slow
+            if duration_ms > 200 {
+                tracing::warn!(
+                    target: "write_behind_queue",
+                    operation = "buyer_responses_batch",
+                    count = count,
+                    duration_ms = duration_ms,
+                    "Slow buyer responses batch insert"
+                );
+            } else {
+                tracing::debug!(
+                    target: "write_behind_queue",
+                    operation = "buyer_responses_batch",
+                    count = count,
+                    duration_ms = duration_ms,
+                    "Buyer responses persisted"
+                );
+            }
+        });
+    }
+}
 
 // Type aliases to reduce complexity
 type BuyerResponseTuple = (
@@ -212,6 +336,8 @@ impl WriteBehindQueue {
             return;
         }
 
+        let flush_start = Instant::now();
+
         // Group tasks by type for batch processing
         let mut pulsar_logs = Vec::new();
         let mut buyer_responses = Vec::new();
@@ -289,6 +415,12 @@ impl WriteBehindQueue {
             }
         }
 
+        let batch_size = pulsar_logs.len()
+            + buyer_responses.len()
+            + lead_updates.len()
+            + payload_updates.len()
+            + lead_creations.len();
+
         // Execute batches in parallel
         let (pulsar_result, buyer_result, lead_result, payload_result, creation_result) = tokio::join!(
             Self::batch_insert_pulsar_logs(&pulsar_logs, pool),
@@ -296,6 +428,19 @@ impl WriteBehindQueue {
             Self::batch_update_leads(&lead_updates, pool),
             Self::batch_update_payloads(&payload_updates, pool),
             Self::batch_create_leads(&lead_creations, pool),
+        );
+
+        let flush_duration_ms = flush_start.elapsed().as_millis() as u64;
+
+        // Log batch flush summary (async, non-blocking - 0ms impact)
+        async_log::log_batch_flush(
+            batch_size,
+            flush_duration_ms,
+            pulsar_logs.len(),
+            buyer_responses.len(),
+            lead_updates.len(),
+            payload_updates.len(),
+            lead_creations.len(),
         );
 
         // Log errors (non-blocking)
@@ -361,6 +506,8 @@ impl WriteBehindQueue {
             return Ok(());
         }
 
+        let insert_start = Instant::now();
+
         // Use existing batch_insert_buyer_responses from ping_tree_router
         // For now, insert individually (can optimize later with UNNEST)
         for (lead_id, campaign_id, ping_id, post_id, buyer_id, payload) in responses {
@@ -380,6 +527,11 @@ impl WriteBehindQueue {
             .execute(pool)
             .await;
         }
+
+        let insert_duration_ms = insert_start.elapsed().as_millis() as u64;
+
+        // Log buyer response batch insert (async, non-blocking - 0ms impact)
+        async_log::log_buyer_responses_batch(responses.len(), insert_duration_ms);
 
         Ok(())
     }
@@ -404,6 +556,7 @@ impl WriteBehindQueue {
             vertical_data,
         ) in updates
         {
+            let update_start = Instant::now();
             if *sold_at && *status == LeadStatus::Sold {
                 // Update with sold_at and conditional post_id check
                 if let Some(token) = inprog_token {
@@ -421,7 +574,15 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let update_duration_ms = update_start.elapsed().as_millis() as u64;
+                            // Log lead update (async, non-blocking - 0ms impact)
+                            async_log::log_lead_update(
+                                *lead_id,
+                                status.clone(),
+                                update_duration_ms,
+                            );
+                        }
                         Err(e) => {
                             tracing::error!(
                                 "Failed to update lead {} to sold status: {}",
@@ -444,7 +605,15 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let update_duration_ms = update_start.elapsed().as_millis() as u64;
+                            // Log lead update (async, non-blocking - 0ms impact)
+                            async_log::log_lead_update(
+                                *lead_id,
+                                status.clone(),
+                                update_duration_ms,
+                            );
+                        }
                         Err(e) => {
                             tracing::error!(
                                 "Failed to update lead {} to sold status: {}",
@@ -489,7 +658,11 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let update_duration_ms = update_start.elapsed().as_millis() as u64;
+                            // Log lead update (async, non-blocking - 0ms impact)
+                            async_log::log_lead_update(*lead_id, status.clone(), update_duration_ms);
+                        }
                         Err(e) => {
                             tracing::error!("Failed to update lead {} status: {}", lead_id, e);
                         }
@@ -512,7 +685,11 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let update_duration_ms = update_start.elapsed().as_millis() as u64;
+                            // Log lead update (async, non-blocking - 0ms impact)
+                            async_log::log_lead_update(*lead_id, status.clone(), update_duration_ms);
+                        }
                         Err(e) => {
                             tracing::error!("Failed to update lead {} status: {}", lead_id, e);
                         }
@@ -692,6 +869,8 @@ impl WriteBehindQueue {
                     None
                 };
 
+                let creation_start = Instant::now();
+
                 // Start transaction
                 let mut tx = match pool.begin().await {
                     Ok(t) => t,
@@ -811,7 +990,9 @@ impl WriteBehindQueue {
                 if let Err(e) = tx.commit().await {
                     tracing::error!("Failed to commit transaction for lead {}: {}", lead_uuid, e);
                 } else {
-                    tracing::debug!("Successfully created lead {} in background", lead_uuid);
+                    let creation_duration_ms = creation_start.elapsed().as_millis() as u64;
+                    // Log lead creation (async, non-blocking - 0ms impact)
+                    async_log::log_lead_creation(lead_uuid, creation_duration_ms);
                 }
             }
         }

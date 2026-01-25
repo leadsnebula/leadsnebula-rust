@@ -24,7 +24,7 @@ mod optimization_tests {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
             return;
         }
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         let pool = create_test_pool().await.expect("DATABASE_URL required");
@@ -145,7 +145,7 @@ mod optimization_tests {
             return;
         }
 
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         let pool = create_test_pool().await.expect("DATABASE_URL required");
@@ -202,7 +202,7 @@ mod optimization_tests {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
             return;
         }
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         let pool = create_test_pool().await.expect("DATABASE_URL required");
@@ -243,7 +243,7 @@ mod optimization_tests {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
             return;
         }
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         let pool = create_test_pool().await.expect("DATABASE_URL required");
@@ -285,7 +285,7 @@ mod optimization_tests {
         }
         // Test that SSM key caching reduces actual SSM API calls
         // Note: This test requires SSM to be available or mocked
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         use crate::services::ssm_key_cache::get_ssm_parameter_cached;
@@ -362,7 +362,7 @@ mod optimization_tests {
             return;
         }
         // Test that write-behind queue handles database errors gracefully
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         let pool = create_test_pool().await.expect("DATABASE_URL required");
@@ -399,7 +399,7 @@ mod optimization_tests {
             return;
         }
         // Test that write-behind queue batches tasks correctly (flushes at 10 items)
-        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // EPHEMERAL_DB check removed - redundant since test scripts set it
         // Test will fail naturally if DATABASE_URL isn't set
 
         let pool = create_test_pool().await.expect("DATABASE_URL required");

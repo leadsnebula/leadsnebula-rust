@@ -43,14 +43,14 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
             "❌ REFUSED: Tests cannot run against main database.\n\
              \n\
              To run tests:\n\
-             1. Use ephemeral Neon branch: ./autotests.sh\n\
+             1. Use ephemeral Neon branch: ./testScripts/autotestsall.sh\n\
              2. Or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL\n\
              3. Or run in CI (CI=1 is set automatically)\n\
              \n\
              Current DATABASE_URL appears to be main DB (not ephemeral).\n\
              This prevents test data from polluting your main database.\n\
              \n\
-             If you need to run tests locally, use: ./autotests.sh"
+             If you need to run tests locally, use: ./testScripts/autotestsall.sh"
         ));
     }
 
@@ -501,8 +501,8 @@ pub async fn create_test_pool_with_transaction(
 /// Check if heavy tests should run
 /// Heavy tests are skipped by default in CI and fast iteration mode
 /// Check if heavy tests should run
-/// Relies on RUN_HEAVY_TESTS environment variable (set by autotests.sh)
-/// autotests.sh exports RUN_HEAVY_TESTS=true by default for local runs
+/// Relies on RUN_HEAVY_TESTS environment variable (set by test scripts)
+/// Test scripts export RUN_HEAVY_TESTS=true by default for local runs
 /// CI does not set this variable, so heavy tests are skipped in CI
 pub fn should_run_heavy_tests() -> bool {
     std::env::var("RUN_HEAVY_TESTS")

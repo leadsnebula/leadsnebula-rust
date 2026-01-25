@@ -229,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
             let state_for_warmup = state.clone();
             let state_for_periodic = Arc::new(state.clone());
             let write_behind_queue_for_shutdown = state.write_behind_queue.clone();
+            let pool_for_keepalive = state.db_pool.clone();
 
             let app = axum::Router::new()
                 .route("/live", axum::routing::get(routes::health::liveness_check))
@@ -280,6 +281,37 @@ async fn main() -> anyhow::Result<()> {
             // Start periodic cache warm-up task (runs every 30 minutes)
             tokio::spawn(async move {
                 cache_warmup::start_periodic_warmup(state_for_periodic).await;
+            });
+
+            // Keep Neon warm (prevents 5-6s cold starts on free tier)
+            // Runs every 4 minutes to prevent auto-suspend (free tier suspends after 5 min)
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(240)); // 4 min
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let start = std::time::Instant::now();
+                    match sqlx::query("SELECT 1")
+                        .execute(pool_for_keepalive.as_ref())
+                        .await
+                    {
+                        Ok(_) => {
+                            let duration_ms = start.elapsed().as_millis();
+                            // Only log if slow (should be <10ms normally, >50ms indicates potential cold start)
+                            if duration_ms > 50 {
+                                tracing::warn!(
+                                    neon_keepalive_ms = duration_ms,
+                                    "Neon keep-alive slow (may indicate cold start)"
+                                );
+                            } else {
+                                tracing::debug!("Neon keep-alive OK ({}ms)", duration_ms);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Neon keep-alive failed: {}", e);
+                        }
+                    }
+                }
             });
 
             // Setup shutdown signal handler to flush write-behind queue

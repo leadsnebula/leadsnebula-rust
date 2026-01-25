@@ -2400,9 +2400,30 @@ async fn create_lead(
                     post_id: routing_result.post_id.clone(),
                     sold_at: routing_result.status == "sold",
                     inprog_token: None,
-                    vertical_data: Some(auction_timing_data),
+                    vertical_data: Some(auction_timing_data.clone()),
                 },
             );
+
+            // Log auction process summary (async, non-blocking - 0ms impact)
+            // Must have: Complete auction process visibility for troubleshooting
+            let auction_summary = serde_json::json!({
+                "lead_id": lead_uuid,
+                "request_type": request_type,
+                "ping_auction_ms": ping_auction_ms,
+                "post_ms": post_sent_ms,
+                "total_ms": total_ms,
+                "winner_campaign_id": routing_result.campaign_id,
+                "winner_buyer_id": routing_result.buyer_id,
+                "status": routing_result.status,
+                "success": routing_result.success,
+            });
+            tokio::spawn(async move {
+                tracing::info!(
+                    target: "auction_process",
+                    auction_summary = %serde_json::to_string(&auction_summary).unwrap_or_default(),
+                    "Auction process completed"
+                );
+            });
 
             // Single-line auction duration summary (WARN level to ensure visibility in production)
             if request_type == "ping" {

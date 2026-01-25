@@ -56,5 +56,11 @@ Thumbs.db
 .cursorrules
 
 # CI/CD and infrastructure files (not committed)
-validate.sh
+# Note: validate.sh in root is ignored, but testScripts/validate.sh should be committed
+/validate.sh
 iam-policy.json
+
+# Test scripts in root directory (moved from testScripts/)
+test-*.sh
+common_setup.sh
+autotestsall.sh

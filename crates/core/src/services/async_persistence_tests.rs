@@ -11,7 +11,7 @@ mod async_persistence_tests {
     use uuid::Uuid;
 
     #[tokio::test]
-    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
+    #[ignore] // Requires ephemeral DB; run via ./testScripts/autotestsall.sh
     async fn test_async_persistence_does_not_block_routing() {
         if !crate::test_helpers::should_run_heavy_tests() {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
@@ -19,7 +19,7 @@ mod async_persistence_tests {
         }
         if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
             eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+                "Skipping: run ./testScripts/autotestsall.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
             );
             return;
         }
@@ -244,7 +244,7 @@ mod async_persistence_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires ephemeral DB; run via ./autotests.sh
+    #[ignore] // Requires ephemeral DB; run via ./testScripts/autotestsall.sh
     async fn test_async_persistence_handles_errors_gracefully() {
         if !crate::test_helpers::should_run_heavy_tests() {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
@@ -252,7 +252,7 @@ mod async_persistence_tests {
         }
         if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
             eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
+                "Skipping: run ./testScripts/autotestsall.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
             );
             return;
         }
