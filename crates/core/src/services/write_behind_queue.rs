@@ -32,6 +32,7 @@ type LeadUpdateTuple = (
     Option<String>,
     bool,           // sold_at
     Option<String>, // inprog_token
+    Option<Value>,  // vertical_data (JSONB)
 );
 type PayloadUpdateTuple = (
     Uuid,
@@ -67,6 +68,7 @@ pub enum BackgroundTask {
         post_id: Option<String>,
         sold_at: bool, // If true, set sold_at = NOW() when status = LeadStatus::Sold
         inprog_token: Option<String>, // For conditional update (WHERE post_id = inprog_token)
+        vertical_data: Option<Value>, // Optional JSONB data (e.g., auction timing)
     },
     /// Buyer response batch insert
     BuyerResponse {
@@ -251,6 +253,7 @@ impl WriteBehindQueue {
                     post_id,
                     sold_at,
                     inprog_token,
+                    vertical_data,
                 } => lead_updates.push((
                     lead_id,
                     status,
@@ -261,6 +264,7 @@ impl WriteBehindQueue {
                     post_id,
                     sold_at,
                     inprog_token,
+                    vertical_data,
                 )),
                 BackgroundTask::PayloadUpdate {
                     lead_id,
@@ -397,6 +401,7 @@ impl WriteBehindQueue {
             post_id,
             sold_at,
             inprog_token,
+            vertical_data,
         ) in updates
         {
             if *sold_at && *status == LeadStatus::Sold {
@@ -464,27 +469,53 @@ impl WriteBehindQueue {
                     tracing::error!("Failed to reset inprog_token for lead {}: {}", lead_id, e);
                 }
             } else {
-                // Standard update
-                match sqlx::query(
-                    r#"
-                    UPDATE leads
-                    SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, updated_at = NOW()
-                    WHERE uuid = $1
-                    "#,
-                )
-                .bind(lead_id)
-                .bind(status)
-                .bind(campaign_id)
-                .bind(buyer_id)
-                .bind(promise_id)
-                .bind(ping_id)
-                .bind(post_id)
-                .execute(pool)
-                .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!("Failed to update lead {} status: {}", lead_id, e);
+                // Standard update (with optional vertical_data)
+                if let Some(vd) = vertical_data {
+                    match sqlx::query(
+                        r#"
+                        UPDATE leads
+                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, vertical_data = $8, updated_at = NOW()
+                        WHERE uuid = $1
+                        "#,
+                    )
+                    .bind(lead_id)
+                    .bind(status)
+                    .bind(campaign_id)
+                    .bind(buyer_id)
+                    .bind(promise_id)
+                    .bind(ping_id)
+                    .bind(post_id)
+                    .bind(sqlx::types::Json(vd))
+                    .execute(pool)
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to update lead {} status: {}", lead_id, e);
+                        }
+                    }
+                } else {
+                    match sqlx::query(
+                        r#"
+                        UPDATE leads
+                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, updated_at = NOW()
+                        WHERE uuid = $1
+                        "#,
+                    )
+                    .bind(lead_id)
+                    .bind(status)
+                    .bind(campaign_id)
+                    .bind(buyer_id)
+                    .bind(promise_id)
+                    .bind(ping_id)
+                    .bind(post_id)
+                    .execute(pool)
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to update lead {} status: {}", lead_id, e);
+                        }
                     }
                 }
             }

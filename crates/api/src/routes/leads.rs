@@ -167,13 +167,14 @@ async fn create_lead(
     Extension(publisher): Extension<Publisher>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     Json(payload): Json<LeadRequest>,
-) -> Result<Json<LeadResponse>, StatusCode> {
+) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
     // Initialize timing and metrics
     let timing = Arc::new(AtomicAuctionTiming::new());
     let metrics = Arc::new(DiagnosticMetrics::new());
 
-    // Check for minimal mode
+    // Check for minimal mode and async mode
     let minimal_mode = params.get("minimal").map(|v| v == "true").unwrap_or(false);
+    let async_mode = params.get("async").map(|v| v == "true").unwrap_or(false);
 
     let request_level_verbose = if minimal_mode {
         false // Skip verbose in minimal mode
@@ -261,66 +262,72 @@ async fn create_lead(
     let vertical = match vertical_result {
         Ok(Some(v)) => v,
         Ok(None) => {
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(format!("Invalid vertical: {}", lead_data.vertical)),
-                    error: Some(format!("Invalid vertical slug: {}", lead_data.vertical)),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_400",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 400
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(400),
-            }));
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some(format!("Invalid vertical: {}", lead_data.vertical)),
+                        error: Some(format!("Invalid vertical slug: {}", lead_data.vertical)),
+                    },
+                    lead: LeadNode {
+                        promise_id: None,
+                        lead_id: None,
+                        lead_uuid: None,
+                        ping_id: None,
+                        bid: None,
+                        post_id: None,
+                        price: None,
+                    },
+                    verbose: if verbose_requested {
+                        Some(serde_json::json!({
+                            "error_code": "ERR_400",
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "endpoint": "POST /api/v1/leads",
+                            "status_code": 400
+                        }))
+                    } else {
+                        None
+                    },
+                    http_status: Some(400),
+                }),
+            ));
         }
         Err(e) => {
             tracing::error!("Database error finding vertical: {}", e);
             let (message, technical) = map_error_to_user(&e.to_string());
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(message),
-                    error: Some(technical),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_500",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 500
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(500),
-            }));
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some(message),
+                        error: Some(technical),
+                    },
+                    lead: LeadNode {
+                        promise_id: None,
+                        lead_id: None,
+                        lead_uuid: None,
+                        ping_id: None,
+                        bid: None,
+                        post_id: None,
+                        price: None,
+                    },
+                    verbose: if verbose_requested {
+                        Some(serde_json::json!({
+                            "error_code": "ERR_500",
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "endpoint": "POST /api/v1/leads",
+                            "status_code": 500
+                        }))
+                    } else {
+                        None
+                    },
+                    http_status: Some(500),
+                }),
+            ));
         }
     };
 
@@ -329,7 +336,7 @@ async fn create_lead(
         let provided_uuid = uuid::Uuid::parse_str(provided_publisher_id).ok();
         if let Some(provided_uuid) = provided_uuid {
             if provided_uuid != publisher.id {
-                return Ok(Json(LeadResponse {
+                return Ok((StatusCode::BAD_REQUEST, Json(LeadResponse {
                     status: StatusNode {
                         success: false,
                         status: "error".to_string(),
@@ -358,58 +365,24 @@ async fn create_lead(
                         None
                     },
                     http_status: Some(401),
-                }));
+                })));
             }
         } else {
             // Invalid UUID format
-            return Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(format!(
-                        "Invalid publisher_id format: {}",
-                        provided_publisher_id
-                    )),
-                    error: Some(format!(
-                        "Invalid UUID format for publisher_id: {}",
-                        provided_publisher_id
-                    )),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_400",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 400
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(400),
-            }));
-        }
-    }
-
-    // Handle post request (update existing lead)
-    if request_type == "post" {
-        let promise_id = match lead_data.promise_id {
-            Some(ref p) => p.clone(),
-            None => {
-                return Ok(Json(LeadResponse {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(LeadResponse {
                     status: StatusNode {
                         success: false,
                         status: "error".to_string(),
-                        message: None,
-                        error: Some("Missing promise_id for post request".to_string()),
+                        message: Some(format!(
+                            "Invalid publisher_id format: {}",
+                            provided_publisher_id
+                        )),
+                        error: Some(format!(
+                            "Invalid UUID format for publisher_id: {}",
+                            provided_publisher_id
+                        )),
                     },
                     lead: LeadNode {
                         promise_id: None,
@@ -425,14 +398,54 @@ async fn create_lead(
                             "error_code": "ERR_400",
                             "timestamp": Utc::now().to_rfc3339(),
                             "endpoint": "POST /api/v1/leads",
-                            "status_code": 400,
-                            "note": "Post requests must include a promise_id"
+                            "status_code": 400
                         }))
                     } else {
                         None
                     },
                     http_status: Some(400),
-                }));
+                }),
+            ));
+        }
+    }
+
+    // Handle post request (update existing lead)
+    if request_type == "post" {
+        let promise_id = match lead_data.promise_id {
+            Some(ref p) => p.clone(),
+            None => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: None,
+                            error: Some("Missing promise_id for post request".to_string()),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": "ERR_400",
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 400,
+                                "note": "Post requests must include a promise_id"
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(400),
+                    }),
+                ));
             }
         };
         // CACHE: Lead lookup by promise_id (5m TTL - leads don't change after creation)
@@ -451,66 +464,72 @@ async fn create_lead(
             {
                 Ok(Some(l)) => l,
                 Ok(None) => {
-                    return Ok(Json(LeadResponse {
-                        status: StatusNode {
-                            success: false,
-                            status: "error".to_string(),
-                            message: None,
-                            error: Some("Lead not found".to_string()),
-                        },
-                        lead: LeadNode {
-                            promise_id: None,
-                            lead_id: None,
-                            lead_uuid: None,
-                            ping_id: None,
-                            bid: None,
-                            post_id: None,
-                            price: None,
-                        },
-                        verbose: if verbose_requested {
-                            Some(serde_json::json!({
-                                "error_code": format!("ERR_{}", 404),
-                                "timestamp": Utc::now().to_rfc3339(),
-                                "endpoint": "POST /api/v1/leads",
-                                "status_code": 404
-                            }))
-                        } else {
-                            None
-                        },
-                        http_status: Some(404),
-                    }));
+                    return Ok((
+                        StatusCode::NOT_FOUND,
+                        Json(LeadResponse {
+                            status: StatusNode {
+                                success: false,
+                                status: "error".to_string(),
+                                message: None,
+                                error: Some("Lead not found".to_string()),
+                            },
+                            lead: LeadNode {
+                                promise_id: None,
+                                lead_id: None,
+                                lead_uuid: None,
+                                ping_id: None,
+                                bid: None,
+                                post_id: None,
+                                price: None,
+                            },
+                            verbose: if verbose_requested {
+                                Some(serde_json::json!({
+                                    "error_code": format!("ERR_{}", 404),
+                                    "timestamp": Utc::now().to_rfc3339(),
+                                    "endpoint": "POST /api/v1/leads",
+                                    "status_code": 404
+                                }))
+                            } else {
+                                None
+                            },
+                            http_status: Some(404),
+                        }),
+                    ));
                 }
                 Err(e) => {
                     tracing::error!("Database error finding lead: {}", e);
                     let (message, technical) = map_error_to_user(&e.to_string());
-                    return Ok(Json(LeadResponse {
-                        status: StatusNode {
-                            success: false,
-                            status: "error".to_string(),
-                            message: Some(message),
-                            error: Some(technical),
-                        },
-                        lead: LeadNode {
-                            promise_id: None,
-                            lead_id: None,
-                            lead_uuid: None,
-                            ping_id: None,
-                            bid: None,
-                            post_id: None,
-                            price: None,
-                        },
-                        verbose: if verbose_requested {
-                            Some(serde_json::json!({
-                                "error_code": "ERR_500",
-                                "timestamp": Utc::now().to_rfc3339(),
-                                "endpoint": "POST /api/v1/leads",
-                                "status_code": 500
-                            }))
-                        } else {
-                            None
-                        },
-                        http_status: Some(500),
-                    }));
+                    return Ok((
+                        StatusCode::BAD_REQUEST,
+                        Json(LeadResponse {
+                            status: StatusNode {
+                                success: false,
+                                status: "error".to_string(),
+                                message: Some(message),
+                                error: Some(technical),
+                            },
+                            lead: LeadNode {
+                                promise_id: None,
+                                lead_id: None,
+                                lead_uuid: None,
+                                ping_id: None,
+                                bid: None,
+                                post_id: None,
+                                price: None,
+                            },
+                            verbose: if verbose_requested {
+                                Some(serde_json::json!({
+                                    "error_code": "ERR_500",
+                                    "timestamp": Utc::now().to_rfc3339(),
+                                    "endpoint": "POST /api/v1/leads",
+                                    "status_code": 500
+                                }))
+                            } else {
+                                None
+                            },
+                            http_status: Some(500),
+                        }),
+                    ));
                 }
             }
         } else {
@@ -523,66 +542,72 @@ async fn create_lead(
             {
                 Ok(Some(l)) => l,
                 Ok(None) => {
-                    return Ok(Json(LeadResponse {
-                        status: StatusNode {
-                            success: false,
-                            status: "error".to_string(),
-                            message: None,
-                            error: Some("Lead not found".to_string()),
-                        },
-                        lead: LeadNode {
-                            promise_id: None,
-                            lead_id: None,
-                            lead_uuid: None,
-                            ping_id: None,
-                            bid: None,
-                            post_id: None,
-                            price: None,
-                        },
-                        verbose: if verbose_requested {
-                            Some(serde_json::json!({
-                                "error_code": format!("ERR_{}", 404),
-                                "timestamp": Utc::now().to_rfc3339(),
-                                "endpoint": "POST /api/v1/leads",
-                                "status_code": 404
-                            }))
-                        } else {
-                            None
-                        },
-                        http_status: Some(404),
-                    }));
+                    return Ok((
+                        StatusCode::NOT_FOUND,
+                        Json(LeadResponse {
+                            status: StatusNode {
+                                success: false,
+                                status: "error".to_string(),
+                                message: None,
+                                error: Some("Lead not found".to_string()),
+                            },
+                            lead: LeadNode {
+                                promise_id: None,
+                                lead_id: None,
+                                lead_uuid: None,
+                                ping_id: None,
+                                bid: None,
+                                post_id: None,
+                                price: None,
+                            },
+                            verbose: if verbose_requested {
+                                Some(serde_json::json!({
+                                    "error_code": format!("ERR_{}", 404),
+                                    "timestamp": Utc::now().to_rfc3339(),
+                                    "endpoint": "POST /api/v1/leads",
+                                    "status_code": 404
+                                }))
+                            } else {
+                                None
+                            },
+                            http_status: Some(404),
+                        }),
+                    ));
                 }
                 Err(e) => {
                     tracing::error!("Database error finding lead: {}", e);
                     let (message, technical) = map_error_to_user(&e.to_string());
-                    return Ok(Json(LeadResponse {
-                        status: StatusNode {
-                            success: false,
-                            status: "error".to_string(),
-                            message: Some(message),
-                            error: Some(technical),
-                        },
-                        lead: LeadNode {
-                            promise_id: None,
-                            lead_id: None,
-                            lead_uuid: None,
-                            ping_id: None,
-                            bid: None,
-                            post_id: None,
-                            price: None,
-                        },
-                        verbose: if verbose_requested {
-                            Some(serde_json::json!({
-                                "error_code": "ERR_500",
-                                "timestamp": Utc::now().to_rfc3339(),
-                                "endpoint": "POST /api/v1/leads",
-                                "status_code": 500
-                            }))
-                        } else {
-                            None
-                        },
-                        http_status: Some(500),
-                    }));
+                    return Ok((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(LeadResponse {
+                            status: StatusNode {
+                                success: false,
+                                status: "error".to_string(),
+                                message: Some(message),
+                                error: Some(technical),
+                            },
+                            lead: LeadNode {
+                                promise_id: None,
+                                lead_id: None,
+                                lead_uuid: None,
+                                ping_id: None,
+                                bid: None,
+                                post_id: None,
+                                price: None,
+                            },
+                            verbose: if verbose_requested {
+                                Some(serde_json::json!({
+                                    "error_code": "ERR_500",
+                                    "timestamp": Utc::now().to_rfc3339(),
+                                    "endpoint": "POST /api/v1/leads",
+                                    "status_code": 500
+                                }))
+                            } else {
+                                None
+                            },
+                            http_status: Some(500),
+                        }),
+                    ));
                 }
             }
         };
@@ -611,69 +636,75 @@ async fn create_lead(
                 // We have claimed this promise for this process. Proceed to route the post.
             }
             Ok(None) => {
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some(
-                            "Lead has already been posted/sold or promise expired".to_string(),
-                        ),
-                        error: Some("duplicate_or_expired_promise".to_string()),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: lead.lead_id.clone(),
-                        lead_uuid: Some(lead.uuid.to_string()),
-                        ping_id: lead.ping_id.clone(),
-                        bid: None,
-                        post_id: lead.post_id.clone(),
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": "ERR_400",
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 400,
-                            "note": "Duplicate post attempt or promise expired"
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(400),
-                }));
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: Some(
+                                "Lead has already been posted/sold or promise expired".to_string(),
+                            ),
+                            error: Some("duplicate_or_expired_promise".to_string()),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: lead.lead_id.clone(),
+                            lead_uuid: Some(lead.uuid.to_string()),
+                            ping_id: lead.ping_id.clone(),
+                            bid: None,
+                            post_id: lead.post_id.clone(),
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": "ERR_400",
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 400,
+                                "note": "Duplicate post attempt or promise expired"
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(400),
+                    }),
+                ));
             }
             Err(e) => {
                 tracing::error!("Database error claiming promise: {}", e);
                 let (message, technical) = map_error_to_user(&e.to_string());
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some(message),
-                        error: Some(technical),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: None,
-                        lead_uuid: None,
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": "ERR_500",
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 500
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(500),
-                }));
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: Some(message),
+                            error: Some(technical),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": "ERR_500",
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 500
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(500),
+                    }),
+                ));
             }
         }
 
@@ -976,6 +1007,7 @@ async fn create_lead(
                             post_id: routing_result.post_id.clone(),
                             sold_at: true,
                             inprog_token: Some(inprog_token.clone()),
+                            vertical_data: None,
                         },
                     );
                 } else {
@@ -991,75 +1023,82 @@ async fn create_lead(
                             post_id: Some("".to_string()),
                             sold_at: false,
                             inprog_token: Some(inprog_token.clone()),
+                            vertical_data: None,
                         },
                     );
                 }
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success,
-                        status,
-                        message,
-                        error: routing_result.error.clone(),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: lead.lead_id.clone(),
-                        lead_uuid: Some(lead.uuid.to_string()),
-                        ping_id: None,
-                        bid: None,
-                        post_id: routing_result.post_id.clone(),
-                        price: rounded_price,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": format!("ERR_{}", if success {200} else {500}),
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": if success {200} else {500},
-                            "routing": {
-                                "buyer_name": buyer_name,
-                                "buyer_id": routing_result.buyer_id.map(|b| b.to_string()),
-                                "campaign_name": campaign_name,
-                                "campaign_id": routing_result.campaign_id.map(|c| c.to_string())
-                            }
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(if success { 200 } else { 500 }),
-                }));
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(LeadResponse {
+                        status: StatusNode {
+                            success,
+                            status,
+                            message,
+                            error: routing_result.error.clone(),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: lead.lead_id.clone(),
+                            lead_uuid: Some(lead.uuid.to_string()),
+                            ping_id: None,
+                            bid: None,
+                            post_id: routing_result.post_id.clone(),
+                            price: rounded_price,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": format!("ERR_{}", if success {200} else {500}),
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": if success {200} else {500},
+                                "routing": {
+                                    "buyer_name": buyer_name,
+                                    "buyer_id": routing_result.buyer_id.map(|b| b.to_string()),
+                                    "campaign_name": campaign_name,
+                                    "campaign_id": routing_result.campaign_id.map(|c| c.to_string())
+                                }
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(if success { 200 } else { 500 }),
+                    }),
+                ));
             }
             Err(e) => {
                 tracing::error!("Routing error during post: {}", e);
                 let (message, technical) = map_error_to_user(&e.to_string());
-                return Ok(Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some(message),
-                        error: Some(technical),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: None,
-                        lead_uuid: None,
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": "ERR_500",
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 500
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(500),
-                }));
+                return Ok((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(LeadResponse {
+                        status: StatusNode {
+                            success: false,
+                            status: "error".to_string(),
+                            message: Some(message),
+                            error: Some(technical),
+                        },
+                        lead: LeadNode {
+                            promise_id: None,
+                            lead_id: None,
+                            lead_uuid: None,
+                            ping_id: None,
+                            bid: None,
+                            post_id: None,
+                            price: None,
+                        },
+                        verbose: if verbose_requested {
+                            Some(serde_json::json!({
+                                "error_code": "ERR_500",
+                                "timestamp": Utc::now().to_rfc3339(),
+                                "endpoint": "POST /api/v1/leads",
+                                "status_code": 500
+                            }))
+                        } else {
+                            None
+                        },
+                        http_status: Some(500),
+                    }),
+                ));
             }
         }
     }
@@ -1456,37 +1495,40 @@ async fn create_lead(
 
     if !preproblems.is_empty() {
         let message = preproblems.join("\n");
-        return Ok(Json(LeadResponse {
-            status: StatusNode {
-                success: false,
-                status: "error".to_string(),
-                message: Some(message.clone()),
-                error: Some(format!(
-                    "pre-check failures: {}",
-                    message.replace("\n", ", ")
-                )),
-            },
-            lead: LeadNode {
-                promise_id: None,
-                lead_id: None,
-                lead_uuid: None,
-                ping_id: None,
-                bid: None,
-                post_id: None,
-                price: None,
-            },
-            verbose: if verbose_requested {
-                Some(serde_json::json!({
-                    "error_code": "ERR_400",
-                    "timestamp": Utc::now().to_rfc3339(),
-                    "endpoint": "POST /api/v1/leads",
-                    "status_code": 400
-                }))
-            } else {
-                None
-            },
-            http_status: Some(400),
-        }));
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(LeadResponse {
+                status: StatusNode {
+                    success: false,
+                    status: "error".to_string(),
+                    message: Some(message.clone()),
+                    error: Some(format!(
+                        "pre-check failures: {}",
+                        message.replace("\n", ", ")
+                    )),
+                },
+                lead: LeadNode {
+                    promise_id: None,
+                    lead_id: None,
+                    lead_uuid: None,
+                    ping_id: None,
+                    bid: None,
+                    post_id: None,
+                    price: None,
+                },
+                verbose: if verbose_requested {
+                    Some(serde_json::json!({
+                        "error_code": "ERR_400",
+                        "timestamp": Utc::now().to_rfc3339(),
+                        "endpoint": "POST /api/v1/leads",
+                        "status_code": 400
+                    }))
+                } else {
+                    None
+                },
+                http_status: Some(400),
+            }),
+        ));
     }
 
     // Critical path timing: start AFTER pre-checks and DB operations
@@ -1497,7 +1539,8 @@ async fn create_lead(
     // Generate temporary UUID for lead (will be used in DB insert)
     let lead_uuid = uuid::Uuid::new_v4();
 
-    tracing::info!(
+    // DEBUG: Detailed timing (only in debug mode, not in production)
+    tracing::debug!(
         lead_uuid = %lead_uuid,
         stage = "critical_path_start",
         "Starting critical path timing"
@@ -1548,7 +1591,8 @@ async fn create_lead(
     session_id.push_str("sess_");
     session_id.push_str(&session_uuid.to_string());
     let id_generation_duration = id_generation_start.elapsed().as_millis() as u64;
-    tracing::info!(
+    // DEBUG: Detailed timing (only in debug mode)
+    tracing::debug!(
         id_generation_ms = id_generation_duration,
         "ID generation completed"
     );
@@ -1559,7 +1603,8 @@ async fn create_lead(
     let request_payload_json =
         serde_json::to_value(&lead_data).unwrap_or_else(|_| serde_json::json!({}));
     let payload_serialization_duration = payload_serialization_start.elapsed().as_millis() as u64;
-    tracing::info!(
+    // DEBUG: Detailed timing (only in debug mode)
+    tracing::debug!(
         payload_serialization_ms = payload_serialization_duration,
         "Payload serialization completed"
     );
@@ -1586,7 +1631,8 @@ async fn create_lead(
         }
     };
     let ssm_key_derivation_duration = ssm_key_derivation_start.elapsed().as_millis() as u64;
-    tracing::info!(
+    // DEBUG: Detailed timing (only in debug mode)
+    tracing::debug!(
         ssm_key_derivation_ms = ssm_key_derivation_duration,
         "SSM key derivation completed"
     );
@@ -1594,7 +1640,8 @@ async fn create_lead(
     // Enqueue lead creation to write-behind queue (decoupled from critical path)
     let queue_enqueue_start = std::time::Instant::now();
     // All encryption happens in the background batch processor
-    tracing::info!(
+    // DEBUG: Detailed enqueue info (only in debug mode)
+    tracing::debug!(
         "Enqueueing lead creation: event_id={}, lead_id={}, publisher_id={}, vertical_id={}, request_type={}, lead_uuid={}",
         event_id,
         lead_id,
@@ -1651,11 +1698,151 @@ async fn create_lead(
         },
     );
     let queue_enqueue_duration = queue_enqueue_start.elapsed().as_millis() as u64;
-    tracing::info!(
+    // DEBUG: Detailed timing (only in debug mode)
+    tracing::debug!(
         queue_enqueue_ms = queue_enqueue_duration,
         "Queue enqueue completed"
     );
 
+    // ASYNC MODE: Return 202 Accepted immediately after enqueueing (routing happens in background)
+    // This eliminates routing latency from response time (typically 2-400ms savings)
+    // Client receives lead_uuid immediately and can poll for status if needed
+    if async_mode {
+        // Spawn routing task in background (non-blocking)
+        let state_clone = state.clone();
+        let lead_clone = leadsnebula_core::models::lead::Lead {
+            uuid: lead_uuid,
+            event_id: event_id.clone(),
+            lead_id: if lead_id.is_empty() {
+                None
+            } else {
+                Some(lead_id.clone())
+            },
+            publisher_id: Some(publisher.id),
+            vertical_id: vertical.id,
+            campaign_id: campaign_id_opt,
+            buyer_id: buyer_id_opt,
+            request_type: request_type.clone(),
+            strategy: strategy.to_string(),
+            status: leadsnebula_core::models::enums::LeadStatus::Processing,
+            promise_id: promise_id.clone(),
+            ping_id: None,
+            post_id: None,
+            session_id: Some(session_id.clone()),
+            request_stage: None,
+            first_name_encrypted: None,
+            last_name_encrypted: None,
+            email_encrypted: None,
+            cell_phone_encrypted: None,
+            street_address_encrypted: None,
+            city_encrypted: None,
+            state_encrypted: None,
+            zip_encrypted: None,
+            ip_address_encrypted: None,
+            email_sha256: None,
+            phone_sha256: None,
+            ip_address_hash: None,
+            email_domain: None,
+            tcpa_consent: lead_data.tcpa_consent.unwrap_or(false),
+            tcpa_language: lead_data.tcpa_language.as_deref().unwrap_or("").to_string(),
+            is_test: lead_data.is_test.unwrap_or(false),
+            user_agent: None,
+            referrer: None,
+            website_url: None,
+            click_id: None,
+            url_consent: None,
+            best_call_time: None,
+            date_of_birth: None,
+            home_phone: None,
+            jornaya_lead_id: None,
+            trusted_form_url: None,
+            fbp_cookie: None,
+            fbc_cookie: None,
+            utm_params: None,
+            submitted_at: Some(chrono::Utc::now()),
+            sold_at: None,
+            retry_count: 0,
+            next_retry_at: None,
+            vertical_data: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let publisher_id_clone = publisher.id;
+        let vertical_slug_clone = vertical.slug.clone();
+        let request_type_clone = request_type.clone();
+        let timing_clone = timing.clone();
+        let metrics_clone = metrics.clone();
+        let encryption_key_clone = std::sync::Arc::new(state.config.encryption_key.clone());
+
+        // Spawn background routing task (non-blocking, fire-and-forget)
+        tokio::spawn(async move {
+            let router = leadsnebula_core::services::ping_tree_router::PingTreeRouter::new(
+                lead_clone,
+                publisher_id_clone,
+                vertical_slug_clone,
+                request_type_clone,
+                state_clone.cache.clone(),
+                Some(state_clone.write_behind_queue.clone()),
+            )
+            .with_timing_and_metrics(timing_clone.clone(), metrics_clone.clone());
+
+            match router
+                .route(state_clone.db_pool.clone(), encryption_key_clone)
+                .await
+            {
+                Ok(_routing_result) => {
+                    // Routing completed successfully in background
+                    // Lead status is updated via write-behind queue
+                    tracing::debug!("Background routing completed successfully");
+                }
+                Err(e) => {
+                    tracing::error!("Background routing failed: {}", e);
+                    // Error is logged but doesn't affect the 202 response
+                    // Client can check lead status via polling if needed
+                }
+            }
+        });
+
+        // Return 202 Accepted immediately with lead_uuid
+        // Client can poll for status using lead_uuid if needed
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(LeadResponse {
+                status: StatusNode {
+                    success: true,
+                    status: "processing".to_string(),
+                    message: Some("Lead accepted for processing. Routing in progress.".to_string()),
+                    error: None,
+                },
+                lead: LeadNode {
+                    promise_id: promise_id.clone(),
+                    lead_id: if lead_id.is_empty() {
+                        None
+                    } else {
+                        Some(lead_id)
+                    },
+                    lead_uuid: Some(lead_uuid.to_string()),
+                    ping_id: None,
+                    bid: None,
+                    post_id: None,
+                    price: None,
+                },
+                verbose: if verbose_requested {
+                    Some(serde_json::json!({
+                        "async_mode": true,
+                        "message": "Lead accepted for asynchronous processing. Use lead_uuid to check status.",
+                        "lead_uuid": lead_uuid.to_string(),
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    }))
+                } else {
+                    None
+                },
+                http_status: Some(202),
+            }),
+        ));
+    }
+
+    // SYNCHRONOUS MODE (default): Continue with normal routing flow
     // Create minimal Lead object for routing (no DB query needed)
     let lead_object_creation_start = std::time::Instant::now();
     // This allows routing to proceed immediately while DB insert happens in background
@@ -1718,7 +1905,8 @@ async fn create_lead(
         updated_at: chrono::Utc::now(),
     };
     let lead_object_creation_duration = lead_object_creation_start.elapsed().as_millis() as u64;
-    tracing::info!(
+    // DEBUG: Detailed timing (only in debug mode)
+    tracing::debug!(
         lead_object_creation_ms = lead_object_creation_duration,
         "Lead object creation completed"
     );
@@ -1727,7 +1915,8 @@ async fn create_lead(
     let payload_row_id: Option<uuid::Uuid> = None;
 
     // Route the lead through ping tree
-    tracing::info!(stage = "routing_start", "Starting routing phase");
+    // DEBUG: Detailed routing steps (only in debug mode)
+    tracing::debug!(stage = "routing_start", "Starting routing phase");
     let routing_start = std::time::Instant::now();
     let timing_arc = timing.clone();
     let metrics_arc = metrics.clone();
@@ -1744,7 +1933,8 @@ async fn create_lead(
     )
     .with_timing_and_metrics(timing_arc.clone(), metrics_arc.clone());
     let router_create_duration = router_create_start.elapsed().as_millis() as u64;
-    tracing::info!(router_create_ms = router_create_duration, "Router created");
+    // DEBUG: Detailed timing (only in debug mode)
+    tracing::debug!(router_create_ms = router_create_duration, "Router created");
 
     // DETAILED TIMING: Log route call
     let route_call_start = std::time::Instant::now();
@@ -1757,8 +1947,8 @@ async fn create_lead(
     let route_call_duration = route_call_start.elapsed().as_millis() as u64;
     let routing_duration = routing_start.elapsed().as_millis() as u64;
 
-    // DETAILED TIMING: Log routing breakdown
-    tracing::info!(
+    // DETAILED TIMING: Log routing breakdown (DEBUG level to reduce overhead)
+    tracing::debug!(
         routing_total_ms = routing_duration,
         route_call_ms = route_call_duration,
         router_create_ms = router_create_duration,
@@ -2165,69 +2355,154 @@ async fn create_lead(
             timing_arc.flush_to_background(&lead_uuid.to_string());
             metrics_arc.log_summary("carina");
 
-            // Critical path timing: mark post_response_parsed (response ready to return)
-            // Always available (not feature-gated) for production performance monitoring
-            let critical_path_elapsed = critical_path_start.elapsed();
-            tracing::info!(
-                lead_id = %lead_uuid,
-                critical_path_ms = critical_path_elapsed.as_millis() as u64,
-                "Non-DB critical path timing"
+            // Single-line auction duration summary (informative only)
+            let ping_auction_ms = timing_arc.get_ping_auction_ms();
+            let post_sent_ms = timing_arc.get_post_sent_ms();
+            let total_ms = timing_arc.get_total_ms();
+
+            // Store auction timing in vertical_data for frontend reporting
+            let auction_timing_data = if request_type == "ping" {
+                serde_json::json!({
+                    "auction_timing": {
+                        "request_type": "ping",
+                        "ping_auction_ms": ping_auction_ms,
+                        "total_ms": total_ms,
+                    }
+                })
+            } else if request_type == "post" || request_type == "fullpost" {
+                serde_json::json!({
+                    "auction_timing": {
+                        "request_type": request_type,
+                        "ping_auction_ms": ping_auction_ms,
+                        "post_ms": post_sent_ms,
+                        "total_ms": total_ms,
+                    }
+                })
+            } else {
+                serde_json::json!({})
+            };
+
+            // Store auction timing in database via write-behind queue (non-blocking)
+            state.write_behind_queue.enqueue(
+                leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
+                    lead_id: lead_uuid,
+                    status: if routing_result.status == "sold" {
+                        leadsnebula_core::models::enums::LeadStatus::Sold
+                    } else if routing_result.status == "accepted" {
+                        leadsnebula_core::models::enums::LeadStatus::PingAccepted
+                    } else {
+                        leadsnebula_core::models::enums::LeadStatus::Processing
+                    },
+                    campaign_id: routing_result.campaign_id,
+                    buyer_id: routing_result.buyer_id,
+                    promise_id: routing_result.promise_id.clone(),
+                    ping_id: routing_result.ping_id.clone(),
+                    post_id: routing_result.post_id.clone(),
+                    sold_at: routing_result.status == "sold",
+                    inprog_token: None,
+                    vertical_data: Some(auction_timing_data),
+                },
             );
 
-            Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: routing_result.success,
-                    status: routing_result.status.clone(),
-                    message,
-                    error: routing_result.error.clone(),
-                },
-                lead: LeadNode {
-                    promise_id: routing_result.promise_id.clone(),
-                    lead_id: Some(lead_id),
-                    lead_uuid: Some(lead_uuid.to_string()),
-                    ping_id: None,
-                    bid,
-                    post_id: routing_result.post_id.clone(),
-                    price,
-                },
-                verbose: verbose_json,
-                http_status: Some(200),
-            }))
+            // Single-line auction duration summary (WARN level to ensure visibility in production)
+            if request_type == "ping" {
+                tracing::warn!(
+                    lead_id = %lead_uuid,
+                    request_type = "ping",
+                    ping_auction_ms = ping_auction_ms,
+                    total_ms = total_ms,
+                    "Auction durations"
+                );
+            } else if request_type == "post" || request_type == "fullpost" {
+                tracing::warn!(
+                    lead_id = %lead_uuid,
+                    request_type = %request_type,
+                    ping_auction_ms = ping_auction_ms,
+                    post_ms = post_sent_ms,
+                    total_ms = total_ms,
+                    "Auction durations"
+                );
+            }
+
+            // Critical path timing: mark post_response_parsed (response ready to return)
+            // Log slow requests as WARN (for monitoring), fast requests as DEBUG (reduced overhead)
+            let critical_path_elapsed = critical_path_start.elapsed();
+            let critical_path_ms = critical_path_elapsed.as_millis() as u64;
+            // Only log if > 500ms (slow requests) or in debug mode
+            if critical_path_ms > 500 {
+                tracing::warn!(
+                    lead_id = %lead_uuid,
+                    critical_path_ms = critical_path_ms,
+                    "Non-DB critical path timing (slow)"
+                );
+            } else {
+                tracing::debug!(
+                    lead_id = %lead_uuid,
+                    critical_path_ms = critical_path_ms,
+                    "Non-DB critical path timing"
+                );
+            }
+
+            Ok((
+                StatusCode::OK,
+                Json(LeadResponse {
+                    status: StatusNode {
+                        success: routing_result.success,
+                        status: routing_result.status.clone(),
+                        message,
+                        error: routing_result.error.clone(),
+                    },
+                    lead: LeadNode {
+                        promise_id: routing_result.promise_id.clone(),
+                        lead_id: Some(lead_id),
+                        lead_uuid: Some(lead_uuid.to_string()),
+                        ping_id: None,
+                        bid,
+                        post_id: routing_result.post_id.clone(),
+                        price,
+                    },
+                    verbose: verbose_json,
+                    http_status: Some(200),
+                }),
+            ))
         }
         Err(e) => {
             tracing::error!("Routing error: {}", e);
             timing_arc.flush_to_background(&lead_uuid.to_string());
             metrics_arc.log_summary("carina");
             let (message, technical) = map_error_to_user(&e.to_string());
-            Ok(Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(message),
-                    error: Some(technical),
-                },
-                // Do not expose identifiers when routing failed due to configuration/routing problems
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_500",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 500
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(500),
-            }))
+            Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some(message),
+                        error: Some(technical),
+                    },
+                    // Do not expose identifiers when routing failed due to configuration/routing problems
+                    lead: LeadNode {
+                        promise_id: None,
+                        lead_id: None,
+                        lead_uuid: None,
+                        ping_id: None,
+                        bid: None,
+                        post_id: None,
+                        price: None,
+                    },
+                    verbose: if verbose_requested {
+                        Some(serde_json::json!({
+                            "error_code": "ERR_500",
+                            "timestamp": Utc::now().to_rfc3339(),
+                            "endpoint": "POST /api/v1/leads",
+                            "status_code": 500
+                        }))
+                    } else {
+                        None
+                    },
+                    http_status: Some(500),
+                }),
+            ))
         }
     }
 }

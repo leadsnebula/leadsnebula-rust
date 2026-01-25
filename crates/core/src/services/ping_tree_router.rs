@@ -130,7 +130,8 @@ impl PingTreeRouter {
             .unwrap_or_else(|| local_metrics);
 
         // Find active ping tree for publisher and vertical with revshare info (CACHED - 6h TTL)
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode to reduce overhead)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "ping_tree_lookup_start",
             "Starting ping tree lookup"
@@ -164,8 +165,8 @@ impl PingTreeRouter {
         } else if ping_tree_duration > 0 {
             metrics.record_cache_miss();
         }
-        // DETAILED TIMING: Log ping tree lookup
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode to reduce overhead)
+        tracing::debug!(
             ping_tree_lookup_ms = ping_tree_duration,
             cache_hit = was_cache_hit,
             "Ping tree lookup completed"
@@ -239,7 +240,8 @@ impl PingTreeRouter {
         }
 
         // Get enabled campaigns from ping tree (CACHED - 6h TTL)
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "campaigns_load_start",
             ping_tree_id = %ping_tree.id,
@@ -278,7 +280,8 @@ impl PingTreeRouter {
             metrics.record_cache_miss();
         }
         // DETAILED TIMING: Log campaigns loading
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             campaigns_load_ms = campaigns_duration,
             cache_hit = was_cache_hit,
             ping_tree_campaign_count = ping_tree_campaigns.len(),
@@ -319,7 +322,8 @@ impl PingTreeRouter {
 
         // OPTIMIZED: Load campaigns with associations (CACHED) and qualification configs in PARALLEL
         // Both operations depend on campaign_ids but are independent of each other
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "campaigns_associations_start",
             campaign_count = ping_tree_campaigns.len(),
@@ -366,7 +370,8 @@ impl PingTreeRouter {
             .unwrap_or_default()
         };
         let buyer_ids_extraction_duration = buyer_ids_extraction_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             buyer_ids_extraction_ms = buyer_ids_extraction_duration,
             buyer_count = buyer_ids_from_campaigns.len(),
             "Buyer IDs extracted from campaigns"
@@ -449,7 +454,8 @@ impl PingTreeRouter {
         timing.record_pre_checks(campaigns_load_duration);
 
         // DETAILED TIMING: Log parallel loading breakdown
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             campaigns_associations_load_ms = campaigns_load_duration,
             parallel_load_ms = parallel_load_duration,
             buyer_ids_extraction_ms = buyer_ids_extraction_duration,
@@ -487,7 +493,8 @@ impl PingTreeRouter {
         metrics.record_query(campaigns_load_duration);
         timing.record_qualification(campaigns_load_duration);
         // DETAILED TIMING: Log qualification config loading (now parallelized with campaigns)
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             qual_configs_ms = campaigns_load_duration,
             qual_preload_total_ms = qual_preload_duration,
             buyer_count = buyer_ids_from_campaigns.len(),
@@ -614,7 +621,9 @@ impl PingTreeRouter {
             .filter(|opt_int| opt_int.is_none())
             .count();
 
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        // WARN: External buyers will be logged separately if present
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "ping_auction_start",
             campaign_count = campaigns.len(),
@@ -666,8 +675,8 @@ impl PingTreeRouter {
                 .map(|i| i.is_internal)
                 .unwrap_or(false);
 
-            // DETAILED TIMING: Log per-buyer task creation
-            tracing::info!(
+            // DEBUG: Detailed routing steps (only in debug mode)
+            tracing::debug!(
                 lead_id = %self.lead.uuid,
                 campaign_id = %campaign_id,
                 buyer_id = %campaign_clone.buyer_id,
@@ -693,7 +702,8 @@ impl PingTreeRouter {
                 inject_chaos_delay().await;
                 let chaos_delay_duration = chaos_delay_start.elapsed().as_millis() as u64;
                 if chaos_delay_duration > 0 {
-                    tracing::info!(
+                    // DEBUG: Chaos mode logging (only in debug mode)
+                    tracing::debug!(
                         campaign_id = %campaign_id,
                         chaos_delay_ms = chaos_delay_duration,
                         "Chaos delay injected"
@@ -719,14 +729,15 @@ impl PingTreeRouter {
                 let route_call_start = std::time::Instant::now();
                 let result = if is_internal_buyer {
                     // Direct call for internal buyers (no timeout overhead)
-                    tracing::info!(
+                    // DEBUG: Detailed routing steps (only in debug mode)
+                    tracing::debug!(
                         campaign_id = %campaign_id,
                         stage = "pulsar_direct_call_start",
                         "Calling Pulsar directly (no timeout)"
                     );
                     let pulsar_result = router.route().await;
                     let route_call_duration = route_call_start.elapsed().as_millis() as u64;
-                    tracing::info!(
+                    tracing::debug!(
                         campaign_id = %campaign_id,
                         stage = "pulsar_direct_call_complete",
                         pulsar_call_ms = route_call_duration,
@@ -736,7 +747,8 @@ impl PingTreeRouter {
                     Ok(pulsar_result)
                 } else {
                     // Timeout wrapper for external buyers
-                    tracing::info!(
+                    // DEBUG: External buyer calls (only in debug mode)
+                    tracing::debug!(
                         campaign_id = %campaign_id,
                         stage = "external_buyer_call_start",
                         timeout_ms = PING_AUCTION_TIMEOUT.as_millis(),
@@ -746,7 +758,7 @@ impl PingTreeRouter {
                         .await
                         .map_err(|e| anyhow::anyhow!("Timeout: {}", e));
                     let route_call_duration = route_call_start.elapsed().as_millis() as u64;
-                    tracing::info!(
+                    tracing::debug!(
                         campaign_id = %campaign_id,
                         stage = "external_buyer_call_complete",
                         external_call_ms = route_call_duration,
@@ -757,7 +769,8 @@ impl PingTreeRouter {
                 };
 
                 let processing_time_ms = buyer_start.elapsed().as_millis() as u64;
-                tracing::info!(
+                // DEBUG: Detailed timing (only in debug mode)
+                tracing::debug!(
                     campaign_id = %campaign_id,
                     total_processing_ms = processing_time_ms,
                     router_creation_ms = router_creation_duration,
@@ -770,7 +783,8 @@ impl PingTreeRouter {
         }
 
         // Wait for all responses concurrently using FuturesUnordered for better parallelism
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "futures_unordered_start",
             task_count = task_futures.len(),
@@ -786,7 +800,8 @@ impl PingTreeRouter {
         while let Some(result) = futures_unordered.next().await {
             if first_response_time.is_none() {
                 first_response_time = Some(ping_auction_start.elapsed().as_millis() as u64);
-                tracing::info!(
+                // DEBUG: Detailed timing (only in debug mode)
+                tracing::debug!(
                     lead_id = %self.lead.uuid,
                     first_response_ms = first_response_time.unwrap(),
                     "First buyer response received"
@@ -795,7 +810,8 @@ impl PingTreeRouter {
             task_results.push(result);
         }
         let ping_auction_duration = ping_auction_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "futures_unordered_complete",
             ping_auction_total_ms = ping_auction_duration,
@@ -805,8 +821,8 @@ impl PingTreeRouter {
         );
         metrics.record_ping_auction(ping_auction_duration); // Track ping auction duration
         metrics.record_stage_timing("ping_auction", ping_auction_duration);
-        // DETAILED TIMING: Log ping auction duration
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             ping_auction_ms = ping_auction_duration,
             campaign_count = campaigns.len(),
             response_count = task_results.len(),
@@ -815,7 +831,8 @@ impl PingTreeRouter {
         let mut responses: Vec<(BuyerResponse, Uuid, Option<i32>)> = Vec::new();
         let mut per_buyer_timings: Vec<serde_json::Value> = Vec::new();
 
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "processing_responses_start",
             response_count = task_results.len(),
@@ -1144,7 +1161,8 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest bid, then priority, then random
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "select_winner_start",
             total_responses = responses.len(),
@@ -1155,7 +1173,8 @@ impl PingTreeRouter {
         let winner = select_winner(valid_responses);
         let (winner_response, winner_campaign_id, _) = winner;
         let winner_selection_duration = winner_selection_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        // DEBUG: Detailed routing steps (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "select_winner_complete",
             winner_selection_ms = winner_selection_duration,
@@ -1173,7 +1192,8 @@ impl PingTreeRouter {
             .find(|c| c.id == winner_campaign_id)
             .ok_or_else(|| anyhow::anyhow!("Winner campaign not found"))?;
         let find_winner_campaign_duration = find_winner_campaign_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             find_winner_campaign_ms = find_winner_campaign_duration,
             "Winner campaign found"
@@ -1193,6 +1213,7 @@ impl PingTreeRouter {
                     post_id: None,
                     sold_at: false,
                     inprog_token: None,
+                    vertical_data: None, // Auction timing stored separately after routing completes
                 },
             );
         } else {
@@ -1208,7 +1229,8 @@ impl PingTreeRouter {
         }
 
         let total_route_ping_auction_duration = _ping_auction_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        // DEBUG: Detailed timing (only in debug mode)
+        tracing::debug!(
             lead_id = %self.lead.uuid,
             stage = "route_ping_auction_complete",
             total_ping_auction_ms = total_route_ping_auction_duration,
@@ -1483,7 +1505,8 @@ impl PingTreeRouter {
         // If ping tree strategy is ping_post, split fullpost into ping/post
         if ping_tree.strategy == "ping_post" {
             #[cfg(feature = "tracing")]
-            tracing::info!(
+            // DEBUG: Detailed routing steps (only in debug mode)
+            tracing::debug!(
                 lead_id = %self.lead.uuid,
                 strategy = %ping_tree.strategy,
                 campaign_count = campaigns.len(),
@@ -1530,7 +1553,8 @@ impl PingTreeRouter {
                 updated_lead.campaign_id = Some(campaign_id);
             }
             #[cfg(feature = "tracing")]
-            tracing::info!(
+            // DEBUG: Detailed routing steps (only in debug mode)
+            tracing::debug!(
                 lead_id = %self.lead.uuid,
                 promise_id = ?updated_lead.promise_id,
                 campaign_id = ?updated_lead.campaign_id,
@@ -1855,7 +1879,8 @@ impl PingTreeRouter {
         }
 
         #[cfg(feature = "tracing")]
-        tracing::info!(
+        // DEBUG: Detailed DB operations (only in debug mode)
+        tracing::debug!(
             response_count = responses.len(),
             "Executing batch insert for buyer responses"
         );
@@ -1973,7 +1998,8 @@ impl PingTreeRouter {
                 #[cfg(feature = "tracing")]
                 {
                     let duration_ms = db_query_start.elapsed().as_millis() as u64;
-                    tracing::info!(
+                    // DEBUG: Detailed DB operations (only in debug mode)
+                    tracing::debug!(
                         operation = "db_query",
                         query_type = "insert",
                         table = "buyer_responses",
@@ -2007,7 +2033,8 @@ impl PingTreeRouter {
         query_result?;
 
         #[cfg(feature = "tracing")]
-        tracing::info!(
+        // DEBUG: Detailed DB operations (only in debug mode)
+        tracing::debug!(
             response_count = responses.len(),
             "Batch insert completed successfully"
         );

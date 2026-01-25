@@ -500,13 +500,11 @@ pub async fn create_test_pool_with_transaction(
 
 /// Check if heavy tests should run
 /// Heavy tests are skipped by default in CI and fast iteration mode
-/// Set RUN_HEAVY_TESTS=true in .env.local to enable them locally
+/// Check if heavy tests should run
+/// Relies on RUN_HEAVY_TESTS environment variable (set by autotests.sh)
+/// autotests.sh exports RUN_HEAVY_TESTS=true by default for local runs
+/// CI does not set this variable, so heavy tests are skipped in CI
 pub fn should_run_heavy_tests() -> bool {
-    // Load .env.local if present (non-fatal)
-    let _ = dotenvy::from_filename(".env.local");
-    let _ = dotenvy::dotenv();
-
-    // Check if RUN_HEAVY_TESTS is explicitly set to "true"
     std::env::var("RUN_HEAVY_TESTS")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false)

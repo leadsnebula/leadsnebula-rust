@@ -209,6 +209,19 @@ impl AtomicAuctionTiming {
     pub fn elapsed_ms(&self) -> u64 {
         self.lead_arrived_at.elapsed().as_millis() as u64
     }
+
+    // Getters for auction durations (for logging)
+    pub fn get_ping_auction_ms(&self) -> u64 {
+        self.ping_auction_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn get_post_sent_ms(&self) -> u64 {
+        self.post_sent_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn get_total_ms(&self) -> u64 {
+        self.total_ms.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for AtomicAuctionTiming {

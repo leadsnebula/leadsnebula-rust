@@ -24,16 +24,10 @@ mod optimization_tests {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
             return;
         }
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
-        let pool = create_test_pool()
-            .await
-            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
+        let pool = create_test_pool().await.expect("DATABASE_URL required");
 
         // Create test buyer and campaign
         let mut tx = pool.begin().await.unwrap();
@@ -151,16 +145,10 @@ mod optimization_tests {
             return;
         }
 
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
-        let pool = create_test_pool()
-            .await
-            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
+        let pool = create_test_pool().await.expect("DATABASE_URL required");
 
         // Create Redis client and cache
         let redis_url = std::env::var("REDIS_URL").unwrap();
@@ -214,16 +202,10 @@ mod optimization_tests {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
             return;
         }
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
-        let pool = create_test_pool()
-            .await
-            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
+        let pool = create_test_pool().await.expect("DATABASE_URL required");
         let pool_arc = Arc::new(pool.clone());
 
         use crate::services::write_behind_queue::{BackgroundTask, WriteBehindQueue};
@@ -261,16 +243,10 @@ mod optimization_tests {
             eprintln!("Skipping heavy test: set RUN_HEAVY_TESTS=true in .env.local to enable");
             return;
         }
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
-        let pool = create_test_pool()
-            .await
-            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
+        let pool = create_test_pool().await.expect("DATABASE_URL required");
         let pool_arc = Arc::new(pool.clone());
 
         use crate::services::write_behind_queue::{BackgroundTask, WriteBehindQueue};
@@ -309,12 +285,8 @@ mod optimization_tests {
         }
         // Test that SSM key caching reduces actual SSM API calls
         // Note: This test requires SSM to be available or mocked
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
         use crate::services::ssm_key_cache::get_ssm_parameter_cached;
         use crate::ssm::SsmService;
@@ -390,16 +362,10 @@ mod optimization_tests {
             return;
         }
         // Test that write-behind queue handles database errors gracefully
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
-        let pool = create_test_pool()
-            .await
-            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
+        let pool = create_test_pool().await.expect("DATABASE_URL required");
         let pool_arc = Arc::new(pool.clone());
 
         use crate::services::write_behind_queue::{BackgroundTask, WriteBehindQueue};
@@ -433,16 +399,10 @@ mod optimization_tests {
             return;
         }
         // Test that write-behind queue batches tasks correctly (flushes at 10 items)
-        if std::env::var("CI").is_err() && std::env::var("EPHEMERAL_DB").is_err() {
-            eprintln!(
-                "Skipping: run ./autotests.sh or set EPHEMERAL_DB=1 with ephemeral DATABASE_URL"
-            );
-            return;
-        }
+        // EPHEMERAL_DB check removed - redundant since autotests.sh sets it
+        // Test will fail naturally if DATABASE_URL isn't set
 
-        let pool = create_test_pool()
-            .await
-            .expect("DATABASE_URL required when EPHEMERAL_DB or CI");
+        let pool = create_test_pool().await.expect("DATABASE_URL required");
         let pool_arc = Arc::new(pool.clone());
 
         use crate::services::write_behind_queue::{BackgroundTask, WriteBehindQueue};

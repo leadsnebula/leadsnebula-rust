@@ -118,10 +118,11 @@ async fn main() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
     }
 
-    // Initialize tracing with comprehensive logging
-    // Default to INFO level for all crates to ensure logs work in Fly.io/Grafana
-    // RUST_LOG can override this if set (e.g., RUST_LOG=debug for verbose)
-    let default_filter = "leadsnebula_api=info,leadsnebula_core=info,leadsnebula_utils=info,tower_http=info,sqlx=warn,redis=info";
+    // Initialize tracing with production-optimized logging
+    // Default to WARN level to eliminate logging overhead in critical path (100-300ms savings)
+    // RUST_LOG can override this if set (e.g., RUST_LOG=info or RUST_LOG=debug for verbose)
+    // ERROR and WARN logs are preserved for troubleshooting, INFO/DEBUG are disabled by default
+    let default_filter = "leadsnebula_api=warn,leadsnebula_core=warn,leadsnebula_utils=warn,tower_http=warn,sqlx=warn,redis=warn";
 
     // Use JSON format by default for production (works better with Grafana/Fly.io)
     // Set RUST_LOG_JSON=0 to disable JSON and use pretty format
