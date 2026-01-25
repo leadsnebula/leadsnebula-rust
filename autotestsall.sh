@@ -96,6 +96,7 @@ fi
 
 # Maximize resource usage: Use all available CPU cores and system linker to prevent linker OOM
 # The linker (rust-lld) can run out of memory in WSL, but system linkers (gold/bfd) handle large binaries better
+# NOTE: User has 64GB RAM with peak usage at 51GB, so there's plenty of headroom for full parallel compilation
 CPU_CORES=$(nproc)
 export CARGO_BUILD_JOBS=$CPU_CORES
 
