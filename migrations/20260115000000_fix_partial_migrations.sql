@@ -163,13 +163,54 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
 );
 
 -- Ensure platform_user_id column exists (add if missing)
+-- Handle existing data by populating from instance_user_id before making it NOT NULL
 DO $$ 
+DECLARE
+    has_platform_user_id BOOLEAN;
+    has_instance_user_id BOOLEAN;
+    row_count BIGINT;
 BEGIN
-    IF NOT EXISTS (
+    -- Check if platform_user_id column exists
+    SELECT EXISTS (
         SELECT 1 FROM information_schema.columns 
         WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
-    ) THEN
-        ALTER TABLE webauthn_credentials ADD COLUMN platform_user_id UUID NOT NULL;
+    ) INTO has_platform_user_id;
+    
+    -- Only proceed if column doesn't exist
+    IF NOT has_platform_user_id THEN
+        -- Check if instance_user_id exists (we'll use it to populate platform_user_id)
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns 
+            WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
+        ) INTO has_instance_user_id;
+        
+        -- Check if table has data
+        EXECUTE 'SELECT COUNT(*) FROM webauthn_credentials' INTO row_count;
+        
+        IF row_count > 0 AND has_instance_user_id THEN
+            -- Table has data and instance_user_id exists - add column as nullable first
+            ALTER TABLE webauthn_credentials ADD COLUMN platform_user_id UUID;
+            
+            -- Populate platform_user_id from instance_user_id (they should be the same)
+            UPDATE webauthn_credentials 
+            SET platform_user_id = instance_user_id 
+            WHERE platform_user_id IS NULL AND instance_user_id IS NOT NULL;
+            
+            -- Now make it NOT NULL
+            ALTER TABLE webauthn_credentials ALTER COLUMN platform_user_id SET NOT NULL;
+            
+            RAISE NOTICE 'Added platform_user_id column and populated from instance_user_id for % rows', row_count;
+        ELSIF row_count > 0 THEN
+            -- Table has data but no instance_user_id - this is an inconsistent state
+            -- We can't safely add NOT NULL column, so drop and recreate
+            RAISE WARNING 'webauthn_credentials has % rows but missing both platform_user_id and instance_user_id - dropping and recreating', row_count;
+            DROP TABLE IF EXISTS webauthn_credentials CASCADE;
+            -- Table will be recreated by CREATE TABLE IF NOT EXISTS below
+        ELSE
+            -- Table is empty - safe to add NOT NULL column directly
+            ALTER TABLE webauthn_credentials ADD COLUMN platform_user_id UUID NOT NULL;
+            RAISE NOTICE 'Added platform_user_id column to empty table';
+        END IF;
     END IF;
 END $$;
 
