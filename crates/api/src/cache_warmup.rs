@@ -356,90 +356,59 @@ async fn pre_warm_buyer_integrations(
 }
 
 /// Pre-warm qualification configs (1h TTL - configs rarely change)
-/// FIXED: Cache key format matches ping_tree_router.rs (qual:buyers:{comma-separated-ids})
-/// This pre-warms the exact cache keys used during routing to eliminate cache misses
+/// Pre-warms buyer combinations from active ping trees to eliminate cache misses during routing
 async fn pre_warm_qualification_configs(
     cache: &Arc<leadsnebula_core::cache::CacheService>,
     pool: &PgPool,
 ) -> usize {
     let mut warmed = 0;
+    use leadsnebula_core::models::buyer_qualification_config::BuyerQualificationConfig;
 
-    // Get all active buyers (we'll pre-warm qual configs for common buyer combinations)
-    // First, get all buyers that have qualification configs
+    // Get active ping trees and their buyer combinations (this is what actually matters for routing)
     match sqlx::query(
-        "SELECT DISTINCT buyer_id FROM buyer_qualification_configs WHERE enabled = true AND is_active = true ORDER BY buyer_id LIMIT 500"
+        r#"
+        SELECT DISTINCT pt.id, array_agg(DISTINCT c.buyer_id) FILTER (WHERE c.buyer_id IS NOT NULL) as buyer_ids
+        FROM ping_trees pt
+        INNER JOIN ping_tree_campaigns ptc ON pt.id = ptc.ping_tree_id
+        INNER JOIN campaigns c ON ptc.campaign_id = c.id AND c.deleted_at IS NULL
+        WHERE pt.deleted_at IS NULL AND pt.status = 'active' AND ptc.enabled = true
+        GROUP BY pt.id
+        LIMIT 50
+        "#
     )
     .fetch_all(pool)
     .await
     {
-        Ok(rows) => {
-            let buyer_ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.get::<uuid::Uuid, _>("buyer_id")).collect();
+        Ok(ping_tree_rows) => {
+            for row in ping_tree_rows {
+                if let Ok(Some(buyer_ids_array)) = row.try_get::<Option<Vec<Option<uuid::Uuid>>>, _>("buyer_ids") {
+                    let buyer_ids_list: Vec<uuid::Uuid> = buyer_ids_array
+                        .into_iter()
+                        .flatten()
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
 
-            if !buyer_ids.is_empty() {
-                use leadsnebula_core::models::buyer_qualification_config::BuyerQualificationConfig;
+                    if !buyer_ids_list.is_empty() {
+                        // Create cache key matching ping_tree_router format (sorted, comma-separated)
+                        let mut sorted_ids = buyer_ids_list.clone();
+                        sorted_ids.sort();
+                        let cache_key = format!(
+                            "qual:buyers:{}",
+                            sorted_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                        );
 
-                // Fetch all configs at once
-                if let Ok(configs_map) = BuyerQualificationConfig::find_by_buyer_ids(pool, &buyer_ids).await {
-                    // Pre-warm individual buyer qual configs (used in buyer_router)
-                    for buyer_id in &buyer_ids {
-                        if let Some(config) = configs_map.get(buyer_id).and_then(|c| c.as_ref()) {
-                            let cache_key = format!("qual:buyers:{}", buyer_id);
-                            let _ = cache
-                                .get_or_insert_with(&cache_key, 3600, || async {
-                                    Ok::<BuyerQualificationConfig, anyhow::Error>(config.clone())
-                                })
-                                .await;
-                            warmed += 1;
-                        }
-                    }
-
-                    // Pre-warm common buyer combinations (used in ping_tree_router)
-                    // Cache keys like "qual:buyers:{id1},{id2},{id3}" for common ping tree combinations
-                    // Get active ping trees and their buyer combinations
-                    if let Ok(ping_tree_rows) = sqlx::query(
-                        r#"
-                        SELECT DISTINCT pt.id, array_agg(DISTINCT c.buyer_id) FILTER (WHERE c.buyer_id IS NOT NULL) as buyer_ids
-                        FROM ping_trees pt
-                        INNER JOIN ping_tree_campaigns ptc ON pt.id = ptc.ping_tree_id
-                        INNER JOIN campaigns c ON ptc.campaign_id = c.id AND c.deleted_at IS NULL
-                        WHERE pt.deleted_at IS NULL AND pt.status = 'active' AND ptc.enabled = true
-                        GROUP BY pt.id
-                        LIMIT 50
-                        "#
-                    )
-                    .fetch_all(pool)
-                    .await
-                    {
-                        for row in ping_tree_rows {
-                            if let Ok(Some(buyer_ids_array)) = row.try_get::<Option<Vec<Option<uuid::Uuid>>>, _>("buyer_ids") {
-                                let buyer_ids_list: Vec<uuid::Uuid> = buyer_ids_array
-                                    .into_iter()
-                                    .flatten()
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .into_iter()
-                                    .collect();
-
-                                if !buyer_ids_list.is_empty() {
-                                    // Create cache key matching ping_tree_router format
-                                    let mut sorted_ids = buyer_ids_list.clone();
-                                    sorted_ids.sort();
-                                    let cache_key = format!(
-                                        "qual:buyers:{}",
-                                        sorted_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
-                                    );
-
-                                    // Pre-warm this combination
-                                    let _ = cache
-                                        .get_or_insert_with(&cache_key, 3600, || async {
-                                            BuyerQualificationConfig::find_by_buyer_ids(pool, &buyer_ids_list)
-                                                .await
-                                                .map_err(|e| anyhow::anyhow!("DB error: {}", e))
-                                        })
-                                        .await;
-                                    warmed += 1;
-                                }
-                            }
-                        }
+                        // Pre-warm this combination - this is the exact cache key used in routing
+                        let pool_clone = pool.clone();
+                        let buyer_ids_clone = buyer_ids_list.clone();
+                        let _ = cache
+                            .get_or_insert_with(&cache_key, 3600, || async {
+                                BuyerQualificationConfig::find_by_buyer_ids(&pool_clone, &buyer_ids_clone)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("DB error: {}", e))
+                            })
+                            .await;
+                        warmed += 1;
                     }
                 }
             }

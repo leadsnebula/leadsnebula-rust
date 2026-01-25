@@ -28,6 +28,7 @@ fn default_json_object() -> serde_json::Value {
 impl BuyerQualificationConfig {
     /// Find qualification configs for multiple buyers in a single query
     /// Returns a HashMap keyed by buyer_id for fast lookup
+    /// OPTIMIZED: Early exit if no configs exist (avoids unnecessary query when no rules configured)
     pub async fn find_by_buyer_ids(
         pool: &sqlx::PgPool,
         buyer_ids: &[Uuid],
@@ -36,6 +37,30 @@ impl BuyerQualificationConfig {
             return Ok(std::collections::HashMap::new());
         }
 
+        // Early exit: Check if any configs exist for these buyers (fast EXISTS query)
+        let has_configs: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM buyer_qualification_configs
+                WHERE buyer_id = ANY($1) AND enabled = true AND is_active = true
+                LIMIT 1
+            )
+            "#,
+        )
+        .bind(buyer_ids)
+        .fetch_one(pool)
+        .await?;
+
+        // If no configs exist, return empty map immediately (no need to query)
+        if !has_configs {
+            let mut result = std::collections::HashMap::new();
+            for buyer_id in buyer_ids {
+                result.insert(*buyer_id, None);
+            }
+            return Ok(result);
+        }
+
+        // Configs exist, fetch them
         let configs = sqlx::query_as::<_, BuyerQualificationConfig>(
             r#"
             SELECT * FROM buyer_qualification_configs

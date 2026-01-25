@@ -1164,22 +1164,33 @@ impl PingTreeRouter {
             "Winner campaign found"
         );
 
-        // Update lead with winner
-        let update_lead_start = std::time::Instant::now();
-        self.update_lead_with_winner(
-            pool.as_ref(),
-            winner_campaign,
-            winner_response.promise_id.as_deref().unwrap_or(""),
-            winner_response.ping_id.as_deref(),
-            winner_response.price,
-        )
-        .await?;
-        let update_lead_duration = update_lead_start.elapsed().as_millis() as u64;
-        tracing::info!(
-            lead_id = %self.lead.uuid,
-            update_lead_ms = update_lead_duration,
-            "Lead updated with winner"
-        );
+        // Enqueue lead update with winner to background queue (non-blocking)
+        // This removes 120-554ms sync DB write from critical path
+        if let Some(queue) = &self.write_behind_queue {
+            queue.enqueue(
+                crate::services::write_behind_queue::BackgroundTask::LeadUpdate {
+                    lead_id: self.lead.uuid,
+                    status: crate::models::enums::LeadStatus::PingAccepted,
+                    campaign_id: Some(winner_campaign.id),
+                    buyer_id: Some(winner_campaign.buyer_id),
+                    promise_id: winner_response.promise_id.clone(),
+                    ping_id: winner_response.ping_id.clone(),
+                    post_id: None,
+                    sold_at: false,
+                    inprog_token: None,
+                },
+            );
+        } else {
+            // Fallback: synchronous update if queue unavailable (shouldn't happen in production)
+            self.update_lead_with_winner(
+                pool.as_ref(),
+                winner_campaign,
+                winner_response.promise_id.as_deref().unwrap_or(""),
+                winner_response.ping_id.as_deref(),
+                winner_response.price,
+            )
+            .await?;
+        }
 
         let total_route_ping_auction_duration = _ping_auction_start.elapsed().as_millis() as u64;
         tracing::info!(
@@ -1188,8 +1199,7 @@ impl PingTreeRouter {
             total_ping_auction_ms = total_route_ping_auction_duration,
             ping_auction_collection_ms = ping_auction_duration,
             winner_selection_ms = winner_selection_duration,
-            update_lead_ms = update_lead_duration,
-            "Ping auction routing completed"
+            "Ping auction routing completed (lead update enqueued to background)"
         );
 
         Ok(RoutingResult {
