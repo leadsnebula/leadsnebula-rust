@@ -150,7 +150,8 @@ END $$;
 -- Recreate table if it doesn't exist
 CREATE TABLE IF NOT EXISTS webauthn_credentials (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    instance_user_id UUID NOT NULL,
+    platform_user_id UUID NOT NULL,
+    instance_user_id UUID,
     external_id VARCHAR NOT NULL,
     public_key TEXT NOT NULL,
     sign_count INTEGER NOT NULL DEFAULT 0,
@@ -161,14 +162,25 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
     passkey_type VARCHAR
 );
 
--- Ensure instance_user_id column exists (add if missing)
+-- Ensure platform_user_id column exists (add if missing)
+DO $$ 
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
+    ) THEN
+        ALTER TABLE webauthn_credentials ADD COLUMN platform_user_id UUID NOT NULL;
+    END IF;
+END $$;
+
+-- Ensure instance_user_id column exists (add if missing, make nullable)
 DO $$ 
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns 
         WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
     ) THEN
-        ALTER TABLE webauthn_credentials ADD COLUMN instance_user_id UUID NOT NULL;
+        ALTER TABLE webauthn_credentials ADD COLUMN instance_user_id UUID;
     END IF;
 END $$;
 
@@ -222,6 +234,7 @@ END $$;
 
 -- Create indexes if they don't exist
 CREATE UNIQUE INDEX IF NOT EXISTS index_webauthn_credentials_on_external_id ON webauthn_credentials(external_id);
+CREATE INDEX IF NOT EXISTS index_webauthn_credentials_on_platform_user_id ON webauthn_credentials(platform_user_id);
 CREATE INDEX IF NOT EXISTS index_webauthn_credentials_on_instance_user_id ON webauthn_credentials(instance_user_id);
 CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_instance_user_id ON webauthn_credentials(instance_user_id);
 
