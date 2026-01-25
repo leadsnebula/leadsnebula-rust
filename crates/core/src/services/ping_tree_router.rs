@@ -993,33 +993,48 @@ impl PingTreeRouter {
             ));
         }
 
-        // Batch insert all responses in one query
+        // Enqueue buyer responses to write-behind queue (non-blocking)
+        // This removes ~2.8s sync DB write from critical path
         if !batch_responses.is_empty() {
-            #[cfg(all(feature = "tracing", debug_assertions))]
-            tracing::debug!(
-                lead_id = %self.lead.uuid,
-                response_count = batch_responses.len(),
-                "Batch inserting buyer responses"
-            );
-            let result =
-                PingTreeRouter::batch_insert_buyer_responses(pool.as_ref(), batch_responses).await;
-            if result.is_ok() {
+            if let Some(queue) = &self.write_behind_queue {
                 #[cfg(all(feature = "tracing", debug_assertions))]
-                {
-                    tracing::debug!(
-                        lead_id = %self.lead.uuid,
-                        "Buyer responses batch inserted successfully"
+                tracing::debug!(
+                    lead_id = %self.lead.uuid,
+                    response_count = batch_responses.len(),
+                    "Enqueueing buyer responses to write-behind queue"
+                );
+                for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload) in batch_responses {
+                    queue.enqueue(
+                        crate::services::write_behind_queue::BackgroundTask::BuyerResponse {
+                            lead_id,
+                            campaign_id,
+                            ping_id,
+                            post_id,
+                            buyer_id,
+                            payload,
+                        },
                     );
                 }
-            } else if let Err(_e) = &result {
+            } else {
+                // Fallback: synchronous insert if queue unavailable (shouldn't happen in production)
                 #[cfg(feature = "tracing")]
-                tracing::error!("Failed to batch insert buyer responses: {}", _e);
-                #[cfg(feature = "sentry")]
-                {
-                    sentry::capture_message(
-                        &format!("Batch insert buyer responses failed: {}", _e),
-                        sentry::Level::Error,
-                    );
+                tracing::warn!(
+                    lead_id = %self.lead.uuid,
+                    "Write-behind queue unavailable, falling back to synchronous buyer response insert"
+                );
+                let result =
+                    PingTreeRouter::batch_insert_buyer_responses(pool.as_ref(), batch_responses)
+                        .await;
+                if let Err(_e) = &result {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!("Failed to batch insert buyer responses: {}", _e);
+                    #[cfg(feature = "sentry")]
+                    {
+                        sentry::capture_message(
+                            &format!("Batch insert buyer responses failed: {}", _e),
+                            sentry::Level::Error,
+                        );
+                    }
                 }
             }
         }
