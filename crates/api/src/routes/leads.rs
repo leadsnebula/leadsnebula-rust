@@ -168,6 +168,9 @@ async fn create_lead(
     Query(params): Query<std::collections::HashMap<String, String>>,
     Json(payload): Json<LeadRequest>,
 ) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
+    // BLAME-SHIFTING: Track total wall-clock time from request start
+    let request_start = std::time::Instant::now();
+
     // Initialize timing and metrics
     let timing = Arc::new(AtomicAuctionTiming::new());
     let metrics = Arc::new(DiagnosticMetrics::new());
@@ -2382,23 +2385,62 @@ async fn create_lead(
                 serde_json::json!({})
             };
 
+            // Determine final status with explicit sold detection
+            // CRITICAL: Ensure sold leads are always marked as sold, even if status string doesn't match exactly
+            let final_status = if routing_result.success
+                && routing_result.status == "sold"
+                && routing_result.price.is_some()
+                && routing_result.price.unwrap_or(0.0) > 0.0
+            {
+                // Explicitly sold: status="sold", success=true, has price
+                leadsnebula_core::models::enums::LeadStatus::Sold
+            } else if routing_result.success
+                && routing_result.post_id.is_some()
+                && routing_result.price.is_some()
+                && routing_result.price.unwrap_or(0.0) > 0.0
+            {
+                // Post succeeded with price - must be sold (even if status string doesn't say "sold")
+                tracing::warn!(
+                    lead_id = %lead_uuid,
+                    routing_status = %routing_result.status,
+                    has_post_id = true,
+                    has_price = true,
+                    "Detected sold lead (post succeeded with price) but status string was not 'sold' - correcting to Sold"
+                );
+                leadsnebula_core::models::enums::LeadStatus::Sold
+            } else if routing_result.success && routing_result.status == "accepted" {
+                leadsnebula_core::models::enums::LeadStatus::PingAccepted
+            } else {
+                leadsnebula_core::models::enums::LeadStatus::Processing
+            };
+
+            // Log status determination for debugging
+            tracing::warn!(
+                lead_id = %lead_uuid,
+                routing_status = %routing_result.status,
+                routing_success = routing_result.success,
+                has_post_id = routing_result.post_id.is_some(),
+                has_price = routing_result.price.is_some(),
+                price_value = ?routing_result.price,
+                final_status = ?final_status,
+                "Determining final lead status"
+            );
+
             // Store auction timing in database via write-behind queue (non-blocking)
+            let is_sold = matches!(
+                final_status,
+                leadsnebula_core::models::enums::LeadStatus::Sold
+            );
             state.write_behind_queue.enqueue(
                 leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
                     lead_id: lead_uuid,
-                    status: if routing_result.status == "sold" {
-                        leadsnebula_core::models::enums::LeadStatus::Sold
-                    } else if routing_result.status == "accepted" {
-                        leadsnebula_core::models::enums::LeadStatus::PingAccepted
-                    } else {
-                        leadsnebula_core::models::enums::LeadStatus::Processing
-                    },
+                    status: final_status,
                     campaign_id: routing_result.campaign_id,
                     buyer_id: routing_result.buyer_id,
                     promise_id: routing_result.promise_id.clone(),
                     ping_id: routing_result.ping_id.clone(),
                     post_id: routing_result.post_id.clone(),
-                    sold_at: routing_result.status == "sold",
+                    sold_at: is_sold,
                     inprog_token: None,
                     vertical_data: Some(auction_timing_data.clone()),
                 },
@@ -2449,6 +2491,19 @@ async fn create_lead(
             // Log slow requests as WARN (for monitoring), fast requests as DEBUG (reduced overhead)
             let critical_path_elapsed = critical_path_start.elapsed();
             let critical_path_ms = critical_path_elapsed.as_millis() as u64;
+
+            // SENTRY ALERT: Slow critical path
+            #[cfg(feature = "sentry")]
+            if critical_path_ms > 1000 {
+                sentry::capture_message(
+                    &format!(
+                        "Slow critical path: {}ms for lead {}",
+                        critical_path_ms, lead_uuid
+                    ),
+                    sentry::Level::Warning,
+                );
+            }
+
             // Only log if > 500ms (slow requests) or in debug mode
             if critical_path_ms > 500 {
                 tracing::warn!(
@@ -2464,28 +2519,63 @@ async fn create_lead(
                 );
             }
 
-            Ok((
-                StatusCode::OK,
-                Json(LeadResponse {
-                    status: StatusNode {
-                        success: routing_result.success,
-                        status: routing_result.status.clone(),
-                        message,
-                        error: routing_result.error.clone(),
-                    },
-                    lead: LeadNode {
-                        promise_id: routing_result.promise_id.clone(),
-                        lead_id: Some(lead_id),
-                        lead_uuid: Some(lead_uuid.to_string()),
-                        ping_id: None,
-                        bid,
-                        post_id: routing_result.post_id.clone(),
-                        price,
-                    },
-                    verbose: verbose_json,
-                    http_status: Some(200),
-                }),
-            ))
+            // BLAME-SHIFTING: Calculate timing breakdown for async logging (zero overhead)
+            let total_wall_ms = request_start.elapsed().as_millis() as u64;
+            let internal_ms = critical_path_ms;
+            let buyer_post_ms = post_sent_ms;
+            let external_ms = total_wall_ms.saturating_sub(internal_ms);
+
+            // Get DB query time from metrics for Sentry alert
+            let _db_query_time_ms = metrics.get_total_query_time_ms();
+
+            // SENTRY ALERT: Slow DB queries
+            #[cfg(feature = "sentry")]
+            if _db_query_time_ms > 500 {
+                sentry::capture_message(
+                    &format!(
+                        "Slow DB query: {}ms for lead {}",
+                        _db_query_time_ms, lead_uuid
+                    ),
+                    sentry::Level::Warning,
+                );
+            }
+
+            // Build response first (don't wait for logging)
+            let response = LeadResponse {
+                status: StatusNode {
+                    success: routing_result.success,
+                    status: routing_result.status.clone(),
+                    message,
+                    error: routing_result.error.clone(),
+                },
+                lead: LeadNode {
+                    promise_id: routing_result.promise_id.clone(),
+                    lead_id: Some(lead_id),
+                    lead_uuid: Some(lead_uuid.to_string()),
+                    ping_id: None,
+                    bid,
+                    post_id: routing_result.post_id.clone(),
+                    price,
+                },
+                verbose: verbose_json,
+                http_status: Some(200),
+            };
+
+            // BLAME-SHIFTING: Log summary asynchronously (zero impact on response time)
+            let lead_uuid_for_log = lead_uuid;
+            tokio::spawn(async move {
+                tracing::warn!(
+                    lead_id = %lead_uuid_for_log,
+                    internal_ms,
+                    buyer_post_ms,
+                    external_ms,
+                    total_wall_ms,
+                    "SUMMARY: LeadsNebula internal: {}ms | Buyer post: {}ms | External overhead: {}ms | Total wall-clock: {}ms",
+                    internal_ms, buyer_post_ms, external_ms, total_wall_ms
+                );
+            });
+
+            Ok((StatusCode::OK, Json(response)))
         }
         Err(e) => {
             tracing::error!("Routing error: {}", e);

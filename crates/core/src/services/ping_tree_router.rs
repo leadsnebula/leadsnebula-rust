@@ -7,6 +7,7 @@ use crate::services::auction_timing::AtomicAuctionTiming;
 use crate::services::buyer_router::BuyerResponse;
 use crate::services::diagnostic_metrics::DiagnosticMetrics;
 use anyhow::Result;
+use chrono;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hex;
 use rand;
@@ -1341,6 +1342,25 @@ impl PingTreeRouter {
                 encryption_key_clone,
             )
             .with_cache(self.cache.clone());
+
+            // BLAME-SHIFTING: Log hand-off timestamp before buyer post
+            let handoff_instant = chrono::Utc::now();
+            let handoff_timestamp = handoff_instant.to_rfc3339();
+            let internal_time_before_handoff = if let Some(ref t) = timing {
+                t.get_total_ms()
+            } else {
+                0
+            };
+
+            tracing::info!(
+                lead_id = %self.lead.uuid,
+                stage = "handoff_to_buyer",
+                internal_time_ms = internal_time_before_handoff,
+                handoff_timestamp = %handoff_timestamp,
+                buyer_id = %campaign.buyer_id,
+                campaign_id = %campaign.id,
+                "LeadsNebula handing off to buyer — internal work complete"
+            );
 
             let post_start = std::time::Instant::now();
             let post_result = buyer_router.route().await;

@@ -99,6 +99,23 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
         .await
         .map_err(|e| anyhow::anyhow!("Database connection test failed: {}", e))?;
 
+    // Set statement timeout for migrations - Neon free-tier can be very slow
+    // This must be set before migrations run, as migrations can take 60+ seconds
+    let is_test_env = database_url.contains("ci-local-")
+        || database_url.contains("test-")
+        || std::env::var("TEST_MODE").is_ok()
+        || std::env::var("NEON_BRANCH").is_ok()
+        || std::env::var("CI").is_ok()
+        || std::env::var("EPHEMERAL_DB").is_ok();
+
+    if is_test_env {
+        // Set 60s timeout for test environments (migrations can be slow on Neon free-tier)
+        sqlx::query("SET statement_timeout = '60s'")
+            .execute(&pool)
+            .await
+            .ok(); // Non-critical - if this fails, migrations will use default timeout
+    }
+
     // Find migrations directory
     if let Ok(migrations_path) = find_migrations_dir() {
         // Determine test mode early - needed for table creation logic

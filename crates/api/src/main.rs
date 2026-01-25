@@ -283,9 +283,32 @@ async fn main() -> anyhow::Result<()> {
                 cache_warmup::start_periodic_warmup(state_for_periodic).await;
             });
 
-            // Keep Neon warm (prevents 5-6s cold starts on free tier)
-            // Runs every 4 minutes to prevent auto-suspend (free tier suspends after 5 min)
+            // SAMURAI PERFECTION: Keep Neon warm (prevents 5-6s cold starts on free tier)
+            // Run immediately on startup, then every 4 minutes to prevent auto-suspend
             tokio::spawn(async move {
+                // Run first keep-alive immediately (no delay)
+                let start = std::time::Instant::now();
+                match sqlx::query("SELECT 1")
+                    .execute(pool_for_keepalive.as_ref())
+                    .await
+                {
+                    Ok(_) => {
+                        let duration_ms = start.elapsed().as_millis();
+                        if duration_ms > 50 {
+                            tracing::warn!(
+                                neon_keepalive_ms = duration_ms,
+                                "Neon initial keep-alive slow (may indicate cold start)"
+                            );
+                        } else {
+                            tracing::info!("Neon initial keep-alive OK ({}ms)", duration_ms);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Neon initial keep-alive failed: {}", e);
+                    }
+                }
+
+                // Then continue with periodic keep-alive every 4 minutes
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(240)); // 4 min
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {

@@ -12,3 +12,9 @@ test-all = "test --all-targets --all-features --locked"
 nextest-fast = "nextest run --lib --locked --all-features"
 nextest-slow = "nextest run --test '*' --locked --all-features"
 nextest-all = "nextest run --locked --all-features"
+
+# WSL: Use system linker instead of rust-lld to prevent OOM with large binaries
+# This is set conditionally in scripts, but can be overridden here if needed
+# [target.x86_64-unknown-linux-gnu]
+# linker = "gcc"
+# rustflags = ["-C", "link-arg=-fuse-ld=gold"]

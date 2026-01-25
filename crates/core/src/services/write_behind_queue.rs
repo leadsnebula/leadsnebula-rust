@@ -84,6 +84,18 @@ mod async_log {
     /// Log lead update (async, non-blocking)
     pub fn log_lead_update(lead_id: Uuid, status: LeadStatus, duration_ms: u64) {
         tokio::spawn(async move {
+            // SENTRY ALERT: Slow persist operations
+            #[cfg(feature = "sentry")]
+            if duration_ms > 300 {
+                sentry::capture_message(
+                    &format!(
+                        "Slow lead update persist: {}ms for lead {}",
+                        duration_ms, lead_id
+                    ),
+                    sentry::Level::Warning,
+                );
+            }
+
             // Must have: Lead status changes (especially Sold transitions)
             let is_sold = matches!(status, LeadStatus::Sold);
             let is_slow = duration_ms > 200;

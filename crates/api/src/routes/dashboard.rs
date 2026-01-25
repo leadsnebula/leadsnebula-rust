@@ -940,13 +940,12 @@ async fn register_passkey(
         sqlx::query(
             r#"
             INSERT INTO webauthn_credentials (
-                id, instance_user_id, instance_user_id, external_id, public_key, sign_count,
+                id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
                 name, passkey_type, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+            ) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, NOW(), NOW())
             "#,
         )
         .bind(passkey_id)
-        .bind(user.id)
         .bind(user.id)
         .bind(cred_id)
         .bind(public_key_str)
@@ -5830,7 +5829,8 @@ async fn list_leads(
             std::collections::HashMap::new()
         };
 
-    // Batch fetch all buyer_responses for all leads
+    // Batch fetch all buyer_responses for all leads (including both ping and post responses)
+    // FIX: Removed post_id IS NULL filter to include post responses for fullpost requests
     let all_buyer_responses: std::collections::HashMap<Uuid, Vec<sqlx::postgres::PgRow>> =
         if !lead_uuids.is_empty() {
             sqlx::query(
@@ -5839,6 +5839,7 @@ async fn list_leads(
                 br.lead_id,
                 br.id,
                 br.ping_id,
+                br.post_id,
                 br.buyer_id,
                 br.campaign_id,
                 br.payload,
@@ -5850,10 +5851,10 @@ async fn list_leads(
             LEFT JOIN buyers b ON br.buyer_id = b.id AND b.deleted_at IS NULL
             LEFT JOIN campaigns c ON br.campaign_id = c.id AND c.deleted_at IS NULL
             WHERE br.lead_id = ANY($1)
-            AND br.post_id IS NULL
             AND (
                 br.ping_id IS NOT NULL 
-                OR (br.ping_id IS NULL AND (br.payload->>'status' IN ('timeout', 'error', 'accepted', 'rejected')))
+                OR br.post_id IS NOT NULL
+                OR (br.ping_id IS NULL AND br.post_id IS NULL AND (br.payload->>'status' IN ('timeout', 'error', 'accepted', 'rejected', 'sold')))
             )
             ORDER BY br.lead_id, br.created_at ASC
             "#
@@ -6041,7 +6042,19 @@ async fn list_leads(
             .map(|rows| rows.iter().collect())
             .unwrap_or_default();
 
-        let ping_payloads: Vec<serde_json::Value> = buyer_responses_raw
+        // Separate ping responses (post_id IS NULL) from post responses (post_id IS NOT NULL)
+        let ping_responses: Vec<&sqlx::postgres::PgRow> = buyer_responses_raw
+            .iter()
+            .filter(|row| {
+                row.try_get::<Option<String>, _>("post_id")
+                    .ok()
+                    .flatten()
+                    .is_none()
+            })
+            .copied()
+            .collect();
+
+        let ping_payloads: Vec<serde_json::Value> = ping_responses
         .iter()
         .map(|ping_row| {
             let ping_id: Option<String> = ping_row.try_get::<Option<String>, _>("ping_id").ok().flatten();
@@ -6118,23 +6131,52 @@ async fn list_leads(
         .collect();
 
         // Get post payload from batched query (already fetched above)
+        // FIX: Make lookup more flexible - try exact match first, then fallback to any post for this lead
+        // Also check buyer_responses for post responses (fullpost requests store post responses there)
         let post_payload: Option<serde_json::Value> = if let Ok(Some(post_id_str)) =
             row.try_get::<Option<String>, _>("post_id")
         {
-            all_post_payloads
+            // First try post_payloads table (exact match)
+            let post_payload_from_table = all_post_payloads
                 .get(&(lead_uuid, post_id_str.clone()))
-                .map(|post_row| {
-                let payload: Option<serde_json::Value> = post_row.try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload").ok().flatten().map(|j| j.0);
-                let request_encrypted: Option<String> = post_row.try_get::<Option<String>, _>("request_payload_encrypted").ok().flatten();
-                let response_encrypted: Option<String> = post_row.try_get::<Option<String>, _>("response_payload_encrypted").ok().flatten();
-                let processing_time_ms: Option<f64> = post_row.try_get::<Option<f64>, _>("processing_time_ms").ok().flatten();
+                .or_else(|| {
+                    // Fallback: find any post_payload for this lead (in case post_id doesn't match exactly)
+                    all_post_payloads
+                        .iter()
+                        .find(|((lid, _), _)| *lid == lead_uuid)
+                        .map(|(_, row)| row)
+                });
 
-                // Try to decrypt encrypted payloads using SSM deterministic key
-                // Try decrypt_envelope first (Rails format), fallback to simple decrypt
-                let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
-                    enc.and_then(|e| {
-                        // Try Rails envelope format first
-                        leadsnebula_core::encryption::EncryptionService::decrypt_envelope(&pii_decryption_key, &e)
+            if let Some(post_row) = post_payload_from_table {
+                // Found in post_payloads table
+                Some({
+                    let payload: Option<serde_json::Value> = post_row
+                        .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+                        .ok()
+                        .flatten()
+                        .map(|j| j.0);
+                    let request_encrypted: Option<String> = post_row
+                        .try_get::<Option<String>, _>("request_payload_encrypted")
+                        .ok()
+                        .flatten();
+                    let response_encrypted: Option<String> = post_row
+                        .try_get::<Option<String>, _>("response_payload_encrypted")
+                        .ok()
+                        .flatten();
+                    let processing_time_ms: Option<f64> = post_row
+                        .try_get::<Option<f64>, _>("processing_time_ms")
+                        .ok()
+                        .flatten();
+
+                    // Try to decrypt encrypted payloads using SSM deterministic key
+                    // Try decrypt_envelope first (Rails format), fallback to simple decrypt
+                    let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
+                        enc.and_then(|e| {
+                            // Try Rails envelope format first
+                            leadsnebula_core::encryption::EncryptionService::decrypt_envelope(
+                                &pii_decryption_key,
+                                &e,
+                            )
                             .ok()
                             .or_else(|| {
                                 // Fallback to simple decrypt
@@ -6143,23 +6185,24 @@ async fn list_leads(
                                     .and_then(|svc| svc.decrypt(&e).ok())
                             })
                             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    })
-                };
+                        })
+                    };
 
-                // Request payload: try encrypted first, then fallback to payload JSONB
-                let request_payload = decrypt_payload(request_encrypted)
-                    .or_else(|| payload.clone());
+                    // Request payload: try encrypted first, then fallback to payload JSONB
+                    let request_payload =
+                        decrypt_payload(request_encrypted).or_else(|| payload.clone());
 
-                // Response payload: stored in response_payload_encrypted when encrypted
-                // The response contains routing_result with price (for post requests)
-                let response_payload_decrypted = decrypt_payload(response_encrypted);
+                    // Response payload: stored in response_payload_encrypted when encrypted
+                    // The response contains routing_result with price (for post requests)
+                    let response_payload_decrypted = decrypt_payload(response_encrypted);
 
-                // Extract price from response
-                // For post requests, routing_result.price is the final sale price
-                let price = response_payload_decrypted.as_ref()
-                    .and_then(|r| r.get("routing_result"))
-                    .and_then(|rr| rr.get("price"))
-                    .and_then(|p| p.as_f64());
+                    // Extract price from response
+                    // For post requests, routing_result.price is the final sale price
+                    let price = response_payload_decrypted
+                        .as_ref()
+                        .and_then(|r| r.get("routing_result"))
+                        .and_then(|rr| rr.get("price"))
+                        .and_then(|p| p.as_f64());
 
                     serde_json::json!({
                         "id": post_row.try_get::<i64, _>("id").ok(),
@@ -6171,6 +6214,77 @@ async fn list_leads(
                         "created_at": post_row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at").ok().flatten().map(|d| d.to_rfc3339()),
                     })
                 })
+            } else {
+                // Not found in post_payloads, check buyer_responses for post responses
+                let post_responses: Vec<&sqlx::postgres::PgRow> = buyer_responses_raw
+                    .iter()
+                    .filter(|row| {
+                        row.try_get::<Option<String>, _>("post_id")
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            .map(|pid| pid == &post_id_str)
+                            .unwrap_or(false)
+                    })
+                    .copied()
+                    .collect();
+
+                if let Some(post_row) = post_responses.first() {
+                    // Build post payload from buyer_response
+                    let payload: Option<serde_json::Value> = post_row
+                        .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+                        .ok()
+                        .flatten()
+                        .map(|j| j.0);
+                    let response_encrypted: Option<String> = post_row
+                        .try_get::<Option<String>, _>("response_payload_encrypted")
+                        .ok()
+                        .flatten();
+
+                    let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
+                        enc.and_then(|e| {
+                            leadsnebula_core::encryption::EncryptionService::decrypt_envelope(
+                                &pii_decryption_key,
+                                &e,
+                            )
+                            .ok()
+                            .or_else(|| {
+                                EncryptionService::new(&pii_decryption_key)
+                                    .ok()
+                                    .and_then(|svc| svc.decrypt(&e).ok())
+                            })
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        })
+                    };
+
+                    let response_payload_decrypted =
+                        decrypt_payload(response_encrypted).or_else(|| payload.clone());
+
+                    let price = response_payload_decrypted
+                        .as_ref()
+                        .and_then(|r| r.get("routing_result"))
+                        .and_then(|rr| rr.get("price"))
+                        .and_then(|p| p.as_f64())
+                        .or_else(|| {
+                            response_payload_decrypted
+                                .as_ref()
+                                .and_then(|r| r.get("price"))
+                                .and_then(|p| p.as_f64())
+                        });
+
+                    Some(serde_json::json!({
+                        "id": post_row.try_get::<i64, _>("id").ok(),
+                        "post_id": post_id_str,
+                        "price": price,
+                        "processing_time_ms": None::<f64>,
+                        "request_payload": None::<serde_json::Value>,
+                        "response_payload": response_payload_decrypted,
+                        "created_at": post_row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at").ok().flatten().map(|d| d.to_rfc3339()),
+                    }))
+                } else {
+                    None
+                }
+            }
         } else {
             None
         };

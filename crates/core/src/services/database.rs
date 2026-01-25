@@ -43,8 +43,16 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
                     Box::pin(async move {
                         // Pre-warm with a simple query
                         sqlx::query("SELECT 1").execute(&mut *conn).await?;
-                        // Set statement timeout to prevent long-running queries
-                        sqlx::query("SET statement_timeout = '5s'")
+                        // Set statement timeout - increased for Neon free-tier slowness
+                        // Migrations can take 60+ seconds on slow Neon free-tier, especially during concurrent test runs
+                        let timeout = if std::env::var("CI").is_ok()
+                            || std::env::var("EPHEMERAL_DB").is_ok()
+                        {
+                            "60s" // CI/tests: much longer timeout for Neon free-tier migrations
+                        } else {
+                            "10s" // Production: reasonable timeout
+                        };
+                        sqlx::query(&format!("SET statement_timeout = '{}'", timeout))
                             .execute(&mut *conn)
                             .await?;
                         Ok(())

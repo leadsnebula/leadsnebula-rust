@@ -462,9 +462,9 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO webauthn_credentials (
-            id, instance_user_id, external_id, public_key, sign_count,
+            id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
             name, passkey_type, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        ) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, NOW(), NOW())
         "#,
     )
     .bind(passkey_id)
@@ -524,9 +524,9 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO webauthn_credentials (
-                id, instance_user_id, external_id, public_key, sign_count,
+                id, platform_user_id, instance_user_id, external_id, public_key, sign_count,
                 name, passkey_type, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, 0, $5, 'soft', NOW(), NOW())
+            ) VALUES ($1, $2, $2, $3, $4, 0, $5, 'soft', NOW(), NOW())
             "#,
         )
         .bind(passkey_id)

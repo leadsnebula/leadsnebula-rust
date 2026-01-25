@@ -436,15 +436,17 @@ impl BuyerRouter {
         {
             Ok(resp) => {
                 let post_duration = post_start.elapsed().as_millis() as u64;
-                tracing::info!(
-                    operation = "http_request",
-                    method = "POST",
-                    endpoint = %endpoint,
-                    campaign_id = %campaign.id,
+                // BLAME-SHIFTING: Enhanced buyer response breakdown
+                tracing::warn!(
+                    lead_id = %self.lead.uuid,
                     buyer_id = %campaign.buyer_id,
+                    campaign_id = %campaign.id,
+                    buyer_post_duration_ms = post_duration,
                     status_code = resp.status().as_u16(),
-                    duration_ms = post_duration,
-                    "HTTP post request sent and response received"
+                    endpoint = %endpoint,
+                    success = resp.status().is_success(),
+                    "EXTERNAL BUYER POST COMPLETED - Buyer took {}ms to respond",
+                    post_duration
                 );
                 resp
             }
