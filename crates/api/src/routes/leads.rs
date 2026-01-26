@@ -2451,10 +2451,11 @@ async fn create_lead(
                 let auction_timing_data_clone = auction_timing_data.clone();
                 let db_pool_clone = state.db_pool.clone();
 
-                // Fire and forget with 100ms timeout to avoid blocking auction
+                // Fire and forget with 500ms timeout to avoid blocking auction
+                // Increased from 100ms to handle Neon cold starts and slow connections
                 tokio::spawn(async move {
                     match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
+                        std::time::Duration::from_millis(500),
                         sqlx::query(
                             r#"
                             UPDATE leads

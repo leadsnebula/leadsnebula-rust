@@ -570,18 +570,25 @@ impl WriteBehindQueue {
         {
             let update_start = Instant::now();
             if *sold_at && *status == LeadStatus::Sold {
-                // Update with sold_at and conditional post_id check
+                // Update with sold_at and ALL fields (campaign_id, buyer_id, ping_id, promise_id, post_id, vertical_data)
+                // CRITICAL: Must update all fields, not just post_id and status, so leads show complete information
                 if let Some(token) = inprog_token {
                     match sqlx::query(
                         r#"
                         UPDATE leads
-                        SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW()
-                        WHERE uuid = $3 AND post_id = $4
+                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7,
+                            sold_at = NOW(), vertical_data = $8, updated_at = NOW()
+                        WHERE uuid = $1 AND post_id = $9
                         "#,
                     )
-                    .bind(post_id)
-                    .bind(status)
                     .bind(lead_id)
+                    .bind(status)
+                    .bind(campaign_id)
+                    .bind(buyer_id)
+                    .bind(promise_id)
+                    .bind(ping_id)
+                    .bind(post_id)
+                    .bind(vertical_data.as_ref().map(sqlx::types::Json))
                     .bind(token)
                     .execute(pool)
                     .await
@@ -607,13 +614,19 @@ impl WriteBehindQueue {
                     match sqlx::query(
                         r#"
                         UPDATE leads
-                        SET post_id = $1, status = $2, sold_at = NOW(), updated_at = NOW()
-                        WHERE uuid = $3
+                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7,
+                            sold_at = NOW(), vertical_data = $8, updated_at = NOW()
+                        WHERE uuid = $1
                         "#,
                     )
-                    .bind(post_id)
-                    .bind(status)
                     .bind(lead_id)
+                    .bind(status)
+                    .bind(campaign_id)
+                    .bind(buyer_id)
+                    .bind(promise_id)
+                    .bind(ping_id)
+                    .bind(post_id)
+                    .bind(vertical_data.as_ref().map(sqlx::types::Json))
                     .execute(pool)
                     .await
                     {
@@ -732,15 +745,21 @@ impl WriteBehindQueue {
         ) in updates
         {
             if payload_type == "ping" {
-                // Update ping_payloads with response_payload_encrypted and external_ping_id
-                // Note: ping_payloads_row_id is actually lead_id (used to find the row)
+                // Upsert ping_payloads with response_payload_encrypted and external_ping_id
+                // Handle race condition where UPDATE happens before INSERT by trying UPDATE first, then INSERT if no rows affected
+                // Note: ping_payloads_row_id is actually lead_id (used to find/create the row)
+                // Since ping_payloads doesn't have UNIQUE constraint on lead_id, we update the most recent row or insert if none exists
                 if let Some(_row_id) = ping_payloads_row_id {
-                    // Update by lead_id (more reliable than using row id)
-                    let _ = sqlx::query(
+                    // Try UPDATE first (most common case - row exists from LeadCreation)
+                    let update_result = sqlx::query(
                         r#"
                         UPDATE ping_payloads
-                        SET payload = COALESCE(payload, 'null'::jsonb), response_payload_encrypted = $1, external_ping_id = $2, updated_at = now()
+                        SET payload = COALESCE(payload, 'null'::jsonb),
+                            response_payload_encrypted = COALESCE($1, response_payload_encrypted),
+                            external_ping_id = COALESCE($2, external_ping_id),
+                            updated_at = NOW()
                         WHERE lead_id = $3
+                        AND id = (SELECT id FROM ping_payloads WHERE lead_id = $3 ORDER BY created_at DESC LIMIT 1)
                         "#,
                     )
                     .bind(response_payload_encrypted)
@@ -748,13 +767,35 @@ impl WriteBehindQueue {
                     .bind(lead_id)
                     .execute(pool)
                     .await;
+
+                    // If UPDATE affected 0 rows, INSERT a new row (handles race condition)
+                    if let Ok(rows_affected) = update_result {
+                        if rows_affected.rows_affected() == 0 {
+                            let _ = sqlx::query(
+                                r#"
+                                INSERT INTO ping_payloads (lead_id, payload, response_payload_encrypted, external_ping_id, created_at, updated_at)
+                                VALUES ($1, COALESCE($2::jsonb, 'null'::jsonb), $3, $4, NOW(), NOW())
+                                "#,
+                            )
+                            .bind(lead_id)
+                            .bind(sqlx::types::Json(payload))
+                            .bind(response_payload_encrypted)
+                            .bind(external_ping_id)
+                            .execute(pool)
+                            .await;
+                        }
+                    }
                 } else {
-                    // Fallback: update by lead_id
-                    let _ = sqlx::query(
+                    // Fallback: try UPDATE, then INSERT if no rows affected
+                    let update_result = sqlx::query(
                         r#"
                         UPDATE ping_payloads
-                        SET payload = $2, response_payload_encrypted = $3, external_ping_id = $4, updated_at = NOW()
+                        SET payload = COALESCE($2, payload),
+                            response_payload_encrypted = COALESCE($3, response_payload_encrypted),
+                            external_ping_id = COALESCE($4, external_ping_id),
+                            updated_at = NOW()
                         WHERE lead_id = $1
+                        AND id = (SELECT id FROM ping_payloads WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 1)
                         "#,
                     )
                     .bind(lead_id)
@@ -763,6 +804,24 @@ impl WriteBehindQueue {
                     .bind(external_ping_id)
                     .execute(pool)
                     .await;
+
+                    // If UPDATE affected 0 rows, INSERT a new row
+                    if let Ok(rows_affected) = update_result {
+                        if rows_affected.rows_affected() == 0 {
+                            let _ = sqlx::query(
+                                r#"
+                                INSERT INTO ping_payloads (lead_id, payload, response_payload_encrypted, external_ping_id, created_at, updated_at)
+                                VALUES ($1, $2, $3, $4, NOW(), NOW())
+                                "#,
+                            )
+                            .bind(lead_id)
+                            .bind(sqlx::types::Json(payload))
+                            .bind(response_payload_encrypted)
+                            .bind(external_ping_id)
+                            .execute(pool)
+                            .await;
+                        }
+                    }
                 }
             } else if payload_type == "post" {
                 // Insert into post_payloads with all fields

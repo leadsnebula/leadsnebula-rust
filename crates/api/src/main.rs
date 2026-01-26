@@ -345,8 +345,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Then continue with periodic keep-alive every 4 minutes
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(240)); // 4 min
+                // Then continue with periodic keep-alive every 2 minutes
+                // Reduced from 4 minutes to prevent Neon free-tier auto-suspend (suspends after 5 min inactivity)
+                // 2 minutes ensures we ping before suspend threshold, preventing 115-130ms cold start delays
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(120)); // 2 min
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
