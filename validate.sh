@@ -8,7 +8,7 @@
 # Environment variables (for WSL stability):
 #   SKIP_CLEANUP=true      # Skip incremental artifact cleanup (NOT recommended - corrupt artifacts cause crashes)
 #   SKIP_RELEASE_BUILD=true # Skip resource-intensive release build (recommended in WSL)
-#   SKIP_CLIPPY=true       # Skip clippy check (only if cleanup doesn't help)
+#   SKIP_CLIPPY=true       # Skip clippy check (not recommended - validate.sh should catch CI issues)
 #   SKIP_TESTS=true        # Skip unit tests (only if needed)
 #   SKIP_BUILD=true        # Skip release build (same as SKIP_RELEASE_BUILD)
 #   ULTRA_SAFE_MODE=true   # Ultra-safe mode: skip all heavy operations (clippy, tests, build)
@@ -54,14 +54,18 @@ for arg in "$@"; do
     fi
 done
 
-# WSL-specific defaults: skip clippy and release build by default to prevent crashes
-# NOTE: Clippy can crash WSL when processing corrupt incremental artifacts, even after cleanup
-# Cleanup runs by default to remove corrupt artifacts, but clippy is skipped to be safe
+# WSL-specific defaults: limit resources but still run clippy
+# NOTE: Clippy can crash WSL when processing corrupt incremental artifacts or with high parallelism
+# Cleanup runs by default to remove corrupt artifacts BEFORE clippy
+# We limit CARGO_BUILD_JOBS for clippy in WSL to prevent memory exhaustion
 if [ "$IS_WSL" = "true" ]; then
+    # Clippy runs by default, but with limited parallelism to prevent crashes
+    # User can still skip with SKIP_CLIPPY=true if needed
     if [ -z "${SKIP_CLIPPY:-}" ]; then
-        export SKIP_CLIPPY=true
-        echo "🔧 WSL detected: Auto-enabling SKIP_CLIPPY=true to prevent crashes"
-        echo "   Override with: SKIP_CLIPPY=false ./validate.sh"
+        # Clippy will run, but with CARGO_BUILD_JOBS=1 to prevent memory issues
+        export CLIPPY_JOBS=1
+        echo "🔧 WSL detected: Clippy will run with CARGO_BUILD_JOBS=1 to prevent crashes"
+        echo "   Skip with: SKIP_CLIPPY=true ./validate.sh"
     fi
     if [ -z "${SKIP_RELEASE_BUILD:-}" ]; then
         export SKIP_RELEASE_BUILD=true
@@ -233,9 +237,17 @@ else
     # Add timeout to prevent WSL crashes from hanging cargo commands
     # Use shorter timeout in WSL to fail fast
     # Set resource limits to prevent memory exhaustion
-    TIMEOUT_CLIPPY=$([ "$IS_WSL" = "true" ] && echo "240" || echo "300")
+    TIMEOUT_CLIPPY=$([ "$IS_WSL" = "true" ] && echo "600" || echo "300")  # 10 min in WSL (sequential), 5 min elsewhere
     (ulimit -v 2097152 2>/dev/null || true)  # Limit virtual memory to 2GB for clippy
-    if ! timeout "$TIMEOUT_CLIPPY" cargo clippy --all-targets --all-features -- -D warnings; then
+    
+    # In WSL, limit parallelism for clippy to prevent memory exhaustion
+    # Clippy compiles code, so it needs the same safeguards as regular compilation
+    if [ "$IS_WSL" = "true" ] && [ -n "${CLIPPY_JOBS:-}" ]; then
+        export CARGO_BUILD_JOBS="$CLIPPY_JOBS"
+        echo "   Using CARGO_BUILD_JOBS=$CLIPPY_JOBS for clippy (WSL safety)"
+    fi
+    
+    if ! timeout "$TIMEOUT_CLIPPY" cargo clippy --workspace --all-targets --all-features -- -D warnings; then
         EXIT_CODE=$?
         if [ $EXIT_CODE -eq 124 ]; then
             echo "❌ Clippy check timed out (5 minutes). This may indicate WSL/filesystem issues."
