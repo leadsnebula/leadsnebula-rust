@@ -2413,6 +2413,22 @@ async fn create_lead(
                     "Detected sold lead (post succeeded with price) but status string was not 'sold' - correcting to Sold"
                 );
                 leadsnebula_core::models::enums::LeadStatus::Sold
+            } else if routing_result.success
+                && routing_result.campaign_id.is_some()
+                && routing_result.buyer_id.is_some()
+                && routing_result.price.is_some()
+                && routing_result.price.unwrap_or(0.0) > 0.0
+            {
+                // Buyer selected with price - must be sold (fallback for cases where post_id might be None)
+                tracing::warn!(
+                    lead_id = %lead_uuid,
+                    routing_status = %routing_result.status,
+                    has_campaign_id = true,
+                    has_buyer_id = true,
+                    has_price = true,
+                    "Detected sold lead (buyer selected with price) but status/post_id conditions not met - correcting to Sold"
+                );
+                leadsnebula_core::models::enums::LeadStatus::Sold
             } else if routing_result.success && routing_result.status == "accepted" {
                 leadsnebula_core::models::enums::LeadStatus::PingAccepted
             } else {
