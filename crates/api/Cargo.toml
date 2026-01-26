@@ -27,7 +27,7 @@ tracing-flame = { workspace = true }
 tracing-opentelemetry = "0.22"
 opentelemetry = "0.23"
 opentelemetry-otlp = "0.16"
-mimalloc = "0.1"
+mimalloc = { version = "0.1", optional = true }
 tokio-retry = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
@@ -50,11 +50,14 @@ sentry = { version = "0.32", optional = true }
 sentry-tower = { version = "0.32", optional = true }
 
 [features]
-default = ["webauthn"]
+default = ["webauthn", "mimalloc"]
 profiling = []
 sentry = ["dep:sentry", "dep:sentry-tower", "leadsnebula_core/sentry"]
 tracing = ["leadsnebula_core/tracing"]
 webauthn = ["dep:webauthn-rs", "dep:url", "leadsnebula_core/webauthn"]
+# mimalloc compiles native C code (libmimalloc-sys) which causes WSL crashes during tests
+# Tests should use --no-default-features to exclude mimalloc
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 ctor = { workspace = true }

@@ -86,4 +86,9 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+# CRITICAL: Increase codegen-units to reduce parallel codegen memory usage
+# Higher units (256 vs default 16) serializes codegen more, reducing bursty memory peaks
+# during compilation of macro-heavy crates (AWS SDK, protobuf, sqlx)
+# This prevents WSL OOM crashes during parallel compilation
+codegen-units = 256
 

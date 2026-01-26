@@ -13,8 +13,14 @@ nextest-fast = "nextest run --lib --locked --all-features"
 nextest-slow = "nextest run --test '*' --locked --all-features"
 nextest-all = "nextest run --locked --all-features"
 
-# WSL: Use system linker instead of rust-lld to prevent OOM with large binaries
-# This is set conditionally in scripts, but can be overridden here if needed
-# [target.x86_64-unknown-linux-gnu]
-# linker = "gcc"
-# rustflags = ["-C", "link-arg=-fuse-ld=gold"]
+# Clean corrupted artifacts (WSL crash recovery)
+# Removes corrupted rlib files from known problematic crates (proptest, loom, AWS SDK)
+clean-corrupt = "clean -p proptest -p loom -p aws-sdk-ssm -p aws-sdk-sesv2"
+
+# CRITICAL: Use faster linker (lld) instead of bfd to reduce memory usage during linking
+# bfd is slow/memory-heavy for large crates; lld is faster/lower-mem
+# This prevents WSL OOM crashes during linking phase
+# Install clang/lld in WSL: sudo apt install clang lld
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

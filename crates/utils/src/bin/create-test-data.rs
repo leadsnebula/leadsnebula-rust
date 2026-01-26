@@ -184,8 +184,9 @@ async fn get_or_create_ping_tree(
     instance_id: &Uuid,
     publisher_id: &Uuid,
 ) -> Result<Uuid> {
+    // Check if ping tree exists via ping_tree_publishers join table
     let ping_tree_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM ping_trees WHERE publisher_id = $1 AND vertical = 'solar' LIMIT 1",
+        "SELECT ping_tree_id FROM ping_tree_publishers WHERE publisher_id = $1 AND vertical = 'solar' LIMIT 1",
     )
     .bind(publisher_id)
     .fetch_optional(pool)
@@ -195,20 +196,35 @@ async fn get_or_create_ping_tree(
         return Ok(id);
     }
 
+    // Create ping tree (without publisher_id - publishers linked via join table)
     let new_id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO ping_trees (
-            id, instance_id, publisher_id, name, vertical, strategy, status,
+            id, instance_id, name, vertical, strategy, status,
             priority, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, 'Test Ping Tree', 'solar', 'ping_post', 'active',
+            $1, $2, 'Test Ping Tree', 'solar', 'ping_post', 'active',
             1, NOW(), NOW()
         )
         "#,
     )
     .bind(new_id)
     .bind(instance_id)
+    .execute(pool)
+    .await?;
+
+    // Link publisher to ping tree via join table
+    sqlx::query(
+        r#"
+        INSERT INTO ping_tree_publishers (
+            id, ping_tree_id, publisher_id, vertical, revshare_percentage, created_at, updated_at
+        ) VALUES (
+            gen_random_uuid(), $1, $2, 'solar', 80.0, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(new_id)
     .bind(publisher_id)
     .execute(pool)
     .await?;

@@ -215,68 +215,184 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     mc.insert(database_url.clone());
                 } // Release lock before async operations
 
+                // Check if migrations are already applied BEFORE doing any table manipulation
+                // This prevents race conditions when migrations were run before tests (e.g., in autotestsall.sh)
+                // Also check if key tables exist (ping_tree_publishers, webauthn_credentials with platform_user_id)
+                // This is a more reliable indicator than just checking the migrations table
+                let migrations_check = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
+                    )
+                    .fetch_one(&pool),
+                )
+                .await;
+                let migrations_table_has_records = match migrations_check {
+                    Ok(Ok(count)) => count > 0,
+                    _ => false,
+                };
+
+                // Also check if key tables/columns exist (more reliable than just checking migrations table)
+                let key_tables_exist = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables WHERE table_name = 'ping_tree_publishers'
+                        ) AND EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
+                        )"
+                    )
+                    .fetch_one(&pool),
+                )
+                .await;
+                let key_tables_ok = match key_tables_exist {
+                    Ok(Ok(true)) => true,
+                    _ => false,
+                };
+
+                // Migrations are already applied if either:
+                // 1. Migrations table has records, OR
+                // 2. Key tables/columns exist (more reliable - survives migrations table drops)
+                let migrations_already_applied = migrations_table_has_records || key_tables_ok;
+
                 // Simple, clean migration logic for test mode
-                // In test mode (ephemeral Neon branches), always drop and recreate _sqlx_migrations
-                // This ensures a clean slate and prevents checksum mismatches from copied state
+                // In test mode (ephemeral Neon branches), only drop and recreate _sqlx_migrations
+                // if migrations haven't been applied yet (prevents race conditions with parallel tests)
+                // If migrations are already applied (e.g., from autotestsall.sh), skip table manipulation
                 // NOTE: "ep-" in URL is Neon endpoint naming, NOT a test indicator - only check for actual test prefixes
                 // CI environment variable indicates we're in CI (GitHub Actions, etc.) and should treat as test mode
 
-                if is_test_mode {
+                // CRITICAL: Don't drop migrations table if migrations are already applied
+                // This prevents losing migration history when migrations were run explicitly before tests
+                // If key tables exist (ping_tree_publishers, webauthn_credentials with platform_user_id),
+                // we know migrations were applied, so skip all table manipulation
+                //
+                // IMPORTANT: Even if migrations_already_applied is true, we still need to ensure
+                // the schema is correct. The migrations might have run but the schema might be wrong
+                // (e.g., from copied Neon branches with partial migrations)
+                if is_test_mode && !migrations_already_applied {
                     // In test mode, drop and recreate _sqlx_migrations table to ensure clean state
                     // This prevents checksum mismatches from copied branch state
-                    // Remove CASCADE to avoid dropping dependent types that might cause "type already exists" errors
-                    sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
+                    // Only do this if migrations haven't been applied yet (avoids race conditions)
+                    // Use advisory lock to serialize this operation across parallel tests
+                    let lock_acquired = match sqlx::query_scalar::<_, bool>(
+                        "SELECT pg_try_advisory_lock(hashtext($1))",
+                    )
+                    .bind(&database_url)
+                    .fetch_one(&pool)
+                    .await
+                    {
+                        Ok(true) => true,
+                        _ => false,
+                    };
+
+                    if lock_acquired {
+                        // We got the lock - safe to drop/recreate
+                        sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
+                            .execute(&pool)
+                            .await
+                            .ok();
+
+                        // Small delay to ensure DROP is committed before CREATE
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                        // Recreate table with exact SQLx schema
+                        sqlx::query(
+                            "CREATE TABLE _sqlx_migrations (
+                                version BIGINT PRIMARY KEY,
+                                description TEXT NOT NULL,
+                                installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                success BOOLEAN NOT NULL,
+                                checksum BYTEA NOT NULL,
+                                execution_time BIGINT NOT NULL
+                            )",
+                        )
                         .execute(&pool)
                         .await
-                        .ok();
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to recreate _sqlx_migrations table in test mode: {}",
+                                e
+                            )
+                        })?;
 
-                    // Small delay to ensure DROP is committed before CREATE
-                    // This helps avoid race conditions when multiple tests run concurrently
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                    // Recreate table with exact SQLx schema
-                    // Use CREATE TABLE (not IF NOT EXISTS) since we just dropped it
-                    sqlx::query(
-                        "CREATE TABLE _sqlx_migrations (
-                            version BIGINT PRIMARY KEY,
-                            description TEXT NOT NULL,
-                            installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                            success BOOLEAN NOT NULL,
-                            checksum BYTEA NOT NULL,
-                            execution_time BIGINT NOT NULL
-                        )",
-                    )
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to recreate _sqlx_migrations table in test mode: {}",
-                            e
+                        // Release advisory lock
+                        let _ = sqlx::query_scalar::<_, bool>(
+                            "SELECT pg_advisory_unlock(hashtext($1))",
                         )
-                    })?;
+                        .bind(&database_url)
+                        .fetch_one(&pool)
+                        .await;
 
-                    // Verify the table exists after recreation
-                    // Retry with exponential backoff to handle race conditions
-                    let mut retries = 0;
-                    let max_retries = 5;
-                    loop {
-                        match sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
-                            .fetch_optional(&pool)
-                            .await
-                        {
-                            Ok(_) => break, // Table exists and is visible
-                            Err(e) if retries < max_retries => {
-                                let error_str = e.to_string();
-                                if error_str.contains("does not exist")
-                                    || error_str.contains("relation")
-                                {
+                        // Verify the table exists after recreation
+                        let mut retries = 0;
+                        let max_retries = 5;
+                        loop {
+                            match sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
+                                .fetch_optional(&pool)
+                                .await
+                            {
+                                Ok(_) => break, // Table exists and is visible
+                                Err(e) if retries < max_retries => {
+                                    let error_str = e.to_string();
+                                    if error_str.contains("does not exist")
+                                        || error_str.contains("relation")
+                                    {
+                                        retries += 1;
+                                        let delay_ms = 50 * (1 << retries);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                                            delay_ms,
+                                        ))
+                                        .await;
+                                        // Try recreating the table in case it was dropped by another concurrent test
+                                        let _ = sqlx::query(
+                                            "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                                                version BIGINT PRIMARY KEY,
+                                                description TEXT NOT NULL,
+                                                installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                                success BOOLEAN NOT NULL,
+                                                checksum BYTEA NOT NULL,
+                                                execution_time BIGINT NOT NULL
+                                            )",
+                                        )
+                                        .execute(&pool)
+                                        .await;
+                                        continue;
+                                    } else {
+                                        return Err(anyhow::anyhow!(
+                                            "Failed to verify _sqlx_migrations table exists after recreation: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(
+                                        "Failed to verify _sqlx_migrations table exists after recreation (after {} retries): {}",
+                                        max_retries,
+                                        e
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        // Another test has the lock - wait for it to finish, then verify table exists
+                        let mut retries = 0;
+                        let max_retries = 10;
+                        loop {
+                            match sqlx::query("SELECT 1 FROM _sqlx_migrations LIMIT 1")
+                                .fetch_optional(&pool)
+                                .await
+                            {
+                                Ok(_) => break, // Table exists
+                                Err(_) if retries < max_retries => {
                                     retries += 1;
-                                    let delay_ms = 50 * (1 << retries); // 100ms, 200ms, 400ms, 800ms, 1600ms
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                                        delay_ms,
-                                    ))
-                                    .await;
-                                    // Try recreating the table in case it was dropped by another concurrent test
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100))
+                                        .await;
+                                    continue;
+                                }
+                                Err(_) => {
+                                    // Table still doesn't exist after waiting - create it
                                     let _ = sqlx::query(
                                         "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
                                             version BIGINT PRIMARY KEY,
@@ -289,20 +405,8 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                     )
                                     .execute(&pool)
                                     .await;
-                                    continue;
-                                } else {
-                                    return Err(anyhow::anyhow!(
-                                        "Failed to verify _sqlx_migrations table exists after recreation: {}",
-                                        e
-                                    ));
+                                    break;
                                 }
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!(
-                                    "Failed to verify _sqlx_migrations table exists after recreation (after {} retries): {}",
-                                    max_retries,
-                                    e
-                                ));
                             }
                         }
                     }
@@ -334,14 +438,20 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                         }
                     }
 
-                    // Fix webauthn_credentials table - drop if missing instance_user_id column
+                    // Fix webauthn_credentials table - drop if missing platform_user_id (REQUIRED) or instance_user_id
+                    // platform_user_id is REQUIRED, so missing it means inconsistent state
                     let webauthn_fix = sqlx::query(
                         "SELECT EXISTS (
                             SELECT 1 FROM information_schema.tables 
                             WHERE table_name = 'webauthn_credentials'
-                        ) AND NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
+                        ) AND (
+                            NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns 
+                                WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
+                            ) OR NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns 
+                                WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
+                            )
                         )"
                     )
                     .fetch_one(&pool)
@@ -383,42 +493,192 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     .ok();
                 }
 
-                // Check if migrations are already applied before running (optimization to avoid 45+ second delays)
-                // The _sqlx_migrations table should exist at this point (created above)
-                let migrations_check = tokio::time::timeout(
+                // Always verify schema is correct, regardless of migrations table state
+                // This handles cases where migrations table says applied but schema is wrong
+                // (e.g., from copied Neon branches with partial migrations)
+                let schema_verify = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM information_schema.tables WHERE table_name = 'ping_tree_publishers'
+                        ) AND EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
+                        ) AND NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'ping_trees' AND column_name = 'publisher_id'
+                        )"
                     )
                     .fetch_one(&pool),
                 )
                 .await;
-                let migrations_already_applied = match migrations_check {
-                    Ok(Ok(count)) => count > 0,
-                    _ => false, // If query fails or times out, assume migrations not applied
+
+                let schema_correct = match schema_verify {
+                    Ok(Ok(true)) => true,
+                    _ => false,
                 };
 
-                if !migrations_already_applied {
-                    // Run migrations - simple and clean, no retries needed after reset
-                    let migrator = Migrator::new(migrations_path.as_path())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to create migrator: {}", e))?;
-
-                    migrator.run(&pool).await.map_err(|e| {
-                        let error_msg = e.to_string();
-                        // In test mode, provide helpful error message for "already exists" errors
-                        if is_test_mode && (error_msg.contains("already exists") || error_msg.contains("duplicate key")) {
-                            anyhow::anyhow!(
-                                "Migration failed: {}. This happens when database objects already exist from copied branch state. \
-                                Consider using 'IF NOT EXISTS' clauses in migration SQL files for test environments.",
-                                error_msg
-                            )
-                        } else {
-                            anyhow::anyhow!("Migration failed: {}", e)
+                // Run migrations if:
+                // 1. Migrations not already applied (migrations table check), OR
+                // 2. Schema is incorrect (even if migrations table says applied)
+                if !migrations_already_applied || !schema_correct {
+                    if !schema_correct {
+                        tracing::warn!("Schema verification failed - forcing migration re-run even though migrations table says applied");
+                        // Clear migration cache to force re-run
+                        {
+                            let mut mc = MIGRATION_CACHE.lock().unwrap();
+                            mc.remove(&database_url);
                         }
-                    })?;
+                    }
+
+                    // Run migrations - they should be idempotent
+                    // Handle "modified migration" errors by removing the migration record and retrying
+                    let migrator_result = Migrator::new(migrations_path.as_path()).await;
+                    let migrator = match migrator_result {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            // If migration was modified, remove it from the migrations table and retry
+                            if error_msg.contains("was previously applied but has been modified") {
+                                // Extract version number from error message
+                                let version = if let Some(start) = error_msg.find("migration ") {
+                                    let rest = &error_msg[start + 10..];
+                                    if let Some(end) = rest.find(' ') {
+                                        rest[..end].parse::<i64>().ok()
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some(v) = version {
+                                    tracing::warn!("Migration {} was modified - removing from migrations table and retrying", v);
+                                    let _ = sqlx::query(
+                                        "DELETE FROM _sqlx_migrations WHERE version = $1",
+                                    )
+                                    .bind(v)
+                                    .execute(&pool)
+                                    .await;
+                                }
+
+                                // Retry creating migrator
+                                Migrator::new(migrations_path.as_path())
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "Failed to create migrator after cleanup: {}",
+                                            e
+                                        )
+                                    })?
+                            } else {
+                                return Err(anyhow::anyhow!("Failed to create migrator: {}", e));
+                            }
+                        }
+                    };
+
+                    // Run migrations with retry logic for modified migrations
+                    let run_result = migrator.run(&pool).await;
+                    match run_result {
+                        Ok(_) => {
+                            // Migrations ran successfully
+                        }
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            // If migration was modified, remove it from the migrations table and retry
+                            if error_msg.contains("was previously applied but has been modified") {
+                                // Extract version number from error message
+                                let version = if let Some(start) = error_msg.find("migration ") {
+                                    let rest = &error_msg[start + 10..];
+                                    if let Some(end) = rest.find(' ') {
+                                        rest[..end].parse::<i64>().ok()
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some(v) = version {
+                                    tracing::warn!("Migration {} was modified during run - removing from migrations table and retrying", v);
+                                    let _ = sqlx::query(
+                                        "DELETE FROM _sqlx_migrations WHERE version = $1",
+                                    )
+                                    .bind(v)
+                                    .execute(&pool)
+                                    .await;
+
+                                    // Retry running migrations
+                                    let migrator_retry = Migrator::new(migrations_path.as_path())
+                                        .await
+                                        .map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "Failed to create migrator for retry: {}",
+                                                e
+                                            )
+                                        })?;
+
+                                    migrator_retry.run(&pool).await.map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "Migration failed even after cleanup: {}",
+                                            e
+                                        )
+                                    })?;
+                                } else {
+                                    return Err(anyhow::anyhow!("Migration failed: {}", e));
+                                }
+                            } else if is_test_mode
+                                && (error_msg.contains("already exists")
+                                    || error_msg.contains("duplicate key"))
+                            {
+                                return Err(anyhow::anyhow!(
+                                    "Migration failed: {}. This happens when database objects already exist from copied branch state. \
+                                    Consider using 'IF NOT EXISTS' clauses in migration SQL files for test environments.",
+                                    error_msg
+                                ));
+                            } else {
+                                return Err(anyhow::anyhow!("Migration failed: {}", e));
+                            }
+                        }
+                    }
+
+                    // Verify schema is now correct after migrations
+                    let final_verify = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS (
+                                SELECT 1 FROM information_schema.tables WHERE table_name = 'ping_tree_publishers'
+                            ) AND EXISTS (
+                                SELECT 1 FROM information_schema.columns 
+                                WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
+                            ) AND NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns 
+                                WHERE table_name = 'ping_trees' AND column_name = 'publisher_id'
+                            )"
+                        )
+                        .fetch_one(&pool),
+                    )
+                    .await;
+
+                    match final_verify {
+                        Ok(Ok(true)) => {
+                            // Schema is now correct
+                        }
+                        Ok(Ok(false)) => {
+                            return Err(anyhow::anyhow!(
+                                "Migrations ran but schema is still incorrect. This indicates a migration issue. \
+                                Expected: ping_tree_publishers table exists, webauthn_credentials has platform_user_id, \
+                                ping_trees does NOT have publisher_id"
+                            ));
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "Could not verify schema after migrations - proceeding anyway"
+                            );
+                        }
+                    }
                 }
-                // Migration succeeded - cache already updated above
+                // Migration succeeded or already applied - cache already updated above
             }
         }
     }

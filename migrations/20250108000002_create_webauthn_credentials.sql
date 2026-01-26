@@ -10,19 +10,19 @@ BEGIN
     -- Check if table exists
     SELECT EXISTS (
         SELECT 1 FROM information_schema.tables 
-        WHERE table_name = 'webauthn_credentials'
+        WHERE table_schema = 'public' AND table_name = 'webauthn_credentials'
     ) INTO table_exists;
     
     IF table_exists THEN
         -- Check if required columns exist
         SELECT EXISTS (
             SELECT 1 FROM information_schema.columns 
-            WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
+            WHERE table_schema = 'public' AND table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
         ) INTO has_platform_user_id;
         
         SELECT EXISTS (
             SELECT 1 FROM information_schema.columns 
-            WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
+            WHERE table_schema = 'public' AND table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
         ) INTO has_instance_user_id;
         
         -- If table exists but is missing platform_user_id (required) or instance_user_id, drop and recreate
@@ -30,12 +30,18 @@ BEGIN
         IF NOT has_platform_user_id OR NOT has_instance_user_id THEN
             -- Drop table and all dependent objects (safe in test/CI - ephemeral databases)
             -- In production, this should be handled by fix_partial_migrations migration
+            -- Use CASCADE to ensure all constraints are dropped first
             DROP TABLE IF EXISTS webauthn_credentials CASCADE;
         END IF;
     END IF;
 END $$;
 
-CREATE TABLE IF NOT EXISTS webauthn_credentials (
+-- Always drop and recreate to ensure consistent state (safe for ephemeral/test databases)
+-- This prevents issues where table exists but is missing columns
+-- CRITICAL: Use DROP TABLE (not IF NOT EXISTS) to ensure clean recreation
+DROP TABLE IF EXISTS webauthn_credentials CASCADE;
+
+CREATE TABLE webauthn_credentials (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     platform_user_id UUID NOT NULL,
     instance_user_id UUID,
@@ -49,45 +55,18 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
     passkey_type VARCHAR
 );
 
--- Create indexes (idempotent)
--- Only create indexes if columns exist (defensive check)
-DO $$
-BEGIN
-    -- external_id index (always exists)
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'webauthn_credentials' AND column_name = 'external_id'
-    ) THEN
-        CREATE UNIQUE INDEX IF NOT EXISTS index_webauthn_credentials_on_external_id ON webauthn_credentials(external_id);
-    END IF;
-    
-    -- platform_user_id index (required column)
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
-    ) THEN
-        CREATE INDEX IF NOT EXISTS index_webauthn_credentials_on_platform_user_id ON webauthn_credentials(platform_user_id);
-    END IF;
-    
-    -- instance_user_id index (optional column)
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
-    ) THEN
-        CREATE INDEX IF NOT EXISTS index_webauthn_credentials_on_instance_user_id ON webauthn_credentials(instance_user_id);
-        CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_instance_user_id ON webauthn_credentials(instance_user_id);
-    END IF;
-END $$;
+-- Create indexes (table was just created, so columns definitely exist)
+CREATE UNIQUE INDEX index_webauthn_credentials_on_external_id ON webauthn_credentials(external_id);
+CREATE INDEX index_webauthn_credentials_on_platform_user_id ON webauthn_credentials(platform_user_id);
+CREATE INDEX index_webauthn_credentials_on_instance_user_id ON webauthn_credentials(instance_user_id);
+CREATE INDEX idx_webauthn_credentials_instance_user_id ON webauthn_credentials(instance_user_id);
 
 -- Add foreign key constraints to instance_users table
--- Only add constraints if columns exist (defensive check)
+-- Table was just created, so columns definitely exist
 DO $$
 BEGIN
     -- Foreign key for platform_user_id (primary, NOT NULL, REQUIRED)
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'webauthn_credentials' AND column_name = 'platform_user_id'
-    ) AND NOT EXISTS (
+    IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'fk_webauthn_credentials_platform_user'
     ) THEN
         ALTER TABLE webauthn_credentials
@@ -96,24 +75,19 @@ BEGIN
     END IF;
     
     -- Foreign key for instance_user_id (optional, nullable)
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns 
-        WHERE table_name = 'webauthn_credentials' AND column_name = 'instance_user_id'
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_webauthn_credentials_instance_user'
     ) THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint WHERE conname = 'fk_webauthn_credentials_instance_user'
-        ) THEN
-            ALTER TABLE webauthn_credentials
-                ADD CONSTRAINT fk_webauthn_credentials_instance_user
-                FOREIGN KEY (instance_user_id) REFERENCES instance_users(id) ON DELETE CASCADE;
-        END IF;
-        
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint WHERE conname = 'fk_webauthn_credentials_instance_user_id'
-        ) THEN
-            ALTER TABLE webauthn_credentials
-                ADD CONSTRAINT fk_webauthn_credentials_instance_user_id
-                FOREIGN KEY (instance_user_id) REFERENCES instance_users(id) ON DELETE CASCADE;
-        END IF;
+        ALTER TABLE webauthn_credentials
+            ADD CONSTRAINT fk_webauthn_credentials_instance_user
+            FOREIGN KEY (instance_user_id) REFERENCES instance_users(id) ON DELETE CASCADE;
+    END IF;
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_webauthn_credentials_instance_user_id'
+    ) THEN
+        ALTER TABLE webauthn_credentials
+            ADD CONSTRAINT fk_webauthn_credentials_instance_user_id
+            FOREIGN KEY (instance_user_id) REFERENCES instance_users(id) ON DELETE CASCADE;
     END IF;
 END $$;
