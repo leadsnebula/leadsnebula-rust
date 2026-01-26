@@ -1819,14 +1819,25 @@ impl PingTreeRouter {
             });
 
             // Update lead in database (inject chaos delay if enabled)
+            // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
+            // Use COALESCE to handle None values - keep existing values if None is provided
             inject_chaos_delay().await;
             sqlx::query(
-                "UPDATE leads SET campaign_id = $1, buyer_id = $2, promise_id = $3, post_id = $4, status = $5, updated_at = now() WHERE uuid = $6",
+                r#"
+                UPDATE leads 
+                SET campaign_id = COALESCE($1, campaign_id), 
+                    buyer_id = COALESCE($2, buyer_id), 
+                    promise_id = COALESCE($3, promise_id), 
+                    post_id = COALESCE($4, post_id), 
+                    status = $5, 
+                    updated_at = now() 
+                WHERE uuid = $6
+                "#,
             )
             .bind(winner_campaign_id)
             .bind(winner_campaign.buyer_id)
-            .bind(&final_promise_id)
-            .bind(&post_id)
+            .bind(final_promise_id.as_deref())
+            .bind(post_id.as_deref().unwrap_or(""))
             .bind(&LeadStatus::Sold)
             .bind(self.lead.uuid)
             .execute(pool.as_ref())

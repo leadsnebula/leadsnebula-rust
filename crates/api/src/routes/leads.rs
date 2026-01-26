@@ -2473,11 +2473,20 @@ async fn create_lead(
                     let update_start = std::time::Instant::now();
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(2000),
+                        // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
+                        // Use COALESCE to handle None values - keep existing values if None is provided
                         sqlx::query(
                             r#"
                             UPDATE leads
-                            SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, 
-                                sold_at = NOW(), vertical_data = $8, updated_at = NOW()
+                            SET status = $2, 
+                                campaign_id = COALESCE($3, campaign_id), 
+                                buyer_id = COALESCE($4, buyer_id), 
+                                promise_id = COALESCE($5, promise_id), 
+                                ping_id = COALESCE($6, ping_id), 
+                                post_id = COALESCE($7, post_id), 
+                                sold_at = NOW(), 
+                                vertical_data = COALESCE($8, vertical_data), 
+                                updated_at = NOW()
                             WHERE uuid = $1
                             "#,
                         )
@@ -2487,7 +2496,7 @@ async fn create_lead(
                         .bind(buyer_id_clone)
                         .bind(promise_id_clone.as_ref())
                         .bind(ping_id_clone.as_ref())
-                        .bind(post_id_clone.as_ref())
+                        .bind(post_id_clone.as_deref().unwrap_or(""))
                         .bind(sqlx::types::Json(&auction_timing_data_clone))
                         .execute(&*db_pool_clone)
                     ).await {

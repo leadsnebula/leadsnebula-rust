@@ -582,11 +582,20 @@ impl WriteBehindQueue {
                         "Updating sold lead {} with inprog_token (conditional update)",
                         lead_id
                     );
+                    // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
+                    // Only update if we have valid values, otherwise use COALESCE to keep existing values
                     match sqlx::query(
                         r#"
                         UPDATE leads
-                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7,
-                            sold_at = NOW(), vertical_data = $8, updated_at = NOW()
+                        SET status = $2, 
+                            campaign_id = COALESCE($3, campaign_id), 
+                            buyer_id = COALESCE($4, buyer_id), 
+                            promise_id = COALESCE($5, promise_id), 
+                            ping_id = COALESCE($6, ping_id), 
+                            post_id = COALESCE($7, post_id),
+                            sold_at = NOW(), 
+                            vertical_data = COALESCE($8, vertical_data), 
+                            updated_at = NOW()
                         WHERE uuid = $1 AND post_id = $9
                         "#,
                     )
@@ -596,7 +605,7 @@ impl WriteBehindQueue {
                     .bind(buyer_id)
                     .bind(promise_id)
                     .bind(ping_id)
-                    .bind(post_id)
+                    .bind(post_id.as_deref().unwrap_or(""))
                     .bind(vertical_data.as_ref().map(sqlx::types::Json))
                     .bind(token)
                     .execute(pool)
@@ -625,11 +634,20 @@ impl WriteBehindQueue {
                         lead_id,
                         post_id
                     );
+                    // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
+                    // Only update if we have valid values, otherwise use COALESCE to keep existing values
                     match sqlx::query(
                         r#"
                         UPDATE leads
-                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7,
-                            sold_at = NOW(), vertical_data = $8, updated_at = NOW()
+                        SET status = $2, 
+                            campaign_id = COALESCE($3, campaign_id), 
+                            buyer_id = COALESCE($4, buyer_id), 
+                            promise_id = COALESCE($5, promise_id), 
+                            ping_id = COALESCE($6, ping_id), 
+                            post_id = COALESCE($7, post_id),
+                            sold_at = NOW(), 
+                            vertical_data = COALESCE($8, vertical_data), 
+                            updated_at = NOW()
                         WHERE uuid = $1
                         "#,
                     )
@@ -639,7 +657,7 @@ impl WriteBehindQueue {
                     .bind(buyer_id)
                     .bind(promise_id)
                     .bind(ping_id)
-                    .bind(post_id)
+                    .bind(post_id.as_deref().unwrap_or(""))
                     .bind(vertical_data.as_ref().map(sqlx::types::Json))
                     .execute(pool)
                     .await
@@ -703,10 +721,19 @@ impl WriteBehindQueue {
             } else {
                 // Standard update (with optional vertical_data)
                 if let Some(vd) = vertical_data {
+                    // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
+                    // Only update if we have valid values, otherwise use COALESCE to keep existing values
                     match sqlx::query(
                         r#"
                         UPDATE leads
-                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, vertical_data = $8, updated_at = NOW()
+                        SET status = $2, 
+                            campaign_id = COALESCE($3, campaign_id), 
+                            buyer_id = COALESCE($4, buyer_id), 
+                            promise_id = COALESCE($5, promise_id), 
+                            ping_id = COALESCE($6, ping_id), 
+                            post_id = COALESCE($7, post_id), 
+                            vertical_data = $8, 
+                            updated_at = NOW()
                         WHERE uuid = $1
                         "#,
                     )
@@ -716,7 +743,7 @@ impl WriteBehindQueue {
                     .bind(buyer_id)
                     .bind(promise_id)
                     .bind(ping_id)
-                    .bind(post_id)
+                    .bind(post_id.as_deref().unwrap_or(""))
                     .bind(sqlx::types::Json(vd))
                     .execute(pool)
                     .await
@@ -731,10 +758,18 @@ impl WriteBehindQueue {
                         }
                     }
                 } else {
+                    // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
+                    // Only update if we have valid values, otherwise use COALESCE to keep existing values
                     match sqlx::query(
                         r#"
                         UPDATE leads
-                        SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, updated_at = NOW()
+                        SET status = $2, 
+                            campaign_id = COALESCE($3, campaign_id), 
+                            buyer_id = COALESCE($4, buyer_id), 
+                            promise_id = COALESCE($5, promise_id), 
+                            ping_id = COALESCE($6, ping_id), 
+                            post_id = COALESCE($7, post_id), 
+                            updated_at = NOW()
                         WHERE uuid = $1
                         "#,
                     )
@@ -744,7 +779,7 @@ impl WriteBehindQueue {
                     .bind(buyer_id)
                     .bind(promise_id)
                     .bind(ping_id)
-                    .bind(post_id)
+                    .bind(post_id.as_deref().unwrap_or(""))
                     .execute(pool)
                     .await
                     {
