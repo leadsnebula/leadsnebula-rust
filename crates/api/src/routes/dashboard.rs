@@ -6090,13 +6090,14 @@ async fn get_lead_details(
             .flatten(),
     );
 
-    // Fetch ping payloads
+    // Fetch ping payloads (for fallback when buyer_responses don't exist)
     let ping_payloads_rows = sqlx::query(
         r#"
         SELECT 
             pp.lead_id,
             pp.payload,
-            pp.request_payload_encrypted
+            pp.request_payload_encrypted,
+            pp.response_payload_encrypted
         FROM ping_payloads pp
         WHERE pp.lead_id = $1
         ORDER BY pp.created_at ASC
@@ -6108,12 +6109,13 @@ async fn get_lead_details(
     .ok()
     .unwrap_or_default();
 
-    // Fetch buyer responses (ping responses)
+    // Fetch buyer responses (ping and post responses)
     let buyer_responses = sqlx::query(
         r#"
         SELECT 
             br.id,
             br.ping_id,
+            br.post_id,
             br.buyer_id,
             br.campaign_id,
             br.payload,
@@ -6125,7 +6127,6 @@ async fn get_lead_details(
         LEFT JOIN buyers b ON br.buyer_id = b.id AND b.deleted_at IS NULL
         LEFT JOIN campaigns c ON br.campaign_id = c.id AND c.deleted_at IS NULL
         WHERE br.lead_id = $1
-        AND br.ping_id IS NOT NULL
         ORDER BY br.created_at ASC
         "#,
     )
@@ -6171,59 +6172,125 @@ async fn get_lead_details(
         .ok()
         .flatten();
 
-    let ping_payloads: Vec<serde_json::Value> = buyer_responses
+    // Build ping payloads from buyer_responses (preferred) or fallback to ping_payloads table (for historical leads)
+    // Filter to only ping responses (ping_id IS NOT NULL)
+    let ping_buyer_responses: Vec<_> = buyer_responses
         .iter()
-        .map(|row| {
-            let ping_id: Option<String> =
-                row.try_get::<Option<String>, _>("ping_id").ok().flatten();
-            let payload: Option<serde_json::Value> = row
-                .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+        .filter(|row| {
+            row.try_get::<Option<String>, _>("ping_id")
                 .ok()
                 .flatten()
-                .map(|j| j.0);
-            let response_encrypted: Option<String> = row
-                .try_get::<Option<String>, _>("response_payload_encrypted")
-                .ok()
-                .flatten();
-            let response_payload = decrypt_payload(response_encrypted).or_else(|| payload.clone());
-            let bid = response_payload
-                .as_ref()
-                .and_then(|r| r.get("bid"))
-                .and_then(|b| b.as_f64());
-            let processing_time_ms = if let (Some(created_at), Some(lead_created)) = (
-                row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at")
-                    .ok()
-                    .flatten(),
-                lead_created_at,
-            ) {
-                Some(
-                    created_at
-                        .signed_duration_since(lead_created)
-                        .num_milliseconds() as f64,
-                )
-            } else {
-                None
-            };
-
-            serde_json::json!({
-                "id": row.try_get::<i64, _>("id").ok(),
-                "ping_id": ping_id,
-                "buyer_name": row.try_get::<Option<String>, _>("buyer_name").ok().flatten(),
-                "campaign_name": row.try_get::<Option<String>, _>("campaign_name").ok().flatten(),
-                "bid": bid,
-                "processing_time_ms": processing_time_ms,
-                "request_payload": original_request_payload.clone(),
-                "response_payload": response_payload,
-            })
+                .is_some()
         })
         .collect();
+    
+    let ping_payloads: Vec<serde_json::Value> = if !ping_buyer_responses.is_empty() {
+        // Use buyer_responses (normal case)
+        ping_buyer_responses
+            .iter()
+            .map(|row| {
+                let ping_id: Option<String> =
+                    row.try_get::<Option<String>, _>("ping_id").ok().flatten();
+                let payload: Option<serde_json::Value> = row
+                    .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+                    .ok()
+                    .flatten()
+                    .map(|j| j.0);
+                let response_encrypted: Option<String> = row
+                    .try_get::<Option<String>, _>("response_payload_encrypted")
+                    .ok()
+                    .flatten();
+                let response_payload = decrypt_payload(response_encrypted).or_else(|| payload.clone());
+                let bid = response_payload
+                    .as_ref()
+                    .and_then(|r| r.get("bid"))
+                    .and_then(|b| b.as_f64());
+                let processing_time_ms = if let (Some(created_at), Some(lead_created)) = (
+                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("created_at")
+                        .ok()
+                        .flatten(),
+                    lead_created_at,
+                ) {
+                    Some(
+                        created_at
+                            .signed_duration_since(lead_created)
+                            .num_milliseconds() as f64,
+                    )
+                } else {
+                    None
+                };
+
+                serde_json::json!({
+                    "id": row.try_get::<i64, _>("id").ok(),
+                    "ping_id": ping_id,
+                    "buyer_name": row.try_get::<Option<String>, _>("buyer_name").ok().flatten(),
+                    "campaign_name": row.try_get::<Option<String>, _>("campaign_name").ok().flatten(),
+                    "bid": bid,
+                    "processing_time_ms": processing_time_ms,
+                    "request_payload": original_request_payload.clone(),
+                    "response_payload": response_payload,
+                })
+            })
+            .collect()
+    } else if !ping_payloads_rows.is_empty() {
+        // Fallback: Use ping_payloads table for historical leads (when buyer_responses don't exist)
+        ping_payloads_rows
+            .iter()
+            .map(|row| {
+                let payload_json: Option<serde_json::Value> = row
+                    .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+                    .ok()
+                    .flatten()
+                    .map(|j| j.0);
+                let request_encrypted: Option<String> = row
+                    .try_get::<Option<String>, _>("request_payload_encrypted")
+                    .ok()
+                    .flatten();
+                let response_encrypted: Option<String> = row
+                    .try_get::<Option<String>, _>("response_payload_encrypted")
+                    .ok()
+                    .flatten();
+                let request_payload = decrypt_payload(request_encrypted.clone()).or_else(|| payload_json.clone());
+                let response_payload = decrypt_payload(response_encrypted);
+                let bid = response_payload
+                    .as_ref()
+                    .and_then(|r| r.get("bid"))
+                    .and_then(|b| b.as_f64());
+                
+                serde_json::json!({
+                    "id": None::<i64>,
+                    "ping_id": None::<String>,
+                    "buyer_name": None::<String>,
+                    "campaign_name": None::<String>,
+                    "bid": bid,
+                    "processing_time_ms": None::<f64>,
+                    "request_payload": request_payload,
+                    "response_payload": response_payload,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Fetch post payload
+    // Try to get post_id from lead, or fallback to buyer_responses with post_id
     let post_id: Option<String> = lead_row
         .try_get::<Option<String>, _>("post_id")
         .ok()
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            // Fallback: find post_id from buyer_responses if lead.post_id is empty
+            buyer_responses
+                .iter()
+                .find_map(|row| {
+                    row.try_get::<Option<String>, _>("post_id").ok().flatten()
+                })
+        });
+    
+    // Fetch post payload - try with post_id first, then fallback to any post_payloads for this lead
     let post_payload: Option<serde_json::Value> = if let Some(pid) = post_id {
+        // Normal case: use post_id from lead
         sqlx::query(
             r#"
             SELECT 
@@ -6272,7 +6339,59 @@ async fn get_lead_details(
             })
         })
     } else {
-        None
+        // Fallback: find any post_payloads for this lead (for historical leads where post_id wasn't set)
+        sqlx::query(
+            r#"
+            SELECT 
+                pp.id,
+                pp.post_id,
+                pp.payload,
+                pp.request_payload_encrypted,
+                pp.response_payload_encrypted,
+                pp.created_at,
+                EXTRACT(EPOCH FROM (pp.updated_at - pp.created_at)) * 1000 as processing_time_ms
+            FROM post_payloads pp
+            WHERE pp.lead_id = $1
+            ORDER BY pp.created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(lead_uuid)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten()
+        .map(|row| {
+            let post_id_from_db: Option<String> = row
+                .try_get::<Option<String>, _>("post_id")
+                .ok()
+                .flatten();
+            let payload: Option<serde_json::Value> = row
+                .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
+                .ok()
+                .flatten()
+                .map(|j| j.0);
+            let request_payload = decrypt_payload(
+                row.try_get::<Option<String>, _>("request_payload_encrypted").ok().flatten()
+            ).or_else(|| payload.clone());
+            let response_payload = decrypt_payload(
+                row.try_get::<Option<String>, _>("response_payload_encrypted").ok().flatten()
+            );
+            let price = response_payload
+                .as_ref()
+                .and_then(|r| r.get("routing_result"))
+                .and_then(|rr| rr.get("price"))
+                .and_then(|p| p.as_f64());
+
+            serde_json::json!({
+                "id": row.try_get::<i64, _>("id").ok(),
+                "post_id": post_id_from_db,
+                "price": price,
+                "processing_time_ms": row.try_get::<Option<f64>, _>("processing_time_ms").ok().flatten(),
+                "request_payload": request_payload,
+                "response_payload": response_payload,
+            })
+        })
     };
 
     let lead_price = post_payload
