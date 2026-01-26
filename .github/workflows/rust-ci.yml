@@ -99,9 +99,8 @@ jobs:
       - name: Clean build artifacts
         if: always()  # Clean even if previous steps failed
         run: |
-          echo "🧹 Cleaning build artifacts to prevent accumulation..."
-          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
-          echo "✅ Build artifacts cleaned"
+          echo "🧹 Build artifacts will be cleaned by rust-cache action"
+          # rust-cache handles cleanup automatically, no manual cleanup needed
 
       - name: Show sccache statistics
         if: steps.changed-rust.outputs.has_rust_changes == 'true'
@@ -298,6 +297,17 @@ jobs:
           echo "Waiting 3 seconds for database to stabilize..."
           sleep 3
 
+      - name: Build all test binaries (compile once, run many times)
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          echo "🔨 Building all test binaries upfront to avoid redundant compilation..."
+          # Build all test targets once - this compiles all test binaries
+          # Subsequent test runs will reuse these compiled binaries, saving significant time
+          # Using nextest list to trigger compilation of all test binaries that will be run
+          cargo nextest list --all-targets --locked --all-features > /dev/null 2>&1 || \
+            cargo test --no-run --all-targets --locked --all-features
+          echo "✅ All test binaries built - subsequent test runs will reuse them (no recompilation)"
+
       - name: Run integration tests (light DB only; heavy/concurrency run locally)
         if: steps.needs-integration.outputs.needs_tests == 'true'
         env:
@@ -361,8 +371,10 @@ jobs:
         if: always()  # Clean even if tests failed
         run: |
           echo "🧹 Cleaning build artifacts to prevent accumulation..."
-          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
-          echo "✅ Build artifacts cleaned"
+          # Only clean if we're not caching (GitHub Actions runners have limited disk space)
+          # The rust-cache action handles artifact cleanup, so we can skip manual cleanup
+          # to preserve artifacts for potential debugging
+          echo "✅ Build artifacts will be cleaned by rust-cache action"
 
       - name: Cleanup ephemeral Neon branch
         if: always() && steps.needs-integration.outputs.needs_tests == 'true'
@@ -460,9 +472,30 @@ jobs:
             echo "Library package filter: $LIB_PACKAGES"
           fi
 
+      - name: Build unit test binaries (compile once)
+        run: |
+          echo "🔨 Building unit test binaries upfront..."
+          # Build lib test binaries once - subsequent test runs will reuse them
+          if [ "${{ steps.changed-crates.outputs.run_all }}" == "true" ] || [ -z "${{ steps.changed-crates.outputs.packages }}" ]; then
+            cargo nextest list --lib --locked --all-features > /dev/null 2>&1 || \
+              cargo test --no-run --lib --locked --all-features
+          else
+            LIB_PACKAGES="${{ steps.changed-crates.outputs.lib_packages }}"
+            if [ -n "$LIB_PACKAGES" ]; then
+              cargo nextest list --lib $LIB_PACKAGES --locked --all-features > /dev/null 2>&1 || \
+                cargo test --no-run --lib $LIB_PACKAGES --locked --all-features
+            else
+              # Binary-only crates changed - still build all lib tests
+              cargo nextest list --lib --locked --all-features > /dev/null 2>&1 || \
+                cargo test --no-run --lib --locked --all-features
+            fi
+          fi
+          echo "✅ Unit test binaries built - test runs will reuse them"
+
       - name: Run unit tests with nextest
         run: |
           # Run unit tests (lib tests) in parallel with nextest
+          # Binaries are already built, so this will be fast
           # Use all available CPU cores for maximum parallelization
           if [ "${{ steps.changed-crates.outputs.run_all }}" == "true" ] || [ -z "${{ steps.changed-crates.outputs.packages }}" ]; then
             echo "Running all unit tests (no crate-specific changes detected)"
@@ -551,9 +584,8 @@ jobs:
       - name: Clean build artifacts
         if: always() && steps.needs-build.outputs.needs_build == 'true'
         run: |
-          echo "🧹 Cleaning build artifacts to prevent accumulation..."
-          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
-          echo "✅ Build artifacts cleaned"
+          echo "🧹 Build artifacts will be cleaned by rust-cache action"
+          # rust-cache handles cleanup automatically, no manual cleanup needed
 
       - name: Show sccache statistics
         if: steps.needs-build.outputs.needs_build == 'true'
@@ -751,9 +783,8 @@ jobs:
       - name: Clean build artifacts
         if: always()  # Clean even if coverage failed
         run: |
-          echo "🧹 Cleaning build artifacts to prevent accumulation..."
-          cargo clean || echo "⚠️  cargo clean failed (non-critical)"
-          echo "✅ Build artifacts cleaned"
+          echo "🧹 Build artifacts will be cleaned by rust-cache action"
+          # rust-cache handles cleanup automatically, no manual cleanup needed
 
       - name: Cleanup ephemeral Neon branch (coverage)
         if: always() && steps.needs-coverage.outputs.needs_coverage == 'true'

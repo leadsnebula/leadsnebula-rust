@@ -363,6 +363,16 @@ else
 
     if command -v cargo-nextest > /dev/null 2>&1; then
     echo "   Using cargo-nextest for faster parallel test execution..."
+    
+    # Build test binaries once upfront (matches CI optimization pattern)
+    echo "   🔨 Building unit test binaries upfront (compile once, run many times)..."
+    TIMEOUT_BUILD=$([ "$IS_WSL" = "true" ] && echo "300" || echo "180")
+    if ! timeout "$TIMEOUT_BUILD" cargo nextest list --lib --locked --all-features > /dev/null 2>&1; then
+        # Fallback: use cargo test --no-run if nextest list fails
+        timeout "$TIMEOUT_BUILD" cargo test --no-run --lib --locked --all-features > /dev/null 2>&1 || true
+    fi
+    echo "   ✅ Test binaries built - running tests (no recompilation)..."
+    
     # Add timeout to prevent WSL crashes (10 minutes for unit tests, shorter in WSL)
     TIMEOUT_TESTS=$([ "$IS_WSL" = "true" ] && echo "480" || echo "600")
     if ! timeout "$TIMEOUT_TESTS" cargo nextest run --lib --locked --all-features; then
@@ -380,6 +390,14 @@ else
     fi
 else
         echo "   Using cargo test (install cargo-nextest for faster tests: cargo install cargo-nextest)"
+        
+        # Build test binaries once upfront (matches CI optimization pattern)
+        echo "   🔨 Building unit test binaries upfront (compile once, run many times)..."
+        TIMEOUT_BUILD=$([ "$IS_WSL" = "true" ] && echo "300" || echo "180")
+        (ulimit -v 2097152 2>/dev/null || true)  # Limit virtual memory to 2GB for build
+        timeout "$TIMEOUT_BUILD" cargo test --no-run --lib --locked --all-features > /dev/null 2>&1 || true
+        echo "   ✅ Test binaries built - running tests (no recompilation)..."
+        
         # Add timeout to prevent WSL crashes (10 minutes for unit tests, shorter in WSL)
         # Set resource limits to prevent memory exhaustion
         TIMEOUT_TESTS=$([ "$IS_WSL" = "true" ] && echo "480" || echo "600")
