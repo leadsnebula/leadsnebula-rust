@@ -6183,7 +6183,7 @@ async fn get_lead_details(
                 .is_some()
         })
         .collect();
-    
+
     let ping_payloads: Vec<serde_json::Value> = if !ping_buyer_responses.is_empty() {
         // Use buyer_responses (normal case)
         ping_buyer_responses
@@ -6250,13 +6250,14 @@ async fn get_lead_details(
                     .try_get::<Option<String>, _>("response_payload_encrypted")
                     .ok()
                     .flatten();
-                let request_payload = decrypt_payload(request_encrypted.clone()).or_else(|| payload_json.clone());
+                let request_payload =
+                    decrypt_payload(request_encrypted.clone()).or_else(|| payload_json.clone());
                 let response_payload = decrypt_payload(response_encrypted);
                 let bid = response_payload
                     .as_ref()
                     .and_then(|r| r.get("bid"))
                     .and_then(|b| b.as_f64());
-                
+
                 serde_json::json!({
                     "id": None::<i64>,
                     "ping_id": None::<String>,
@@ -6283,11 +6284,9 @@ async fn get_lead_details(
             // Fallback: find post_id from buyer_responses if lead.post_id is empty
             buyer_responses
                 .iter()
-                .find_map(|row| {
-                    row.try_get::<Option<String>, _>("post_id").ok().flatten()
-                })
+                .find_map(|row| row.try_get::<Option<String>, _>("post_id").ok().flatten())
         });
-    
+
     // Fetch post payload - try with post_id first, then fallback to any post_payloads for this lead
     let post_payload: Option<serde_json::Value> = if let Some(pid) = post_id {
         // Normal case: use post_id from lead
