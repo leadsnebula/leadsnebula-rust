@@ -246,10 +246,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     .fetch_one(&pool),
                 )
                 .await;
-                let key_tables_ok = match key_tables_exist {
-                    Ok(Ok(true)) => true,
-                    _ => false,
-                };
+                let key_tables_ok = matches!(key_tables_exist, Ok(Ok(true)));
 
                 // Migrations are already applied if either:
                 // 1. Migrations table has records, OR
@@ -276,16 +273,13 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     // This prevents checksum mismatches from copied branch state
                     // Only do this if migrations haven't been applied yet (avoids race conditions)
                     // Use advisory lock to serialize this operation across parallel tests
-                    let lock_acquired = match sqlx::query_scalar::<_, bool>(
-                        "SELECT pg_try_advisory_lock(hashtext($1))",
-                    )
-                    .bind(&database_url)
-                    .fetch_one(&pool)
-                    .await
-                    {
-                        Ok(true) => true,
-                        _ => false,
-                    };
+                    let lock_acquired = matches!(
+                        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(hashtext($1))")
+                            .bind(&database_url)
+                            .fetch_one(&pool)
+                            .await,
+                        Ok(true)
+                    );
 
                     if lock_acquired {
                         // We got the lock - safe to drop/recreate
@@ -513,10 +507,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 )
                 .await;
 
-                let schema_correct = match schema_verify {
-                    Ok(Ok(true)) => true,
-                    _ => false,
-                };
+                let schema_correct = matches!(schema_verify, Ok(Ok(true)));
 
                 // Run migrations if:
                 // 1. Migrations not already applied (migrations table check), OR
