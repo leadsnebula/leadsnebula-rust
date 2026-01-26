@@ -6,7 +6,7 @@ use leadsnebula_core::services::write_behind_queue::WriteBehindQueue;
 use leadsnebula_core::ssm::SsmService;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -418,31 +418,26 @@ impl AppState {
                 info!("Database connection pool created successfully");
                 let pool_arc = Arc::new(pool);
 
-                // SAMURAI PERFECTION: Pre-warm database immediately (prevents first-request cold start)
-                // Execute a simple query to wake up Neon and initialize connection pool
-                let pool_for_warmup = pool_arc.clone();
-                tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    match sqlx::query("SELECT 1")
-                        .execute(pool_for_warmup.as_ref())
-                        .await
-                    {
-                        Ok(_) => {
-                            let duration_ms = start.elapsed().as_millis();
-                            if duration_ms > 50 {
-                                tracing::warn!(
-                                    db_warmup_ms = duration_ms,
-                                    "DB pre-warm slow (may indicate cold start)"
-                                );
-                            } else {
-                                tracing::info!("DB pre-warmed successfully ({}ms)", duration_ms);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("DB pre-warm failed (non-critical): {}", e);
+                // CRITICAL: Pre-warm database SYNCHRONOUSLY (prevents first-request cold start)
+                // Execute a simple query to wake up Neon and ensure connection pool is ready
+                info!("Pre-warming database connection pool...");
+                let db_warmup_start = std::time::Instant::now();
+                match sqlx::query("SELECT 1").execute(pool_arc.as_ref()).await {
+                    Ok(_) => {
+                        let duration_ms = db_warmup_start.elapsed().as_millis();
+                        if duration_ms > 50 {
+                            warn!(
+                                db_warmup_ms = duration_ms,
+                                "DB pre-warm slow (may indicate cold start)"
+                            );
+                        } else {
+                            info!("DB pre-warmed successfully ({}ms)", duration_ms);
                         }
                     }
-                });
+                    Err(e) => {
+                        warn!("DB pre-warm failed (non-critical): {}", e);
+                    }
+                }
 
                 pool_arc
             }
@@ -461,7 +456,28 @@ impl AppState {
 
         // Handle Redis result
         let redis = match redis_result {
-            Some(Ok(Some(client))) => Some(client),
+            Some(Ok(Some(client))) => {
+                // CRITICAL: Pre-warm Redis connection SYNCHRONOUSLY (prevents first-request cold start)
+                info!("Pre-warming Redis connection pool...");
+                let redis_warmup_start = std::time::Instant::now();
+                match client.ping().await {
+                    Ok(_) => {
+                        let duration_ms = redis_warmup_start.elapsed().as_millis();
+                        if duration_ms > 10 {
+                            warn!(
+                                redis_warmup_ms = duration_ms,
+                                "Redis pre-warm slow (may indicate cold start)"
+                            );
+                        } else {
+                            info!("Redis pre-warmed successfully ({}ms)", duration_ms);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Redis pre-warm failed (non-critical): {}", e);
+                    }
+                }
+                Some(client)
+            }
             Some(Ok(None)) => {
                 tracing::warn!(
                     "Redis initialization returned None. Continuing without Redis cache."
@@ -511,66 +527,65 @@ impl AppState {
             }
         };
 
-        // SAMURAI PERFECTION: Pre-fetch SSM encryption keys synchronously during startup
+        // SAMURAI PERFECTION: Pre-fetch SSM encryption keys SYNCHRONOUSLY during startup
         // This "pays" the 500-1000ms SSM cost at deploy time, not on first request
-        // Use timeout to prevent blocking startup if SSM is slow
+        // CRITICAL: Wait for SSM keys to be cached before proceeding (ensures first request is fast)
         let env_normalized = leadsnebula_core::normalize_env_for_ssm(&config.environment);
-        let _det_path = format!(
+        let det_path = format!(
             "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
             env_normalized
         );
-        let _salt_path = format!(
+        let salt_path = format!(
             "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
             env_normalized
         );
 
-        let _ssm_for_prefetch = ssm.clone();
-        tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let prefetch_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let det_result = _ssm_for_prefetch.get_parameter(&_det_path, true).await;
-                let salt_result = _ssm_for_prefetch.get_parameter(&_salt_path, true).await;
-                (det_result, salt_result)
-            })
-            .await;
+        info!("Pre-fetching SSM encryption keys synchronously during startup...");
+        let ssm_prefetch_start = std::time::Instant::now();
+        let prefetch_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // Fetch both keys in parallel for faster startup
+            let (det_result, salt_result) = tokio::join!(
+                ssm.get_parameter(&det_path, true),
+                ssm.get_parameter(&salt_path, true)
+            );
+            (det_result, salt_result)
+        })
+        .await;
 
-            match prefetch_result {
-                Ok((Ok(Some(_)), Ok(Some(_)))) => {
-                    let duration_ms = start.elapsed().as_millis();
-                    tracing::info!(
-                        ssm_prefetch_ms = duration_ms,
-                        "SSM encryption keys pre-fetched successfully during startup"
-                    );
-                }
-                Ok((Ok(Some(_)), Ok(None))) => {
-                    tracing::warn!(
-                        "SSM pre-fetch: deterministic_key found but salt not found (will fetch on first request)"
-                    );
-                }
-                Ok((Ok(Some(_)), Err(e))) => {
-                    tracing::warn!(
-                        "SSM pre-fetch: deterministic_key found but salt fetch failed (will fetch on first request): {}",
-                        e
-                    );
-                }
-                Ok((Ok(None), _)) => {
-                    tracing::warn!(
-                        "SSM pre-fetch: deterministic_key not found (will fetch on first request)"
-                    );
-                }
-                Ok((Err(e), _)) => {
-                    tracing::warn!(
-                        "SSM pre-fetch failed (non-critical, will fetch on first request): {}",
-                        e
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "SSM pre-fetch timed out after 2s (non-critical, will fetch on first request)"
-                    );
-                }
+        match prefetch_result {
+            Ok((Ok(Some(_)), Ok(Some(_)))) => {
+                let duration_ms = ssm_prefetch_start.elapsed().as_millis();
+                info!(
+                    ssm_prefetch_ms = duration_ms,
+                    "SSM encryption keys pre-fetched and cached successfully during startup"
+                );
             }
-        });
+            Ok((Ok(Some(_)), Ok(None))) => {
+                warn!(
+                    "SSM pre-fetch: deterministic_key found but salt not found (will fetch on first request)"
+                );
+            }
+            Ok((Ok(Some(_)), Err(e))) => {
+                warn!(
+                    "SSM pre-fetch: deterministic_key found but salt fetch failed (will fetch on first request): {}",
+                    e
+                );
+            }
+            Ok((Ok(None), _)) => {
+                warn!("SSM pre-fetch: deterministic_key not found (will fetch on first request)");
+            }
+            Ok((Err(e), _)) => {
+                warn!(
+                    "SSM pre-fetch failed (non-critical, will fetch on first request): {}",
+                    e
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "SSM pre-fetch timed out after 5s (non-critical, will fetch on first request)"
+                );
+            }
+        }
 
         // Create CacheService from Redis (if available)
         let cache = redis.as_ref().map(|r| {

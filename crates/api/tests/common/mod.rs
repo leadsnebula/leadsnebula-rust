@@ -88,6 +88,45 @@ where
 pub async fn create_test_pool_with_transaction(
 ) -> anyhow::Result<(PgPool, sqlx::Transaction<'static, sqlx::Postgres>)> {
     let pool = create_test_pool().await?;
-    let tx = pool.begin().await?;
+    let tx = begin_transaction_with_retry(&pool).await?;
     Ok((pool, tx))
+}
+
+/// Begin a transaction with timeout and retry logic to handle pool exhaustion.
+/// This prevents tests from hanging indefinitely when the connection pool is exhausted.
+///
+/// When running tests with nextest or in parallel, the pool can become exhausted if
+/// previous tests haven't released their connections. This function:
+/// 1. Wraps pool.begin() in a 30s timeout
+/// 2. Retries with exponential backoff on PoolTimedOut errors
+/// 3. Provides clear error messages for debugging
+pub async fn begin_transaction_with_retry(
+    pool: &PgPool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut retries = 0;
+    let max_retries = 5;
+    loop {
+        // Wrap pool.begin() in a timeout to catch hangs (pool exhaustion)
+        match tokio::time::timeout(tokio::time::Duration::from_secs(30), pool.begin()).await {
+            Ok(Ok(tx)) => return Ok(tx),
+            Ok(Err(sqlx::Error::PoolTimedOut)) if retries < max_retries => {
+                retries += 1;
+                let delay_ms = 200 * retries; // 200ms, 400ms, 600ms, 800ms, 1000ms
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                // Timeout occurred - pool.begin() hung (pool is exhausted)
+                if retries < max_retries {
+                    retries += 1;
+                    let delay_ms = 1000 * retries; // Wait longer for connections to be released
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                } else {
+                    return Err(sqlx::Error::PoolTimedOut);
+                }
+            }
+        }
+    }
 }

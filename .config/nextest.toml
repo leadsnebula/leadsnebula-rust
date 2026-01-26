@@ -6,9 +6,12 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 retries = { backoff = "exponential", count = 3, delay = "1s" }
 slow-timeout = { period = "180s", terminate-after = 2 }
 # Override for database-heavy tests that may hang on Neon cold starts
+# This test can take longer due to database connection pool initialization
+# Set terminate-after = 1 to allow one slow period (360s) before termination
+# The outer timeout (420s) in CI will catch truly hung tests
 [[profile.ci.overrides]]
 filter = 'test(test_otp_backup_codes_storage)'
-slow-timeout = { period = "240s", terminate-after = 2 }
+slow-timeout = { period = "360s", terminate-after = 1 }
 
 # WSL profile: Longer timeouts for slow Neon free-tier, prevent resource exhaustion
 [profile.wsl]

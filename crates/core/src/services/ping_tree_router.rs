@@ -1650,6 +1650,8 @@ impl PingTreeRouter {
                 });
             }
 
+            // Measure fullpost auction duration (parallel requests to all buyers)
+            let fullpost_auction_start = std::time::Instant::now();
             // Use FuturesUnordered for true concurrent handling (better than join_all for parallelism)
             let mut futures_unordered = FuturesUnordered::new();
             for future in futures {
@@ -1659,6 +1661,10 @@ impl PingTreeRouter {
             while let Some(result) = futures_unordered.next().await {
                 results.push(result);
             }
+            let fullpost_auction_duration = fullpost_auction_start.elapsed().as_millis() as u64;
+            // Record timing for fullpost auction (similar to post_sent for consistency)
+            timing.record_post_sent(fullpost_auction_duration);
+            metrics.record_stage_timing("fullpost_auction", fullpost_auction_duration);
 
             // Collect responses
             let mut responses: Vec<(

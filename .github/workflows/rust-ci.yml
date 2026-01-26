@@ -315,9 +315,10 @@ jobs:
           # 2. Auth tests - MUST run sequentially (--test-threads=1) to avoid migration table race conditions
           # Multiple concurrent tests trying to create _sqlx_migrations table causes "duplicate key" errors
           # Use CI profile for longer timeouts (180s) to handle Neon free-tier cold starts
-          # Also add timeout wrapper to catch hanging tests (300s = 5 minutes) as final safety net
-          timeout 300 cargo nextest run --test integration_auth --locked --all-features --test-threads=1 --profile ci || \
-            timeout 300 cargo test --test integration_auth --locked --all-features -- --test-threads=1
+          # Also add timeout wrapper to catch hanging tests (420s = 7 minutes) as final safety net
+          # Some tests like test_otp_backup_codes_storage can take longer with nextest due to pool initialization
+          timeout 420 cargo nextest run --test integration_auth --locked --all-features --test-threads=1 --profile ci || \
+            timeout 420 cargo test --test integration_auth --locked --all-features -- --test-threads=1
           
           # 3. Publisher CRUD tests - MUST run sequentially (--test-threads=1) to avoid migration table race conditions
           # Multiple concurrent tests trying to create/drop _sqlx_migrations table causes race conditions

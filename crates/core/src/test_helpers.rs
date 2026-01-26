@@ -36,21 +36,48 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     // This prevents test data from polluting the main database
     let is_ci = std::env::var("CI").is_ok();
     let is_ephemeral = std::env::var("EPHEMERAL_DB").is_ok();
-    let looks_like_ephemeral = database_url.contains("ci-") || database_url.contains("ci-local-");
 
-    if !is_ci && !is_ephemeral && !looks_like_ephemeral {
+    // Check for various ephemeral DB patterns (Neon ephemeral branches, test DBs, etc.)
+    let looks_like_ephemeral = database_url.contains("ci-")
+        || database_url.contains("ci-local-")
+        || database_url.contains("ephemeral")
+        || database_url.contains("test-")
+        || database_url.contains("/test")
+        || database_url.contains("_test")
+        || database_url.contains("neon.tech")
+            && (database_url.contains("ephemeral") || database_url.contains("ci-"));
+
+    // Additional safety: Check if database name looks like production/dev
+    let is_production_like = database_url.contains("leadsnebula")
+        && !database_url.contains("test")
+        && !database_url.contains("ci-")
+        && !database_url.contains("ephemeral")
+        && !is_ci
+        && !is_ephemeral;
+
+    if is_production_like || (!is_ci && !is_ephemeral && !looks_like_ephemeral) {
         return Err(anyhow::anyhow!(
             "❌ REFUSED: Tests cannot run against main database.\n\
+             \n\
+             STRICT SAFEGUARD: Database URL appears to be production/dev (not ephemeral).\n\
              \n\
              To run tests:\n\
              1. Use ephemeral Neon branch: ./testScripts/autotestsall.sh\n\
              2. Or set EPHEMERAL_DB=1 with an ephemeral DATABASE_URL\n\
              3. Or run in CI (CI=1 is set automatically)\n\
              \n\
-             Current DATABASE_URL appears to be main DB (not ephemeral).\n\
+             Current DATABASE_URL: {} (sanitized)\n\
+             \n\
              This prevents test data from polluting your main database.\n\
              \n\
-             If you need to run tests locally, use: ./testScripts/autotestsall.sh"
+             If you need to run tests locally, use: ./testScripts/autotestsall.sh",
+            database_url
+                .split('@')
+                .next_back()
+                .unwrap_or("***")
+                .split('/')
+                .next()
+                .unwrap_or("***")
         ));
     }
 

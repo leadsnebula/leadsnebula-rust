@@ -248,14 +248,9 @@ impl BuyerRouter {
 
         let http_ping_start = std::time::Instant::now();
 
-        // Prepare request payload
-        let mut lead_data = serde_json::to_value(&self.lead)?;
-        if let Some(obj) = lead_data.as_object_mut() {
-            obj.insert("request_type".to_string(), serde_json::json!("ping"));
-        }
-        let payload = serde_json::json!({
-            "lead": lead_data
-        });
+        // Prepare minimal ping payload (no PII) - only qualification data
+        // This ensures PII is only sent after buyer accepts the bid
+        let payload = self.build_ping_payload(campaign, &campaign.vertical);
 
         // Timing is tracked at ping_tree_router level
 
@@ -394,16 +389,9 @@ impl BuyerRouter {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Missing endpoint for external buyer integration"))?;
 
-        // Prepare request payload (wrap lead data in "lead" object for Pulsar compatibility)
-        let mut lead_data = serde_json::to_value(&self.lead)?;
-        if let Some(obj) = lead_data.as_object_mut() {
-            obj.insert("promise_id".to_string(), serde_json::json!(promise_id));
-            // Set request_type to "post" for post requests
-            obj.insert("request_type".to_string(), serde_json::json!("post"));
-        }
-        let payload = serde_json::json!({
-            "lead": lead_data
-        });
+        // Prepare full post payload (with all PII) - used after ping succeeds
+        // This includes all PII that was excluded from the ping request
+        let payload = self.build_post_payload(campaign, promise_id, &campaign.vertical);
 
         // Timing is tracked at ping_tree_router level
 
@@ -864,6 +852,231 @@ impl BuyerRouter {
         encryption_service
             .decrypt(encrypted)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt API key: {}", e))
+    }
+
+    /// Build minimal ping payload (no PII) - only qualification data
+    /// This is used for ping requests to avoid sending PII until buyer accepts the bid
+    fn build_ping_payload(&self, campaign: &Campaign, vertical_slug: &str) -> serde_json::Value {
+        let vertical_data = &self.lead.vertical_data;
+        let vertical_data_obj = vertical_data.as_object();
+
+        // Extract optional fields from vertical_data
+        let get_field = |key: &str| -> Option<serde_json::Value> {
+            vertical_data_obj.and_then(|obj| obj.get(key)).cloned()
+        };
+
+        let mut lead_obj = serde_json::Map::new();
+
+        // Required fields for ping (no PII)
+        if let Some(publisher_id) = self.lead.publisher_id {
+            lead_obj.insert(
+                "publisher_id".to_string(),
+                serde_json::json!(publisher_id.to_string()),
+            );
+        }
+
+        lead_obj.insert("vertical".to_string(), serde_json::json!(vertical_slug));
+        lead_obj.insert("request_type".to_string(), serde_json::json!("ping"));
+
+        lead_obj.insert(
+            "campaign_token".to_string(),
+            serde_json::json!(campaign.campaign_token),
+        );
+
+        if let Some(lead_id) = &self.lead.lead_id {
+            lead_obj.insert("lead_id".to_string(), serde_json::json!(lead_id));
+        }
+
+        // Zip and IP (required for ping)
+        if let Some(zip) = &self.lead.zip_encrypted {
+            lead_obj.insert("zip".to_string(), serde_json::json!(zip));
+        }
+
+        if let Some(ip) = &self.lead.ip_address_encrypted {
+            lead_obj.insert("ip_address".to_string(), serde_json::json!(ip));
+        }
+
+        // Monthly bill (required for ping)
+        if let Some(monthly_bill) = get_field("monthly_bill") {
+            lead_obj.insert("monthly_bill".to_string(), monthly_bill);
+        }
+
+        // Own home (required for ping)
+        if let Some(own_home) = get_field("own_home") {
+            lead_obj.insert("own_home".to_string(), own_home);
+        }
+
+        // TCPA fields
+        lead_obj.insert(
+            "tcpa_consent".to_string(),
+            serde_json::json!(self.lead.tcpa_consent),
+        );
+        lead_obj.insert(
+            "tcpa_language".to_string(),
+            serde_json::json!(self.lead.tcpa_language),
+        );
+
+        // Optional qualification fields
+        if let Some(purchase_timeframe) = get_field("purchase_timeframe") {
+            lead_obj.insert("purchase_timeframe".to_string(), purchase_timeframe);
+        }
+        if let Some(credit_rating) = get_field("credit_rating") {
+            lead_obj.insert("credit_rating".to_string(), credit_rating);
+        }
+        if let Some(property_type) = get_field("property_type") {
+            lead_obj.insert("property_type".to_string(), property_type);
+        }
+        if let Some(roof_shade) = get_field("roof_shade") {
+            lead_obj.insert("roof_shade".to_string(), roof_shade);
+        }
+        if let Some(roof_type) = get_field("roof_type") {
+            lead_obj.insert("roof_type".to_string(), roof_type);
+        }
+        if let Some(utility_provider) = get_field("utility_provider") {
+            lead_obj.insert("utility_provider".to_string(), utility_provider);
+        }
+
+        // TCPA compliance fields (optional)
+        if let Some(jornaya_lead_id) = &self.lead.jornaya_lead_id {
+            lead_obj.insert(
+                "jornaya_lead_id".to_string(),
+                serde_json::json!(jornaya_lead_id),
+            );
+        }
+        if let Some(trusted_form_url) = &self.lead.trusted_form_url {
+            lead_obj.insert(
+                "trusted_form_url".to_string(),
+                serde_json::json!(trusted_form_url),
+            );
+        }
+
+        serde_json::json!({
+            "lead": lead_obj
+        })
+    }
+
+    /// Build full post payload (with all PII) - used for post requests after ping succeeds
+    fn build_post_payload(
+        &self,
+        campaign: &Campaign,
+        promise_id: &str,
+        vertical_slug: &str,
+    ) -> serde_json::Value {
+        let vertical_data = &self.lead.vertical_data;
+        let vertical_data_obj = vertical_data.as_object();
+
+        let get_field = |key: &str| -> Option<serde_json::Value> {
+            vertical_data_obj.and_then(|obj| obj.get(key)).cloned()
+        };
+
+        let mut lead_obj = serde_json::Map::new();
+
+        // All fields from ping payload
+        if let Some(publisher_id) = self.lead.publisher_id {
+            lead_obj.insert(
+                "publisher_id".to_string(),
+                serde_json::json!(publisher_id.to_string()),
+            );
+        }
+
+        lead_obj.insert("vertical".to_string(), serde_json::json!(vertical_slug));
+        lead_obj.insert("request_type".to_string(), serde_json::json!("post"));
+        lead_obj.insert("promise_id".to_string(), serde_json::json!(promise_id));
+
+        lead_obj.insert(
+            "campaign_token".to_string(),
+            serde_json::json!(campaign.campaign_token),
+        );
+
+        if let Some(lead_id) = &self.lead.lead_id {
+            lead_obj.insert("lead_id".to_string(), serde_json::json!(lead_id));
+        }
+
+        // PII fields (only in post)
+        if let Some(first_name) = &self.lead.first_name_encrypted {
+            lead_obj.insert("first_name".to_string(), serde_json::json!(first_name));
+        }
+        if let Some(last_name) = &self.lead.last_name_encrypted {
+            lead_obj.insert("last_name".to_string(), serde_json::json!(last_name));
+        }
+        if let Some(email) = &self.lead.email_encrypted {
+            lead_obj.insert("email".to_string(), serde_json::json!(email));
+        }
+        if let Some(cell_phone) = &self.lead.cell_phone_encrypted {
+            lead_obj.insert("mobile_phone".to_string(), serde_json::json!(cell_phone));
+        }
+        if let Some(street_address) = &self.lead.street_address_encrypted {
+            lead_obj.insert(
+                "street_address".to_string(),
+                serde_json::json!(street_address),
+            );
+        }
+        if let Some(city) = &self.lead.city_encrypted {
+            lead_obj.insert("city".to_string(), serde_json::json!(city));
+        }
+        if let Some(state) = &self.lead.state_encrypted {
+            lead_obj.insert("state".to_string(), serde_json::json!(state));
+        }
+        if let Some(zip) = &self.lead.zip_encrypted {
+            lead_obj.insert("zip".to_string(), serde_json::json!(zip));
+        }
+        if let Some(ip) = &self.lead.ip_address_encrypted {
+            lead_obj.insert("ip_address".to_string(), serde_json::json!(ip));
+        }
+
+        // Qualification fields
+        if let Some(monthly_bill) = get_field("monthly_bill") {
+            lead_obj.insert("monthly_bill".to_string(), monthly_bill);
+        }
+        if let Some(own_home) = get_field("own_home") {
+            lead_obj.insert("own_home".to_string(), own_home);
+        }
+        if let Some(purchase_timeframe) = get_field("purchase_timeframe") {
+            lead_obj.insert("purchase_timeframe".to_string(), purchase_timeframe);
+        }
+        if let Some(credit_rating) = get_field("credit_rating") {
+            lead_obj.insert("credit_rating".to_string(), credit_rating);
+        }
+        if let Some(property_type) = get_field("property_type") {
+            lead_obj.insert("property_type".to_string(), property_type);
+        }
+        if let Some(roof_shade) = get_field("roof_shade") {
+            lead_obj.insert("roof_shade".to_string(), roof_shade);
+        }
+        if let Some(roof_type) = get_field("roof_type") {
+            lead_obj.insert("roof_type".to_string(), roof_type);
+        }
+        if let Some(utility_provider) = get_field("utility_provider") {
+            lead_obj.insert("utility_provider".to_string(), utility_provider);
+        }
+
+        // TCPA fields
+        lead_obj.insert(
+            "tcpa_consent".to_string(),
+            serde_json::json!(self.lead.tcpa_consent),
+        );
+        lead_obj.insert(
+            "tcpa_language".to_string(),
+            serde_json::json!(self.lead.tcpa_language),
+        );
+
+        // TCPA compliance fields
+        if let Some(jornaya_lead_id) = &self.lead.jornaya_lead_id {
+            lead_obj.insert(
+                "jornaya_lead_id".to_string(),
+                serde_json::json!(jornaya_lead_id),
+            );
+        }
+        if let Some(trusted_form_url) = &self.lead.trusted_form_url {
+            lead_obj.insert(
+                "trusted_form_url".to_string(),
+                serde_json::json!(trusted_form_url),
+            );
+        }
+
+        serde_json::json!({
+            "lead": lead_obj
+        })
     }
 }
 

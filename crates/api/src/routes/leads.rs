@@ -2086,8 +2086,12 @@ async fn create_lead(
                 Some(json_obj)
             };
 
-            // Update the ping_payloads row with the routing result as response_payload and external id
-            if payload_row_id.is_some() {
+            // Save ping payloads for ping requests OR fullpost requests that split into ping/post
+            // When fullpost splits, ping_id will be present even though request_type is "fullpost"
+            let should_save_ping_payloads = payload_row_id.is_some()
+                || (request_type == "fullpost" && routing_result.ping_id.is_some());
+
+            if should_save_ping_payloads {
                 // Build JSON manually using serde_json::Value::Object to avoid macro overhead
                 // This is more efficient than serde_json::json! macro
                 use serde_json::Map;
@@ -2364,26 +2368,27 @@ async fn create_lead(
             let total_ms = timing_arc.get_total_ms();
 
             // Store auction timing in vertical_data for frontend reporting
-            let auction_timing_data = if request_type == "ping" {
-                serde_json::json!({
-                    "auction_timing": {
-                        "request_type": "ping",
-                        "ping_auction_ms": ping_auction_ms,
-                        "total_ms": total_ms,
-                    }
-                })
-            } else if request_type == "post" || request_type == "fullpost" {
-                serde_json::json!({
-                    "auction_timing": {
-                        "request_type": request_type,
-                        "ping_auction_ms": ping_auction_ms,
-                        "post_ms": post_sent_ms,
-                        "total_ms": total_ms,
-                    }
-                })
-            } else {
-                serde_json::json!({})
-            };
+            // Include per-buyer timings for detailed analysis
+            let mut auction_timing_base = serde_json::Map::new();
+            auction_timing_base.insert("request_type".to_string(), serde_json::json!(request_type));
+            auction_timing_base.insert(
+                "ping_auction_ms".to_string(),
+                serde_json::json!(ping_auction_ms),
+            );
+            auction_timing_base.insert("post_ms".to_string(), serde_json::json!(post_sent_ms));
+            auction_timing_base.insert("total_ms".to_string(), serde_json::json!(total_ms));
+
+            // Add per-buyer timings if available
+            if let Some(ref per_buyer) = routing_result.per_buyer_timings {
+                auction_timing_base.insert(
+                    "per_buyer_timings".to_string(),
+                    serde_json::json!(per_buyer),
+                );
+            }
+
+            let auction_timing_data = serde_json::json!({
+                "auction_timing": serde_json::Value::Object(auction_timing_base)
+            });
 
             // Determine final status with explicit sold detection
             // CRITICAL: Ensure sold leads are always marked as sold, even if status string doesn't match exactly
@@ -2431,6 +2436,58 @@ async fn create_lead(
                 final_status,
                 leadsnebula_core::models::enums::LeadStatus::Sold
             );
+
+            // For sold leads, update status synchronously as a safety net (with timeout to avoid blocking)
+            // This ensures sold leads are immediately visible in the UI
+            if is_sold {
+                // Clone all values needed for the async block to avoid lifetime issues
+                let lead_uuid_clone = lead_uuid;
+                let final_status_clone = final_status.clone();
+                let campaign_id_clone = routing_result.campaign_id;
+                let buyer_id_clone = routing_result.buyer_id;
+                let promise_id_clone = routing_result.promise_id.clone();
+                let ping_id_clone = routing_result.ping_id.clone();
+                let post_id_clone = routing_result.post_id.clone();
+                let auction_timing_data_clone = auction_timing_data.clone();
+                let db_pool_clone = state.db_pool.clone();
+
+                // Fire and forget with 100ms timeout to avoid blocking auction
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        sqlx::query(
+                            r#"
+                            UPDATE leads
+                            SET status = $2, campaign_id = $3, buyer_id = $4, promise_id = $5, ping_id = $6, post_id = $7, 
+                                sold_at = NOW(), vertical_data = $8, updated_at = NOW()
+                            WHERE uuid = $1
+                            "#,
+                        )
+                        .bind(lead_uuid_clone)
+                        .bind(&final_status_clone)
+                        .bind(campaign_id_clone)
+                        .bind(buyer_id_clone)
+                        .bind(promise_id_clone.as_ref())
+                        .bind(ping_id_clone.as_ref())
+                        .bind(post_id_clone.as_ref())
+                        .bind(sqlx::types::Json(&auction_timing_data_clone))
+                        .execute(&*db_pool_clone)
+                    ).await {
+                        Ok(Ok(_)) => {
+                            // Success - status updated
+                        }
+                        Ok(Err(db_err)) => {
+                            tracing::error!("Failed to synchronously update sold lead {} status: {}", lead_uuid_clone, db_err);
+                        }
+                        Err(_timeout) => {
+                            // Timeout - non-critical, write-behind queue will handle it
+                            tracing::debug!("Sold lead {} status update timed out (non-critical, write-behind queue will handle)", lead_uuid_clone);
+                        }
+                    }
+                });
+            }
+
+            // Also enqueue to write-behind queue for eventual consistency (handles retries, etc.)
             state.write_behind_queue.enqueue(
                 leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadUpdate {
                     lead_id: lead_uuid,

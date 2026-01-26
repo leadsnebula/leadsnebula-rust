@@ -33,7 +33,7 @@
 
 mod common;
 
-use common::create_test_pool;
+use common::{begin_transaction_with_retry, create_test_pool};
 use leadsnebula_core::auth::{hash_password, verify_password, JwtService};
 use uuid::Uuid;
 
@@ -174,7 +174,7 @@ async fn test_otp_setup_creates_secret() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_transaction_with_retry(&pool).await?;
     let user_id = create_test_user(&mut *tx, "otp_test@example.com").await;
 
     // Create OTP setting
@@ -398,7 +398,7 @@ async fn test_otp_backup_codes_storage() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_transaction_with_retry(&pool).await?;
     let user_id = create_test_user(&mut *tx, "otp_backup_test@example.com").await;
 
     // Create OTP setting with backup codes
@@ -448,7 +448,7 @@ async fn test_passkey_credential_storage() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_transaction_with_retry(&pool).await?;
     let user_id = create_test_user(&mut *tx, "passkey_test@example.com").await;
 
     // Create a test passkey credential
@@ -512,7 +512,7 @@ async fn test_passkey_max_limit_enforcement() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_transaction_with_retry(&pool).await?;
     let user_id = create_test_user(&mut *tx, "passkey_limit_test@example.com").await;
 
     // Create 3 passkeys (max limit)
@@ -561,7 +561,7 @@ async fn test_user_password_verification() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_transaction_with_retry(&pool).await?;
     let user_id = create_test_user(&mut *tx, "password_test@example.com").await;
 
     // Retrieve stored password hash
@@ -591,7 +591,7 @@ async fn test_user_status_affects_authentication() -> sqlx::Result<()> {
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_transaction_with_retry(&pool).await?;
     let user_id = create_test_user(&mut *tx, "status_test@example.com").await;
 
     // Verify user is active

@@ -5679,13 +5679,11 @@ async fn list_leads(
                     let value = parts.next().unwrap_or("");
                     Some((
                         urlencoding::decode(key)
-                            .ok()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| key.to_string()),
+                            .map(|s| s.into_owned())
+                            .unwrap_or_else(|_| key.to_string()),
                         urlencoding::decode(value)
-                            .ok()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| value.to_string()),
+                            .map(|s| s.into_owned())
+                            .unwrap_or_else(|_| value.to_string()),
                     ))
                 })
                 .collect()
