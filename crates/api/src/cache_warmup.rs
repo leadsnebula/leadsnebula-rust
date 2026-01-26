@@ -298,14 +298,18 @@ async fn pre_warm_campaign_names(
         Ok(rows) => {
             for row in rows {
                 let campaign_id: uuid::Uuid = row.get("id");
-                let name: String = row.get("name");
-                let cache_key = format!("campaign:name:{}", campaign_id);
-                let _ = cache
-                    .get_or_insert_with(&cache_key, 3600, || async {
-                        Ok::<String, anyhow::Error>(name.clone())
-                    })
-                    .await;
-                warmed += 1;
+                // Handle NULL name gracefully - campaigns.name is optional
+                let name: Option<String> = row.get("name");
+                if let Some(name) = name {
+                    let cache_key = format!("campaign:name:{}", campaign_id);
+                    let _ = cache
+                        .get_or_insert_with(&cache_key, 3600, || async {
+                            Ok::<String, anyhow::Error>(name.clone())
+                        })
+                        .await;
+                    warmed += 1;
+                }
+                // Skip campaigns with NULL names (they won't be cached)
             }
         }
         Err(e) => {

@@ -185,17 +185,26 @@ jobs:
         run: |
           echo "Validating Fly.io app: ${{ env.APP_NAME }}..."
           
-          # Check if app exists and is accessible
-          if ! flyctl status --app ${{ env.APP_NAME }} > /dev/null 2>&1; then
+          # Check if app exists (works even if no machines exist)
+          # Use 'apps show' which returns app info regardless of machine state
+          if ! flyctl apps show ${{ env.APP_NAME }} > /dev/null 2>&1; then
             echo "❌ App ${{ env.APP_NAME }} not found or not accessible"
             echo "Create it with: flyctl apps create ${{ env.APP_NAME }}"
             exit 1
           fi
           
+          # Check machine state (may be empty if all machines were destroyed)
+          MACHINE_COUNT=$(flyctl machines list --app ${{ env.APP_NAME }} --json 2>/dev/null | jq '. | length' || echo "0")
+          if [ "$MACHINE_COUNT" = "0" ]; then
+            echo "⚠️  App exists but has no machines (may have been destroyed due to crash loops)"
+            echo "ℹ️  Deployment will create a new machine automatically"
+          else
+            echo "✅ App ${{ env.APP_NAME }} exists with $MACHINE_COUNT machine(s)"
+          fi
+          
           # Verify required secrets are documented
           # Note: flyctl secrets list doesn't show values, so we verify app exists
           # and provide clear documentation about required secrets
-          echo "✅ App ${{ env.APP_NAME }} is accessible"
           echo ""
           echo "⚠️  Required secrets (verify manually or set if missing):"
           echo "   - ENVIRONMENT (e.g., 'development' or 'production')"
