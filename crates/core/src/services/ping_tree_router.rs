@@ -1162,25 +1162,26 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest bid, then priority, then random
-        // DEBUG: Detailed routing steps (only in debug mode)
-        tracing::debug!(
+        // Log all bids for debugging buyer distribution
+        tracing::warn!(
             lead_id = %self.lead.uuid,
-            stage = "select_winner_start",
             total_responses = responses.len(),
             valid_responses = valid_responses.len(),
-            "Selecting winner from valid responses"
+            bids = ?valid_responses.iter().map(|(r, c, p)| (c, r.bid, p)).collect::<Vec<_>>(),
+            "Selecting winner from valid responses - logging all bids for buyer distribution analysis"
         );
         let winner_selection_start = std::time::Instant::now();
         let winner = select_winner(valid_responses);
-        let (winner_response, winner_campaign_id, _) = winner;
+        let (winner_response, winner_campaign_id, winner_priority) = winner;
         let winner_selection_duration = winner_selection_start.elapsed().as_millis() as u64;
-        // DEBUG: Detailed routing steps (only in debug mode)
-        tracing::debug!(
+        // Log winner selection details
+        tracing::warn!(
             lead_id = %self.lead.uuid,
             stage = "select_winner_complete",
             winner_selection_ms = winner_selection_duration,
             winner_campaign_id = %winner_campaign_id,
             winner_bid = ?winner_response.bid,
+            winner_priority = ?winner_priority,
             winner_status = %winner_response.status,
             "Winner selected"
         );

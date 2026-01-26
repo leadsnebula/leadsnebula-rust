@@ -569,10 +569,19 @@ impl WriteBehindQueue {
         ) in updates
         {
             let update_start = Instant::now();
-            if *sold_at && *status == LeadStatus::Sold {
+            // CRITICAL: Also update if campaign_id and buyer_id are set (indicating sold) even if sold_at flag is false
+            // This handles cases where the sold_at flag wasn't set correctly but the lead was actually sold
+            let should_update_as_sold = (*sold_at && *status == LeadStatus::Sold)
+                || (campaign_id.is_some() && buyer_id.is_some() && *status == LeadStatus::Sold);
+            
+            if should_update_as_sold {
                 // Update with sold_at and ALL fields (campaign_id, buyer_id, ping_id, promise_id, post_id, vertical_data)
                 // CRITICAL: Must update all fields, not just post_id and status, so leads show complete information
                 if let Some(token) = inprog_token {
+                    tracing::debug!(
+                        "Updating sold lead {} with inprog_token (conditional update)",
+                        lead_id
+                    );
                     match sqlx::query(
                         r#"
                         UPDATE leads
@@ -611,6 +620,11 @@ impl WriteBehindQueue {
                         }
                     }
                 } else {
+                    tracing::debug!(
+                        "Updating sold lead {} without inprog_token (unconditional update), post_id: {:?}",
+                        lead_id,
+                        post_id
+                    );
                     match sqlx::query(
                         r#"
                         UPDATE leads
@@ -630,8 +644,22 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await
                     {
-                        Ok(_) => {
+                        Ok(result) => {
                             let update_duration_ms = update_start.elapsed().as_millis() as u64;
+                            let rows_affected = result.rows_affected();
+                            if rows_affected == 0 {
+                                tracing::warn!(
+                                    "Lead {} update to sold status completed but affected 0 rows (lead may not exist or already updated)",
+                                    lead_id
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Successfully updated lead {} to sold status in {}ms (rows affected: {})",
+                                    lead_id,
+                                    update_duration_ms,
+                                    rows_affected
+                                );
+                            }
                             // Log lead update (async, non-blocking - 0ms impact)
                             async_log::log_lead_update(
                                 *lead_id,
@@ -648,7 +676,17 @@ impl WriteBehindQueue {
                         }
                     }
                 }
-            } else if let Some(token) = inprog_token {
+            } else {
+                tracing::debug!(
+                    "Skipping sold_at update for lead {}: sold_at={}, status={:?}",
+                    lead_id,
+                    sold_at,
+                    status
+                );
+            }
+            
+            // Handle inprog_token reset or standard update
+            if let Some(token) = inprog_token {
                 // Reset placeholder (clear inprog_token)
                 if let Err(e) = sqlx::query(
                     r#"

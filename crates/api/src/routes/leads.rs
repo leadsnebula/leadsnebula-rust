@@ -2467,11 +2467,12 @@ async fn create_lead(
                 let auction_timing_data_clone = auction_timing_data.clone();
                 let db_pool_clone = state.db_pool.clone();
 
-                // Fire and forget with 500ms timeout to avoid blocking auction
-                // Increased from 100ms to handle Neon cold starts and slow connections
+                // Fire and forget with 2000ms timeout to avoid blocking auction
+                // Increased from 500ms to handle Neon cold starts and slow connections during first request
                 tokio::spawn(async move {
+                    let update_start = std::time::Instant::now();
                     match tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
+                        std::time::Duration::from_millis(2000),
                         sqlx::query(
                             r#"
                             UPDATE leads
@@ -2490,15 +2491,34 @@ async fn create_lead(
                         .bind(sqlx::types::Json(&auction_timing_data_clone))
                         .execute(&*db_pool_clone)
                     ).await {
-                        Ok(Ok(_)) => {
-                            // Success - status updated
+                        Ok(Ok(result)) => {
+                            let update_duration = update_start.elapsed();
+                            if result.rows_affected() == 0 {
+                                tracing::warn!(
+                                    "Synchronous update for sold lead {} completed but affected 0 rows (lead may not exist or already updated)",
+                                    lead_uuid_clone
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Successfully updated sold lead {} status synchronously in {}ms",
+                                    lead_uuid_clone,
+                                    update_duration.as_millis()
+                                );
+                            }
                         }
                         Ok(Err(db_err)) => {
-                            tracing::error!("Failed to synchronously update sold lead {} status: {}", lead_uuid_clone, db_err);
+                            tracing::error!(
+                                "Failed to synchronously update sold lead {} status: {}",
+                                lead_uuid_clone,
+                                db_err
+                            );
                         }
                         Err(_timeout) => {
                             // Timeout - non-critical, write-behind queue will handle it
-                            tracing::debug!("Sold lead {} status update timed out (non-critical, write-behind queue will handle)", lead_uuid_clone);
+                            tracing::warn!(
+                                "Sold lead {} status update timed out after 2000ms (non-critical, write-behind queue will handle)",
+                                lead_uuid_clone
+                            );
                         }
                     }
                 });
