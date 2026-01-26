@@ -538,7 +538,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                     let _ = sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
                                         .execute(&pool)
                                         .await;
-                                    
+
                                     let _ = sqlx::query(
                                         "CREATE TABLE _sqlx_migrations (
                                             version BIGINT PRIMARY KEY,
@@ -551,11 +551,13 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                     )
                                     .execute(&pool)
                                     .await;
-                                    
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100))
+                                        .await;
                                 } else {
                                     // In non-test mode, try to extract and remove just the specific migration
-                                    let version = if let Some(start) = error_msg.find("migration ") {
+                                    let version = if let Some(start) = error_msg.find("migration ")
+                                    {
                                         let rest = &error_msg[start + 10..];
                                         if let Some(end) = rest.find(' ') {
                                             rest[..end].parse::<i64>().ok()
@@ -568,10 +570,12 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
 
                                     if let Some(v) = version {
                                         tracing::warn!("Migration {} was modified - removing from migrations table", v);
-                                        let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
-                                            .bind(v)
-                                            .execute(&pool)
-                                            .await;
+                                        let _ = sqlx::query(
+                                            "DELETE FROM _sqlx_migrations WHERE version = $1",
+                                        )
+                                        .bind(v)
+                                        .execute(&pool)
+                                        .await;
                                     }
                                 }
 
@@ -602,14 +606,14 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                             // In test mode, we can safely drop the entire migrations table since we're in an ephemeral DB
                             if error_msg.contains("was previously applied but has been modified") {
                                 tracing::warn!("Detected modified migration(s) - clearing migrations table in test mode for clean re-run");
-                                
+
                                 // In test mode, drop the entire migrations table to handle multiple modified migrations
                                 // This is safe because we're in an ephemeral database and migrations are idempotent
                                 if is_test_mode {
                                     let _ = sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
                                         .execute(&pool)
                                         .await;
-                                    
+
                                     // Recreate the table with correct schema
                                     let _ = sqlx::query(
                                         "CREATE TABLE _sqlx_migrations (
@@ -623,12 +627,14 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                     )
                                     .execute(&pool)
                                     .await;
-                                    
+
                                     // Small delay to ensure table is ready
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100))
+                                        .await;
                                 } else {
                                     // In non-test mode, try to extract and remove just the specific migration
-                                    let version = if let Some(start) = error_msg.find("migration ") {
+                                    let version = if let Some(start) = error_msg.find("migration ")
+                                    {
                                         let rest = &error_msg[start + 10..];
                                         if let Some(end) = rest.find(' ') {
                                             rest[..end].parse::<i64>().ok()
@@ -638,13 +644,15 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                     } else {
                                         None
                                     };
-                                    
+
                                     if let Some(v) = version {
                                         tracing::warn!("Migration {} was modified - removing from migrations table", v);
-                                        let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
-                                            .bind(v)
-                                            .execute(&pool)
-                                            .await;
+                                        let _ = sqlx::query(
+                                            "DELETE FROM _sqlx_migrations WHERE version = $1",
+                                        )
+                                        .bind(v)
+                                        .execute(&pool)
+                                        .await;
                                     }
                                 }
 
@@ -659,10 +667,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                     })?;
 
                                 migrator_retry.run(&pool).await.map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "Migration failed even after cleanup: {}",
-                                        e
-                                    )
+                                    anyhow::anyhow!("Migration failed even after cleanup: {}", e)
                                 })?;
                             } else if is_test_mode
                                 && (error_msg.contains("already exists")
