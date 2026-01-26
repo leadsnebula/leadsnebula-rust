@@ -530,27 +530,49 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                         Err(e) => {
                             let error_msg = e.to_string();
                             // If migration was modified, remove it from the migrations table and retry
+                            // In test mode, drop entire table to handle multiple modified migrations
                             if error_msg.contains("was previously applied but has been modified") {
-                                // Extract version number from error message
-                                let version = if let Some(start) = error_msg.find("migration ") {
-                                    let rest = &error_msg[start + 10..];
-                                    if let Some(end) = rest.find(' ') {
-                                        rest[..end].parse::<i64>().ok()
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                if let Some(v) = version {
-                                    tracing::warn!("Migration {} was modified - removing from migrations table and retrying", v);
+                                if is_test_mode {
+                                    tracing::warn!("Detected modified migration(s) during migrator creation - clearing migrations table in test mode");
+                                    // Drop and recreate migrations table to handle all modified migrations at once
+                                    let _ = sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
+                                        .execute(&pool)
+                                        .await;
+                                    
                                     let _ = sqlx::query(
-                                        "DELETE FROM _sqlx_migrations WHERE version = $1",
+                                        "CREATE TABLE _sqlx_migrations (
+                                            version BIGINT PRIMARY KEY,
+                                            description TEXT NOT NULL,
+                                            installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                            success BOOLEAN NOT NULL,
+                                            checksum BYTEA NOT NULL,
+                                            execution_time BIGINT NOT NULL
+                                        )",
                                     )
-                                    .bind(v)
                                     .execute(&pool)
                                     .await;
+                                    
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                } else {
+                                    // In non-test mode, try to extract and remove just the specific migration
+                                    let version = if let Some(start) = error_msg.find("migration ") {
+                                        let rest = &error_msg[start + 10..];
+                                        if let Some(end) = rest.find(' ') {
+                                            rest[..end].parse::<i64>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(v) = version {
+                                        tracing::warn!("Migration {} was modified - removing from migrations table", v);
+                                        let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+                                            .bind(v)
+                                            .execute(&pool)
+                                            .await;
+                                    }
                                 }
 
                                 // Retry creating migrator
@@ -576,48 +598,72 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                         }
                         Err(e) => {
                             let error_msg = e.to_string();
-                            // If migration was modified, remove it from the migrations table and retry
+                            // If migration was modified, remove ALL modified migrations from the migrations table and retry
+                            // In test mode, we can safely drop the entire migrations table since we're in an ephemeral DB
                             if error_msg.contains("was previously applied but has been modified") {
-                                // Extract version number from error message
-                                let version = if let Some(start) = error_msg.find("migration ") {
-                                    let rest = &error_msg[start + 10..];
-                                    if let Some(end) = rest.find(' ') {
-                                        rest[..end].parse::<i64>().ok()
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                if let Some(v) = version {
-                                    tracing::warn!("Migration {} was modified during run - removing from migrations table and retrying", v);
+                                tracing::warn!("Detected modified migration(s) - clearing migrations table in test mode for clean re-run");
+                                
+                                // In test mode, drop the entire migrations table to handle multiple modified migrations
+                                // This is safe because we're in an ephemeral database and migrations are idempotent
+                                if is_test_mode {
+                                    let _ = sqlx::query("DROP TABLE IF EXISTS _sqlx_migrations")
+                                        .execute(&pool)
+                                        .await;
+                                    
+                                    // Recreate the table with correct schema
                                     let _ = sqlx::query(
-                                        "DELETE FROM _sqlx_migrations WHERE version = $1",
+                                        "CREATE TABLE _sqlx_migrations (
+                                            version BIGINT PRIMARY KEY,
+                                            description TEXT NOT NULL,
+                                            installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                            success BOOLEAN NOT NULL,
+                                            checksum BYTEA NOT NULL,
+                                            execution_time BIGINT NOT NULL
+                                        )",
                                     )
-                                    .bind(v)
                                     .execute(&pool)
                                     .await;
+                                    
+                                    // Small delay to ensure table is ready
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                } else {
+                                    // In non-test mode, try to extract and remove just the specific migration
+                                    let version = if let Some(start) = error_msg.find("migration ") {
+                                        let rest = &error_msg[start + 10..];
+                                        if let Some(end) = rest.find(' ') {
+                                            rest[..end].parse::<i64>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    
+                                    if let Some(v) = version {
+                                        tracing::warn!("Migration {} was modified - removing from migrations table", v);
+                                        let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+                                            .bind(v)
+                                            .execute(&pool)
+                                            .await;
+                                    }
+                                }
 
-                                    // Retry running migrations
-                                    let migrator_retry = Migrator::new(migrations_path.as_path())
-                                        .await
-                                        .map_err(|e| {
-                                            anyhow::anyhow!(
-                                                "Failed to create migrator for retry: {}",
-                                                e
-                                            )
-                                        })?;
-
-                                    migrator_retry.run(&pool).await.map_err(|e| {
+                                // Retry running migrations
+                                let migrator_retry = Migrator::new(migrations_path.as_path())
+                                    .await
+                                    .map_err(|e| {
                                         anyhow::anyhow!(
-                                            "Migration failed even after cleanup: {}",
+                                            "Failed to create migrator for retry: {}",
                                             e
                                         )
                                     })?;
-                                } else {
-                                    return Err(anyhow::anyhow!("Migration failed: {}", e));
-                                }
+
+                                migrator_retry.run(&pool).await.map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Migration failed even after cleanup: {}",
+                                        e
+                                    )
+                                })?;
                             } else if is_test_mode
                                 && (error_msg.contains("already exists")
                                     || error_msg.contains("duplicate key"))
