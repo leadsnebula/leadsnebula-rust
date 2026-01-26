@@ -86,18 +86,63 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
             60 // Local: 60s is sufficient for concurrency tests
         });
 
-    let pool = PgPoolOptions::new()
-        .max_connections(max_conns)
-        .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
-        .connect(&database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
+    // Retry pool creation with exponential backoff for Neon free-tier cold starts
+    // Neon can take 5-30+ seconds to wake from suspend, especially in CI
+    let database_url_clone = database_url.clone();
+    let max_conns_clone = max_conns;
+    let acquire_timeout_secs_clone = acquire_timeout_secs;
 
-    // Quick health test
-    sqlx::query("SELECT 1")
-        .execute(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Database connection test failed: {}", e))?;
+    let mut retries = 0;
+    let max_retries = 5;
+    let pool = loop {
+        match PgPoolOptions::new()
+            .max_connections(max_conns_clone)
+            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs_clone))
+            .connect(&database_url_clone)
+            .await
+        {
+            Ok(p) => {
+                // Quick health test
+                match sqlx::query("SELECT 1").execute(&p).await {
+                    Ok(_) => break p,
+                    Err(e) if retries < max_retries => {
+                        retries += 1;
+                        let delay_ms = 500 * (1 << retries.min(4)); // 1s, 2s, 4s, 8s, 8s
+                        eprintln!(
+                            "Health check failed on attempt {}, retrying pool creation in {}ms... (Neon may be cold)",
+                            retries, delay_ms
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Database connection test failed after {} retries: {}",
+                            max_retries,
+                            e
+                        ));
+                    }
+                }
+            }
+            Err(e) if retries < max_retries => {
+                retries += 1;
+                let delay_ms = 500 * (1 << retries.min(4)); // 1s, 2s, 4s, 8s, 8s
+                eprintln!(
+                    "Pool creation failed on attempt {}, retrying in {}ms... (Neon may be cold): {}",
+                    retries, delay_ms, e
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to database after {} retries: {}",
+                    max_retries,
+                    e
+                ));
+            }
+        }
+    };
 
     // Set statement timeout for migrations - Neon free-tier can be very slow
     // This must be set before migrations run, as migrations can take 60+ seconds
@@ -109,8 +154,9 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
         || std::env::var("EPHEMERAL_DB").is_ok();
 
     if is_test_env {
-        // Set 60s timeout for test environments (migrations can be slow on Neon free-tier)
-        sqlx::query("SET statement_timeout = '60s'")
+        // Set 120s timeout for test environments (migrations can be very slow on Neon free-tier,
+        // especially when many tests run in parallel and compete for database resources)
+        sqlx::query("SET statement_timeout = '120s'")
             .execute(&pool)
             .await
             .ok(); // Non-critical - if this fails, migrations will use default timeout
@@ -292,8 +338,10 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                         // Recreate table with exact SQLx schema
+                        // Use IF NOT EXISTS to handle race conditions when multiple tests run in parallel
+                        // Even with advisory locks, there can be timing issues
                         sqlx::query(
-                            "CREATE TABLE _sqlx_migrations (
+                            "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
                                 version BIGINT PRIMARY KEY,
                                 description TEXT NOT NULL,
                                 installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -539,8 +587,9 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                         .execute(&pool)
                                         .await;
 
+                                    // Use IF NOT EXISTS to handle race conditions when multiple tests run in parallel
                                     let _ = sqlx::query(
-                                        "CREATE TABLE _sqlx_migrations (
+                                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
                                             version BIGINT PRIMARY KEY,
                                             description TEXT NOT NULL,
                                             installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -615,8 +664,9 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                                         .await;
 
                                     // Recreate the table with correct schema
+                                    // Use IF NOT EXISTS to handle race conditions when multiple tests run in parallel
                                     let _ = sqlx::query(
-                                        "CREATE TABLE _sqlx_migrations (
+                                        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
                                             version BIGINT PRIMARY KEY,
                                             description TEXT NOT NULL,
                                             installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(),
