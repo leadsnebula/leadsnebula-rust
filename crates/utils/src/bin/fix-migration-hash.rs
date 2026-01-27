@@ -14,29 +14,30 @@ async fn main() -> Result<()> {
         let _ = dotenvy::dotenv();
     }
 
-    // Load DATABASE_URL from SSM or env var
-    let environment = std::env::var("ENVIRONMENT")
-        .or_else(|_| std::env::var("ENV"))
-        .unwrap_or_else(|_| "development".to_string());
-
-    let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
-    let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
-    let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
-    let params = ssm.get_parameters_by_path(&config_path).await?;
-
-    let database_url = params
-        .get(&format!(
-            "/leadsnebula/{}/rust/db/connection_url",
-            env_normalized
-        ))
-        .cloned()
-        .or_else(|| std::env::var("DATABASE_URL").ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "DATABASE_URL not found in SSM at /leadsnebula/{}/rust/db/connection_url",
+    // Prefer DATABASE_URL from env (Neon ephemeral, local .env.local) so fix works without SSM
+    let database_url = if let Ok(url) = std::env::var("DATABASE_URL") {
+        url
+    } else {
+        let environment = std::env::var("ENVIRONMENT")
+            .or_else(|_| std::env::var("ENV"))
+            .unwrap_or_else(|_| "development".to_string());
+        let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
+        let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
+        let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
+        let params = ssm.get_parameters_by_path(&config_path).await?;
+        params
+            .get(&format!(
+                "/leadsnebula/{}/rust/db/connection_url",
                 env_normalized
-            )
-        })?;
+            ))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DATABASE_URL not set and not found in SSM at /leadsnebula/{}/rust/db/connection_url",
+                    env_normalized
+                )
+            })?
+    };
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
     // Remove records for migrations that were modified during recent refactoring
     // These migrations were changed after being applied (schema changes, etc.)
     let versions_to_remove = vec![
+        20250108000002i64, // create_webauthn_credentials (idempotent/conditional logic added)
         20250101000007i64, // create_ping_trees (publisher_id removed)
         20250116000001i64, // add_schema_comments (publisher_id comment removed)
         20260120000001i64, // fix_ping_tree_unique_constraint (likely modified)

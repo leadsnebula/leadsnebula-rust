@@ -6,6 +6,22 @@ use tracing::{debug, error, warn};
 
 // Removed: Using hardcoded retry logic (single retry with 100ms backoff)
 
+/// When SSM is unavailable (timeout/error), use env vars for encryption keys in local dev.
+/// Set LEADSNEBULA_DEV_DETERMINISTIC_KEY and/or LEADSNEBULA_DEV_KEY_DERIVATION_SALT to avoid PII showing as N/A.
+fn try_dev_encryption_fallback(path: &str) -> Option<String> {
+    if path.contains("deterministic_key") {
+        if let Ok(v) = std::env::var("LEADSNEBULA_DEV_DETERMINISTIC_KEY") {
+            return Some(v);
+        }
+    }
+    if path.contains("key_derivation_salt") {
+        if let Ok(v) = std::env::var("LEADSNEBULA_DEV_KEY_DERIVATION_SALT") {
+            return Some(v);
+        }
+    }
+    None
+}
+
 pub struct SsmService {
     client: SsmClient,
     redis: Option<Arc<crate::redis::RedisClient>>,
@@ -77,7 +93,7 @@ impl SsmService {
 
                     Ok(Some(value))
                 } else {
-                    Ok(None)
+                    Ok(try_dev_encryption_fallback(path))
                 }
             }
             Ok(Err(e)) => {
@@ -113,7 +129,7 @@ impl SsmService {
 
                             Ok(Some(value))
                         } else {
-                            Ok(None)
+                            Ok(try_dev_encryption_fallback(path))
                         }
                     }
                     Ok(Err(e)) => {
@@ -122,7 +138,7 @@ impl SsmService {
                             "SSM failed after retry for {}: {}, returning None as fallback",
                             path, e
                         );
-                        Ok(None)
+                        Ok(try_dev_encryption_fallback(path))
                     }
                     Err(_) => {
                         // Timeout on retry - graceful fallback
@@ -130,7 +146,7 @@ impl SsmService {
                             "SSM timeout after retry for {}, returning None as fallback",
                             path
                         );
-                        Ok(None)
+                        Ok(try_dev_encryption_fallback(path))
                     }
                 }
             }
@@ -170,7 +186,7 @@ impl SsmService {
 
                             Ok(Some(value))
                         } else {
-                            Ok(None)
+                            Ok(try_dev_encryption_fallback(path))
                         }
                     }
                     Ok(Err(e)) => {
@@ -179,7 +195,7 @@ impl SsmService {
                             "SSM failed after retry for {}: {}, returning None as fallback",
                             path, e
                         );
-                        Ok(None)
+                        Ok(try_dev_encryption_fallback(path))
                     }
                     Err(_) => {
                         // Timeout on retry - graceful fallback
@@ -187,7 +203,7 @@ impl SsmService {
                             "SSM timeout after retry for {}, returning None as fallback",
                             path
                         );
-                        Ok(None)
+                        Ok(try_dev_encryption_fallback(path))
                     }
                 }
             }

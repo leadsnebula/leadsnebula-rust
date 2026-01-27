@@ -5713,6 +5713,37 @@ async fn list_leads(
         }
     });
 
+    // #region agent log
+    // Debug instrumentation: Log instance_id used for query
+    let log_entry = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "dashboard.rs:5714",
+        "message": "List leads - instance_id and params",
+        "data": {
+            "user_id": user.id.to_string(),
+            "instance_id": instance_id.map(|id| id.to_string()),
+            "page": page,
+            "per_page": per_page,
+            "search_term": search_term.clone()
+        },
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
+    }
+    // #endregion
+
     // Build base query with search support
     // OPTIMIZATION: Only load basic fields - no payloads/PII (loaded lazily via /leads/:id/details endpoint)
     let base_query = if let Some(search) = search_term.as_ref() {
@@ -5736,7 +5767,17 @@ async fn list_leads(
                 v.name as vertical_name,
                 p.name as publisher_name,
                 b.name as buyer_name,
-                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms
+                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms,
+                (SELECT 
+                    CASE 
+                        WHEN pp.payload::jsonb ? 'routing_result' THEN (pp.payload::jsonb->'routing_result'->>'price')::float
+                        WHEN pp.payload::jsonb ? 'price' THEN (pp.payload::jsonb->>'price')::float
+                        ELSE NULL
+                    END
+                 FROM post_payloads pp
+                 WHERE pp.lead_id = l.uuid AND (l.post_id IS NULL OR pp.post_id = l.post_id)
+                 ORDER BY pp.created_at DESC
+                 LIMIT 1) as price
             FROM leads l
             LEFT JOIN verticals v ON l.vertical_id = v.id
             LEFT JOIN publishers p ON l.publisher_id = p.id AND p.deleted_at IS NULL
@@ -5781,7 +5822,17 @@ async fn list_leads(
                 v.name as vertical_name,
                 p.name as publisher_name,
                 b.name as buyer_name,
-                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms
+                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms,
+                (SELECT 
+                    CASE 
+                        WHEN pp.payload::jsonb ? 'routing_result' THEN (pp.payload::jsonb->'routing_result'->>'price')::float
+                        WHEN pp.payload::jsonb ? 'price' THEN (pp.payload::jsonb->>'price')::float
+                        ELSE NULL
+                    END
+                 FROM post_payloads pp
+                 WHERE pp.lead_id = l.uuid AND (l.post_id IS NULL OR pp.post_id = l.post_id)
+                 ORDER BY pp.created_at DESC
+                 LIMIT 1) as price
             FROM leads l
             LEFT JOIN verticals v ON l.vertical_id = v.id
             LEFT JOIN publishers p ON l.publisher_id = p.id AND p.deleted_at IS NULL
@@ -5808,6 +5859,65 @@ async fn list_leads(
             error!("Database error fetching leads: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    // #region agent log
+    // Debug instrumentation: Log query results and check publisher instance_id
+    let leads_count = leads_query.len();
+    let lead_uuids: Vec<String> = leads_query
+        .iter()
+        .take(5)
+        .filter_map(|row| {
+            use sqlx::Row;
+            row.try_get::<uuid::Uuid, _>("uuid")
+                .ok()
+                .map(|id| id.to_string())
+        })
+        .collect();
+
+    // Check publisher instance_id for debugging
+    let publisher_instance_check = if let Some(_inst_id) = instance_id {
+        match sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+            "SELECT instance_id FROM publishers WHERE id IN (SELECT DISTINCT publisher_id FROM leads WHERE created_at > NOW() - INTERVAL '5 minutes' AND publisher_id IS NOT NULL) AND deleted_at IS NULL LIMIT 1"
+        )
+        .fetch_optional(state.db_pool.as_ref())
+        .await {
+            Ok(Some(Some(id))) => Some(id.to_string()),
+            Ok(Some(None)) | Ok(None) => None,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let log_entry = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "dashboard.rs:5810",
+        "message": "List leads - query results",
+        "data": {
+            "instance_id": instance_id.map(|id| id.to_string()),
+            "leads_count": leads_count,
+            "first_5_lead_uuids": lead_uuids,
+            "page": page,
+            "per_page": per_page,
+            "recent_publisher_instance_id": publisher_instance_check
+        },
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
+    }
+    // #endregion
 
     // Get total count for pagination (before applying limit/offset)
     let total_count_query = if let Some(search) = search_term.as_ref() {
@@ -5881,13 +5991,44 @@ async fn list_leads(
             .ok()
             .flatten();
 
+        // Fetch price from post_payloads
+        let price: Option<f64> = row.try_get::<Option<f64>, _>("price").ok().flatten();
+
+        // #region agent log
+        let log_entry = serde_json::json!({
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "F",
+            "location": "dashboard.rs:5970",
+            "message": "Lead list - price and processing time",
+            "data": {
+                "lead_uuid": lead_uuid.to_string(),
+                "price": price,
+                "processing_time_ms": processing_time_ms,
+                "status": row.try_get::<String, _>("status").ok()
+            },
+            "timestamp": chrono::Utc::now().timestamp_millis()
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&log_entry).unwrap_or_default()
+            );
+        }
+        // #endregion
+
         // Build minimal lead JSON (no PII, no payloads - loaded via /leads/:id/details endpoint)
-        // Price is loaded lazily from post_payloads when details are fetched
         let lead_json = serde_json::json!({
             "uuid": lead_uuid.to_string(),
             "lead_id": row.try_get::<Option<String>, _>("lead_id").ok().flatten(),
             "status": row.try_get::<String, _>("status").ok(),
-            "price": None::<f64>, // Loaded lazily via /leads/:id/details
+            "price": price,
             "submitted_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("submitted_at").ok().flatten().map(|d| d.to_rfc3339()),
             "processing_time_ms": processing_time_ms,
             "publisher_name": row.try_get::<Option<String>, _>("publisher_name").ok().flatten(),
@@ -5959,6 +6100,7 @@ async fn get_lead_details(
     let lead_uuid = Uuid::parse_str(&lead_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Initialize encryption service for PII decryption
+    // In local development, SSM may be unavailable - allow viewing leads without decryption
     let env_norm = leadsnebula_core::normalize_env_for_ssm(&state.config.environment).to_string();
     let det_path = format!(
         "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
@@ -5984,10 +6126,9 @@ async fn get_lead_details(
             None
         };
 
-    let pii_decryption_key = pii_decryption_key.ok_or_else(|| {
-        error!("Failed to initialize PII decryption key from SSM");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // If PII decryption key is unavailable (e.g., local dev without SSM), return lead data without decrypted PII
+    // This allows viewing lead details even when SSM is unavailable
+    let pii_decryption_key_opt = pii_decryption_key;
 
     // Fetch lead with basic info
     let lead_row = sqlx::query(
@@ -6034,31 +6175,70 @@ async fn get_lead_details(
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Decrypt PII
+    // Decrypt PII (if decryption key is available)
+    // Return placeholder if decryption fails or key unavailable (instead of None/n/a)
     let decrypt_pii = |enc: Option<String>| -> Option<String> {
-        enc.and_then(|e| {
-            if e.is_empty() {
-                return None;
-            }
-            leadsnebula_core::encryption::EncryptionService::decrypt_envelope(
-                &pii_decryption_key,
-                &e,
-            )
-            .ok()
-            .or_else(|| {
-                EncryptionService::new(&pii_decryption_key)
+        if let Some(ref key) = pii_decryption_key_opt {
+            enc.and_then(|e| {
+                if e.is_empty() {
+                    return None;
+                }
+                leadsnebula_core::encryption::EncryptionService::decrypt_envelope(key, &e)
                     .ok()
-                    .and_then(|svc| svc.decrypt(&e).ok())
+                    .or_else(|| {
+                        EncryptionService::new(key)
+                            .ok()
+                            .and_then(|svc| svc.decrypt(&e).ok())
+                    })
             })
-        })
+        } else {
+            // PII decryption key unavailable - return placeholder if encrypted data exists (even if empty string)
+            if let Some(e) = enc {
+                if !e.is_empty() {
+                    Some("[Encrypted - decryption key unavailable]".to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
     };
 
-    let first_name = decrypt_pii(
-        lead_row
-            .try_get::<Option<String>, _>("first_name_encrypted")
-            .ok()
-            .flatten(),
-    );
+    let first_name_enc = lead_row
+        .try_get::<Option<String>, _>("first_name_encrypted")
+        .ok()
+        .flatten();
+    let first_name = decrypt_pii(first_name_enc.clone());
+    // #region agent log
+    let log_entry = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "D",
+        "location": "dashboard.rs:6134",
+        "message": "PII decryption result",
+        "data": {
+            "lead_uuid": lead_uuid.to_string(),
+            "first_name_encrypted_exists": first_name_enc.is_some(),
+            "first_name_encrypted_empty": first_name_enc.as_ref().map(|s| s.is_empty()),
+            "first_name_result": first_name.clone(),
+            "pii_decryption_key_available": pii_decryption_key_opt.is_some()
+        },
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
+    }
+    // #endregion
     let last_name = decrypt_pii(
         lead_row
             .try_get::<Option<String>, _>("last_name_encrypted")
@@ -6090,10 +6270,13 @@ async fn get_lead_details(
             .flatten(),
     );
 
-    // Fetch ping payloads (for fallback when buyer_responses don't exist)
+    // Fetch ping payloads (for fallback when buyer_responses don't exist, and for ping request payloads)
+    // Also fetch ping_id to match with buyer_responses
     let ping_payloads_rows = sqlx::query(
         r#"
         SELECT 
+            pp.id,
+            pp.ping_id,
             pp.lead_id,
             pp.payload,
             pp.request_payload_encrypted,
@@ -6136,21 +6319,23 @@ async fn get_lead_details(
     .ok()
     .unwrap_or_default();
 
-    // Build ping payloads with decryption
+    // Build ping payloads with decryption (if decryption key is available)
     let decrypt_payload = |enc: Option<String>| -> Option<serde_json::Value> {
-        enc.and_then(|e| {
-            leadsnebula_core::encryption::EncryptionService::decrypt_envelope(
-                &pii_decryption_key,
-                &e,
-            )
-            .ok()
-            .or_else(|| {
-                EncryptionService::new(&pii_decryption_key)
+        if let Some(ref key) = pii_decryption_key_opt {
+            enc.and_then(|e| {
+                leadsnebula_core::encryption::EncryptionService::decrypt_envelope(key, &e)
                     .ok()
-                    .and_then(|svc| svc.decrypt(&e).ok())
+                    .or_else(|| {
+                        EncryptionService::new(key)
+                            .ok()
+                            .and_then(|svc| svc.decrypt(&e).ok())
+                    })
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             })
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        })
+        } else {
+            // PII decryption key unavailable - return None (payloads will be shown as encrypted)
+            None
+        }
     };
 
     let original_request_payload: Option<serde_json::Value> =
@@ -6184,13 +6369,84 @@ async fn get_lead_details(
         })
         .collect();
 
+    // Get winning buyer_id and campaign_id from lead
+    let winning_buyer_id: Option<uuid::Uuid> = lead_row
+        .try_get::<Option<uuid::Uuid>, _>("buyer_id")
+        .ok()
+        .flatten();
+    let winning_campaign_id: Option<uuid::Uuid> = lead_row
+        .try_get::<Option<uuid::Uuid>, _>("campaign_id")
+        .ok()
+        .flatten();
+
+    // Build map: ping_id (string "FP_...") -> ping request payload by joining ping_payloads to pings.
+    // ping_payloads.ping_id can be bigint (pings.id) in DB; pings.ping_id is the "FP_..." string that matches buyer_responses.ping_id (with optional _C{campaign} suffix).
+    let ping_request_payloads: std::collections::HashMap<String, Option<serde_json::Value>> = {
+        let join_rows = sqlx::query(
+            r#"
+            SELECT p.ping_id, pp.request_payload_encrypted
+            FROM ping_payloads pp
+            JOIN pings p ON p.lead_id = pp.lead_id AND p.id::text = pp.ping_id::text
+            WHERE pp.lead_id = $1
+            "#,
+        )
+        .bind(lead_uuid)
+        .fetch_all(state.db_pool.as_ref())
+        .await
+        .ok()
+        .unwrap_or_default();
+        let mut m = std::collections::HashMap::new();
+        for row in &join_rows {
+            if let Ok(Some(k)) = row.try_get::<Option<String>, _>("ping_id") {
+                let enc: Option<String> = row.try_get("request_payload_encrypted").ok().flatten();
+                m.insert(k, decrypt_payload(enc));
+            }
+        }
+        m
+    };
+    let map_keys: Vec<&String> = ping_request_payloads.keys().collect();
+    tracing::warn!(
+        lead_id = %lead_uuid,
+        map_len = ping_request_payloads.len(),
+        map_keys = ?map_keys,
+        "Dashboard get_lead_details: ping_request_payloads map built (visible in cargo run logs)"
+    );
+
+    // Convert buyer_response ping_id ("FP_<b64(lead|ts|accepted)>_C{campaign}") to map key ("FP_<b64(lead|ts|pending)>").
+    // Map is keyed by pings.ping_id which uses "pending"; buyer_responses use "accepted" + _C suffix.
+    let br_ping_id_to_pending_key = |pid: &str| -> Option<String> {
+        let after_fp = pid.strip_prefix("FP_")?;
+        let base_b64 = after_fp.rsplit("_C").next()?;
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(base_b64.as_bytes())
+            .ok()?;
+        let decoded_str = String::from_utf8(decoded).ok()?;
+        let pending_str = decoded_str.replace("|accepted", "|pending");
+        Some(format!(
+            "FP_{}",
+            base64::engine::general_purpose::STANDARD.encode(pending_str.as_bytes())
+        ))
+    };
+
     let ping_payloads: Vec<serde_json::Value> = if !ping_buyer_responses.is_empty() {
-        // Use buyer_responses (normal case)
+        // Use buyer_responses (normal case) - show ALL pings (winning and losing)
         ping_buyer_responses
             .iter()
             .map(|row| {
                 let ping_id: Option<String> =
                     row.try_get::<Option<String>, _>("ping_id").ok().flatten();
+                let buyer_id: Option<uuid::Uuid> =
+                    row.try_get::<Option<uuid::Uuid>, _>("buyer_id").ok().flatten();
+                let campaign_id: Option<uuid::Uuid> =
+                    row.try_get::<Option<uuid::Uuid>, _>("campaign_id").ok().flatten();
+
+                // Determine if this is the winning ping
+                let is_winner = winning_buyer_id.is_some()
+                    && winning_campaign_id.is_some()
+                    && buyer_id == winning_buyer_id
+                    && campaign_id == winning_campaign_id;
+
                 let payload: Option<serde_json::Value> = row
                     .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("payload")
                     .ok()
@@ -6220,6 +6476,72 @@ async fn get_lead_details(
                     None
                 };
 
+                // Get ping request payload: map is keyed by pings.ping_id ("FP_...|pending").
+                // buyer_responses.ping_id is "FP_...|accepted_C{campaign}". Resolve via pending-key derivation.
+                let ping_request_payload = ping_id
+                    .as_ref()
+                    .and_then(|pid| {
+                        let direct = ping_request_payloads.get(pid).cloned();
+                        let via_pending = direct.or_else(|| {
+                            br_ping_id_to_pending_key(pid)
+                                .and_then(|k| ping_request_payloads.get(&k).cloned())
+                        });
+                        let has_key = via_pending.is_some();
+                        tracing::warn!(
+                            lead_id = %lead_uuid,
+                            ping_id = %pid,
+                            has_key = has_key,
+                            "Dashboard get_lead_details: ping request payload lookup (visible in cargo run)"
+                        );
+                        // #region agent log
+                        let log_entry = serde_json::json!({
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "B",
+                            "location": "dashboard.rs:6403",
+                            "message": "Looking up ping request payload",
+                            "data": {
+                                "ping_id": pid,
+                                "ping_request_payloads_has_key": has_key,
+                                "ping_request_payload_keys": via_pending.as_ref().and_then(|p| p.as_ref()).and_then(|p| p.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>())
+                            },
+                            "timestamp": chrono::Utc::now().timestamp_millis()
+                        });
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/home/badinoff/projects/leadsnebula/.cursor/debug.log") {
+                            use std::io::Write;
+                            let _ = writeln!(file, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
+                        }
+                        // #endregion
+                        via_pending
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        tracing::warn!(
+                            lead_id = %lead_uuid,
+                            ping_id = ?ping_id,
+                            "Dashboard get_lead_details: FALLBACK to original_request_payload (visible in cargo run)"
+                        );
+                        // #region agent log
+                        let log_entry = serde_json::json!({
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "B",
+                            "location": "dashboard.rs:6407",
+                            "message": "Falling back to original_request_payload",
+                            "data": {
+                                "ping_id": ping_id.as_ref(),
+                                "original_request_payload_keys": original_request_payload.as_ref().and_then(|p| p.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>())
+                            },
+                            "timestamp": chrono::Utc::now().timestamp_millis()
+                        });
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/home/badinoff/projects/leadsnebula/.cursor/debug.log") {
+                            use std::io::Write;
+                            let _ = writeln!(file, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
+                        }
+                        // #endregion
+                        original_request_payload.clone()
+                    });
+
                 serde_json::json!({
                     "id": row.try_get::<i64, _>("id").ok(),
                     "ping_id": ping_id,
@@ -6227,7 +6549,9 @@ async fn get_lead_details(
                     "campaign_name": row.try_get::<Option<String>, _>("campaign_name").ok().flatten(),
                     "bid": bid,
                     "processing_time_ms": processing_time_ms,
-                    "request_payload": original_request_payload.clone(),
+                    "is_winner": is_winner,
+                    "status": if is_winner { "W" } else { "L" },
+                    "request_payload": ping_request_payload,
                     "response_payload": response_payload,
                 })
             })
@@ -6395,7 +6719,29 @@ async fn get_lead_details(
 
     let lead_price = post_payload
         .as_ref()
-        .and_then(|pp| pp.get("price"))
+        .and_then(|pp| {
+            // #region agent log
+            let log_entry = serde_json::json!({
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "C",
+                "location": "dashboard.rs:6574",
+                "message": "Extracting price from post_payload",
+                "data": {
+                    "lead_uuid": lead_uuid.to_string(),
+                    "post_payload_keys": pp.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()),
+                    "has_price": pp.get("price").is_some(),
+                    "price_value": pp.get("price")
+                },
+                "timestamp": chrono::Utc::now().timestamp_millis()
+            });
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/home/badinoff/projects/leadsnebula/.cursor/debug.log") {
+                use std::io::Write;
+                let _ = writeln!(file, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
+            }
+            // #endregion
+            pp.get("price")
+        })
         .and_then(|p| p.as_f64());
 
     let processing_time_ms: Option<f64> = lead_row
@@ -6403,7 +6749,7 @@ async fn get_lead_details(
         .ok()
         .flatten();
 
-    Ok(Json(serde_json::json!({
+    let response_json = serde_json::json!({
         "success": true,
         "lead": {
             "uuid": lead_uuid.to_string(),
@@ -6428,5 +6774,40 @@ async fn get_lead_details(
             "ping_payloads": ping_payloads,
             "post_payload": post_payload,
         },
-    })))
+    });
+
+    // #region agent log
+    let log_entry = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "E",
+        "location": "dashboard.rs:6724",
+        "message": "Lead details response summary",
+        "data": {
+            "lead_uuid": lead_uuid.to_string(),
+            "ping_payloads_count": ping_payloads.len(),
+            "post_payload_exists": post_payload.is_some(),
+            "lead_price": lead_price,
+            "processing_time_ms": processing_time_ms,
+            "first_name": first_name.clone(),
+            "last_name": last_name.clone(),
+            "email": email.clone()
+        },
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
+    }
+    // #endregion
+
+    Ok(Json(response_json))
 }

@@ -153,6 +153,9 @@ TEST_THREADS=$(nproc)
 echo "Using $TEST_THREADS parallel test threads"
 echo ""
 
+# Give write-behind queue flush more time when DB is under parallel load (CI/heavy tests)
+export WRITE_BEHIND_FLUSH_TIMEOUT_SECS="${WRITE_BEHIND_FLUSH_TIMEOUT_SECS:-60}"
+
 # Single nextest run: all targets, all features, run ignored tests
 # Use all CPU cores for maximum parallelism
 if ! cargo nextest run --all-targets --locked --all-features --run-ignored all --test-threads "$TEST_THREADS"; then

@@ -190,6 +190,35 @@ async fn create_lead(
         .as_deref()
         .unwrap_or("ping")
         .to_lowercase();
+
+    // #region agent log
+    // Debug instrumentation: Log publisher info for lead creation
+    let log_entry = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "leads.rs:187",
+        "message": "Lead creation started - publisher info",
+        "data": {
+            "publisher_id": publisher.id.to_string(),
+            "vertical": lead_data.vertical.clone(),
+            "request_type": request_type.clone()
+        },
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
+    }
+    // #endregion
     // Top-level verbose takes precedence; only use lead-level verbose if top-level is not set
     let verbose_requested = if payload.verbose.is_some() {
         request_level_verbose
@@ -1542,6 +1571,35 @@ async fn create_lead(
     // Generate temporary UUID for lead (will be used in DB insert)
     let lead_uuid = uuid::Uuid::new_v4();
 
+    // #region agent log
+    // Debug instrumentation: Log lead UUID and publisher before routing
+    let log_entry = serde_json::json!({
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": "A",
+        "location": "leads.rs:1543",
+        "message": "Lead UUID generated - before routing",
+        "data": {
+            "lead_uuid": lead_uuid.to_string(),
+            "publisher_id": publisher.id.to_string(),
+            "lead_id": lead_data.lead_id.clone()
+        },
+        "timestamp": chrono::Utc::now().timestamp_millis()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&log_entry).unwrap_or_default()
+        );
+    }
+    // #endregion
+
     // DEBUG: Detailed timing (only in debug mode, not in production)
     tracing::debug!(
         lead_uuid = %lead_uuid,
@@ -1668,6 +1726,7 @@ async fn create_lead(
 
     state.write_behind_queue.enqueue(
         leadsnebula_core::services::write_behind_queue::BackgroundTask::LeadCreation {
+            uuid: lead_uuid, // CRITICAL: Pass the UUID that will be returned to client
             event_id: event_id_for_queue, // Use cloned value
             lead_id: lead_id_for_queue,
             publisher_id: publisher.id,

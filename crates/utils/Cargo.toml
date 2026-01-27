@@ -86,6 +86,10 @@ name = "validate-config"
 path = "src/bin/validate-config.rs"
 
 [[bin]]
+name = "fix-migration-hash"
+path = "src/bin/fix-migration-hash.rs"
+
+[[bin]]
 name = "cleanup-instance-data"
 path = "src/bin/cleanup-instance-data.rs"
 
