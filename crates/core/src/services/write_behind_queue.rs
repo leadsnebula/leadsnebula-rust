@@ -573,7 +573,7 @@ impl WriteBehindQueue {
             // This handles cases where the sold_at flag wasn't set correctly but the lead was actually sold
             let should_update_as_sold = (*sold_at && *status == LeadStatus::Sold)
                 || (campaign_id.is_some() && buyer_id.is_some() && *status == LeadStatus::Sold);
-            
+
             if should_update_as_sold {
                 // Update with sold_at and ALL fields (campaign_id, buyer_id, ping_id, promise_id, post_id, vertical_data)
                 // CRITICAL: Must update all fields, not just post_id and status, so leads show complete information
@@ -702,7 +702,7 @@ impl WriteBehindQueue {
                     status
                 );
             }
-            
+
             // Handle inprog_token reset or standard update
             if let Some(token) = inprog_token {
                 // Reset placeholder (clear inprog_token)
@@ -751,7 +751,11 @@ impl WriteBehindQueue {
                         Ok(_) => {
                             let update_duration_ms = update_start.elapsed().as_millis() as u64;
                             // Log lead update (async, non-blocking - 0ms impact)
-                            async_log::log_lead_update(*lead_id, status.clone(), update_duration_ms);
+                            async_log::log_lead_update(
+                                *lead_id,
+                                status.clone(),
+                                update_duration_ms,
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Failed to update lead {} status: {}", lead_id, e);
@@ -786,7 +790,11 @@ impl WriteBehindQueue {
                         Ok(_) => {
                             let update_duration_ms = update_start.elapsed().as_millis() as u64;
                             // Log lead update (async, non-blocking - 0ms impact)
-                            async_log::log_lead_update(*lead_id, status.clone(), update_duration_ms);
+                            async_log::log_lead_update(
+                                *lead_id,
+                                status.clone(),
+                                update_duration_ms,
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Failed to update lead {} status: {}", lead_id, e);

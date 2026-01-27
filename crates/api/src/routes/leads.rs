@@ -2498,8 +2498,10 @@ async fn create_lead(
                         .bind(ping_id_clone.as_ref())
                         .bind(post_id_clone.as_deref().unwrap_or(""))
                         .bind(sqlx::types::Json(&auction_timing_data_clone))
-                        .execute(&*db_pool_clone)
-                    ).await {
+                        .execute(&*db_pool_clone),
+                    )
+                    .await
+                    {
                         Ok(Ok(result)) => {
                             let update_duration = update_start.elapsed();
                             if result.rows_affected() == 0 {
