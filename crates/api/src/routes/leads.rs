@@ -2429,7 +2429,22 @@ async fn create_lead(
                     "Detected sold lead (buyer selected with price) but status/post_id conditions not met - correcting to Sold"
                 );
                 leadsnebula_core::models::enums::LeadStatus::Sold
-            } else if routing_result.success && routing_result.status == "accepted" {
+            } else if routing_result.success
+                && (routing_result.status == "accepted" || routing_result.status == "ping_accepted")
+            {
+                // Ping succeeded - lead is ping_accepted (even if post failed)
+                leadsnebula_core::models::enums::LeadStatus::PingAccepted
+            } else if routing_result.campaign_id.is_some() && routing_result.buyer_id.is_some() {
+                // Buyer was selected (ping succeeded) but status string doesn't indicate success
+                // This handles cases where ping succeeded but post failed or status string is wrong
+                tracing::warn!(
+                    lead_id = %lead_uuid,
+                    routing_status = %routing_result.status,
+                    routing_success = routing_result.success,
+                    has_campaign_id = true,
+                    has_buyer_id = true,
+                    "Ping succeeded (buyer selected) but status indicates failure - correcting to PingAccepted"
+                );
                 leadsnebula_core::models::enums::LeadStatus::PingAccepted
             } else {
                 leadsnebula_core::models::enums::LeadStatus::Processing

@@ -519,11 +519,13 @@ impl WriteBehindQueue {
         }
 
         let insert_start = Instant::now();
+        let mut success_count = 0;
+        let mut error_count = 0;
 
         // Use existing batch_insert_buyer_responses from ping_tree_router
         // For now, insert individually (can optimize later with UNNEST)
         for (lead_id, campaign_id, ping_id, post_id, buyer_id, payload) in responses {
-            let _ = sqlx::query(
+            match sqlx::query(
                 r#"
                 INSERT INTO buyer_responses (lead_id, campaign_id, ping_id, post_id, buyer_id, payload, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -537,10 +539,43 @@ impl WriteBehindQueue {
             .bind(buyer_id)
             .bind(sqlx::types::Json(payload))
             .execute(pool)
-            .await;
+            .await
+            {
+                Ok(_) => {
+                    success_count += 1;
+                }
+                Err(e) => {
+                    error_count += 1;
+                    tracing::error!(
+                        lead_id = %lead_id,
+                        campaign_id = ?campaign_id,
+                        ping_id = ?ping_id,
+                        post_id = ?post_id,
+                        error = %e,
+                        "Failed to insert buyer response in write-behind queue"
+                    );
+                }
+            }
         }
 
         let insert_duration_ms = insert_start.elapsed().as_millis() as u64;
+
+        if error_count > 0 {
+            tracing::warn!(
+                total_responses = responses.len(),
+                success_count = success_count,
+                error_count = error_count,
+                duration_ms = insert_duration_ms,
+                "Buyer response batch insert completed with errors"
+            );
+        } else {
+            tracing::info!(
+                total_responses = responses.len(),
+                success_count = success_count,
+                duration_ms = insert_duration_ms,
+                "Buyer response batch insert completed successfully"
+            );
+        }
 
         // Log buyer response batch insert (async, non-blocking - 0ms impact)
         async_log::log_buyer_responses_batch(responses.len(), insert_duration_ms);

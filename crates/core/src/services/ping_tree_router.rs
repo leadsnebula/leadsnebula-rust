@@ -1021,6 +1021,12 @@ impl PingTreeRouter {
                     response_count = batch_responses.len(),
                     "Enqueueing buyer responses to write-behind queue"
                 );
+                tracing::info!(
+                    lead_id = %self.lead.uuid,
+                    response_count = batch_responses.len(),
+                    "Enqueueing {} buyer responses to write-behind queue",
+                    batch_responses.len()
+                );
                 for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload) in batch_responses {
                     queue.enqueue(
                         crate::services::write_behind_queue::BackgroundTask::BuyerResponse {
@@ -1162,13 +1168,18 @@ impl PingTreeRouter {
         }
 
         // Select winner: highest bid, then priority, then random
-        // Log all bids for debugging buyer distribution
+        // Log ALL responses (including invalid) and ALL bids for debugging buyer distribution
+        let all_bids: Vec<_> = responses
+            .iter()
+            .map(|(r, c, p)| (c, r.bid, p, r.success, r.status.clone()))
+            .collect();
         tracing::warn!(
             lead_id = %self.lead.uuid,
             total_responses = responses.len(),
             valid_responses = valid_responses.len(),
-            bids = ?valid_responses.iter().map(|(r, c, p)| (c, r.bid, p)).collect::<Vec<_>>(),
-            "Selecting winner from valid responses - logging all bids for buyer distribution analysis"
+            all_responses = ?all_bids,
+            valid_bids = ?valid_responses.iter().map(|(r, c, p)| (c, r.bid, p)).collect::<Vec<_>>(),
+            "Selecting winner - logging ALL responses (valid and invalid) for buyer distribution analysis"
         );
         let winner_selection_start = std::time::Instant::now();
         let winner = select_winner(valid_responses);
@@ -1382,6 +1393,8 @@ impl PingTreeRouter {
                     let bresp_json =
                         serde_json::to_value(&bresp).unwrap_or_else(|_| serde_json::json!({}));
                     // Persist via write-behind queue (eliminates spawn overhead)
+                    // CRITICAL: Always store buyer responses, even if post validation fails
+                    // This ensures frontend can display all ping/post responses
                     if let Some(queue) = &self.write_behind_queue {
                         queue.enqueue(
                             crate::services::write_behind_queue::BackgroundTask::BuyerResponse {
@@ -1393,9 +1406,15 @@ impl PingTreeRouter {
                                 payload: bresp_json,
                             },
                         );
+                        tracing::info!(
+                            lead_id = %self.lead.uuid,
+                            campaign_id = %campaign.id,
+                            has_post_id = bresp.post_id.is_some(),
+                            has_price = bresp.price.is_some(),
+                            "Enqueued post buyer response to write-behind queue"
+                        );
                     } else {
                         // Fallback: log warning if queue not available (shouldn't happen in production)
-                        #[cfg(feature = "tracing")]
                         tracing::warn!(
                             lead_id = %self.lead.uuid,
                             campaign_id = %campaign.id,
@@ -1606,10 +1625,28 @@ impl PingTreeRouter {
             // Log performance metrics to Sentry for monitoring
 
             // Merge ping and post results
+            // CRITICAL: If ping succeeded but post failed, we should still have ping_accepted status
+            // The post_result might have success=false if post validation failed, but ping was successful
+            let merged_success =
+                post_result.success || (ping_result.success && post_result.post_id.is_some());
+            let merged_status = if post_result.success
+                && post_result.post_id.is_some()
+                && post_result.price.is_some()
+            {
+                // Post succeeded - lead is sold
+                "sold".to_string()
+            } else if ping_result.success {
+                // Ping succeeded but post failed or didn't validate - lead is ping_accepted
+                "ping_accepted".to_string()
+            } else {
+                // Both failed - use post result status
+                post_result.status
+            };
+
             Ok(RoutingResult {
-                success: post_result.success,
-                status: post_result.status,
-                error: post_result.error,
+                success: merged_success,
+                status: merged_status,
+                error: post_result.error.or(ping_result.error),
                 promise_id: ping_result.promise_id.or(post_result.promise_id),
                 ping_id: ping_result.ping_id.or(post_result.ping_id),
                 post_id: post_result.post_id,
