@@ -1920,14 +1920,8 @@ impl WriteBehindQueue {
             }
             if start.elapsed() > Duration::from_secs(timeout_secs) {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    "Write-behind queue flush timed out after {}s",
-                    timeout_secs
-                );
-                return Err(anyhow::anyhow!(
-                    "Flush timed out after {}s",
-                    timeout_secs
-                ));
+                tracing::warn!("Write-behind queue flush timed out after {}s", timeout_secs);
+                return Err(anyhow::anyhow!("Flush timed out after {}s", timeout_secs));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
