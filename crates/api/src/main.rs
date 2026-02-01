@@ -230,7 +230,6 @@ async fn main() -> anyhow::Result<()> {
             let state_for_warmup = state.clone();
             let state_for_periodic = Arc::new(state.clone());
             let write_behind_queue_for_shutdown = state.write_behind_queue.clone();
-            let pool_for_keepalive = state.db_pool.clone();
             let redis_for_keepalive = state.redis.clone();
 
             let app = axum::Router::new()
@@ -291,90 +290,8 @@ async fn main() -> anyhow::Result<()> {
                 cache_warmup::start_periodic_warmup(state_for_periodic).await;
             });
 
-            // CRITICAL: Keep database pool warm (ensures min_connections are actually active)
-            // Execute queries in parallel to warm up min_connections
-            info!("Warming up database pool connections...");
-            let pool_warmup_start = std::time::Instant::now();
-            let pool1 = pool_for_keepalive.clone();
-            let pool2 = pool_for_keepalive.clone();
-            let (r1, r2) = tokio::join!(
-                sqlx::query("SELECT 1").execute(pool1.as_ref()),
-                sqlx::query("SELECT 1").execute(pool2.as_ref())
-            );
-            let successful_warmups = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();
-            let pool_warmup_duration = pool_warmup_start.elapsed().as_millis();
-            if successful_warmups == 2 {
-                info!(
-                    db_pool_warmup_ms = pool_warmup_duration,
-                    warmed_connections = successful_warmups,
-                    "Database pool warmed up successfully - {} connections ready",
-                    successful_warmups
-                );
-            } else {
-                tracing::warn!(
-                    db_pool_warmup_ms = pool_warmup_duration,
-                    warmed_connections = successful_warmups,
-                    expected_connections = 2,
-                    "Database pool warmup incomplete - only {}/2 connections warmed",
-                    successful_warmups
-                );
-            }
-
-            // SAMURAI PERFECTION: Keep Neon warm (prevents 5-6s cold starts on free tier)
-            // Run immediately on startup, then every 4 minutes to prevent auto-suspend
-            tokio::spawn(async move {
-                // Run first keep-alive immediately (no delay)
-                let start = std::time::Instant::now();
-                match sqlx::query("SELECT 1")
-                    .execute(pool_for_keepalive.as_ref())
-                    .await
-                {
-                    Ok(_) => {
-                        let duration_ms = start.elapsed().as_millis();
-                        if duration_ms > 50 {
-                            tracing::warn!(
-                                neon_keepalive_ms = duration_ms,
-                                "Neon initial keep-alive slow (may indicate cold start)"
-                            );
-                        } else {
-                            tracing::info!("Neon initial keep-alive OK ({}ms)", duration_ms);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Neon initial keep-alive failed: {}", e);
-                    }
-                }
-
-                // Then continue with periodic keep-alive every 2 minutes
-                // Reduced from 4 minutes to prevent Neon free-tier auto-suspend (suspends after 5 min inactivity)
-                // 2 minutes ensures we ping before suspend threshold, preventing 115-130ms cold start delays
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(120)); // 2 min
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    interval.tick().await;
-                    let start = std::time::Instant::now();
-                    match sqlx::query("SELECT 1")
-                        .execute(pool_for_keepalive.as_ref())
-                        .await
-                    {
-                        Ok(_) => {
-                            let duration_ms = start.elapsed().as_millis();
-                            // Only log if slow (should be <10ms normally, >50ms indicates potential cold start)
-                            if duration_ms > 50 {
-                                tracing::warn!(
-                                    neon_keepalive_ms = duration_ms,
-                                    "Neon keep-alive slow (may indicate cold start)"
-                                );
-                            } else {
-                                tracing::debug!("Neon keep-alive OK ({}ms)", duration_ms);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Neon keep-alive failed: {}", e);
-                        }
-                    }
-                }
-            });
+            // No database keep-alive: no DB poke so Neon can suspend and reduce compute costs.
+            // First request after suspend may see cold-start latency (~5s on free tier).
 
             // CRITICAL: Keep Redis connections warm (prevents connection pool cold starts)
             // Run immediately on startup, then every 2 minutes to keep connections active
