@@ -64,3 +64,13 @@ iam-policy.json
 test-*.sh
 common_setup.sh
 autotestsall.sh
+
+# Dev/maintenance only (not required for application or CI/CD)
+cleanup-and-migrate.sh
+cleanup_dev_db.sql
+run-fix-migration.sh
+diagnose-crash.sh
+diagnose-crash-wrapper.sh
+debug-wsl-crash.sh
+dev_schema.sql
+analyze_prechecks_query.sql
