@@ -51,20 +51,30 @@ impl SsmService {
         path: &str,
         with_decryption: bool,
     ) -> anyhow::Result<Option<String>> {
-        // Try cache first
+        const SSM_CACHE_MISS_MARKER: &str = "__none__";
+        const SSM_CACHE_MISS_TTL: u64 = 300; // 5 min - avoid hammering SSM for known-missing params
+        let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
+
+        // Try cache first (including cached "missing" to avoid retries and log spam)
         if let Some(redis) = &self.redis {
-            let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
             if let Ok(Some(cached)) = redis.get(&cache_key).await {
+                if cached == SSM_CACHE_MISS_MARKER {
+                    return Ok(None);
+                }
                 #[cfg(all(feature = "tracing", debug_assertions))]
                 debug!("SSM cache hit: {}", path);
                 return Ok(Some(cached));
             }
         }
 
-        // OPTIMIZED: Use shorter timeout in local dev (50ms) to fail faster when AWS unavailable
+        // Timeout: longer for local and dev (Fly dev) so SSM has time to respond; short for prod
         let is_local_dev = std::path::Path::new(".env.local").exists();
-        let timeout_ms = if is_local_dev { 50 } else { 200 };
-        let retry_timeout_ms = if is_local_dev { 50 } else { 200 };
+        let timeout_ms = if is_local_dev || self.env == "dev" {
+            3000
+        } else {
+            200
+        };
+        let retry_timeout_ms = timeout_ms;
 
         // Fetch from SSM with timeout + single retry + graceful fallback
         let ssm_future = self
@@ -93,6 +103,11 @@ impl SsmService {
 
                     Ok(Some(value))
                 } else {
+                    if let Some(redis) = &self.redis {
+                        let _ = redis
+                            .set_with_ttl(&cache_key, SSM_CACHE_MISS_MARKER, SSM_CACHE_MISS_TTL)
+                            .await;
+                    }
                     Ok(try_dev_encryption_fallback(path))
                 }
             }
@@ -108,8 +123,11 @@ impl SsmService {
                     .with_decryption(with_decryption)
                     .send();
 
-                match tokio::time::timeout(std::time::Duration::from_millis(200), retry_future)
-                    .await
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(retry_timeout_ms),
+                    retry_future,
+                )
+                .await
                 {
                     Ok(Ok(response)) => {
                         if let Some(param) = response.parameter() {
@@ -129,6 +147,15 @@ impl SsmService {
 
                             Ok(Some(value))
                         } else {
+                            if let Some(redis) = &self.redis {
+                                let _ = redis
+                                    .set_with_ttl(
+                                        &cache_key,
+                                        SSM_CACHE_MISS_MARKER,
+                                        SSM_CACHE_MISS_TTL,
+                                    )
+                                    .await;
+                            }
                             Ok(try_dev_encryption_fallback(path))
                         }
                     }
@@ -138,6 +165,11 @@ impl SsmService {
                             "SSM failed after retry for {}: {}, returning None as fallback",
                             path, e
                         );
+                        if let Some(redis) = &self.redis {
+                            let _ = redis
+                                .set_with_ttl(&cache_key, SSM_CACHE_MISS_MARKER, SSM_CACHE_MISS_TTL)
+                                .await;
+                        }
                         Ok(try_dev_encryption_fallback(path))
                     }
                     Err(_) => {
@@ -146,6 +178,11 @@ impl SsmService {
                             "SSM timeout after retry for {}, returning None as fallback",
                             path
                         );
+                        if let Some(redis) = &self.redis {
+                            let _ = redis
+                                .set_with_ttl(&cache_key, SSM_CACHE_MISS_MARKER, SSM_CACHE_MISS_TTL)
+                                .await;
+                        }
                         Ok(try_dev_encryption_fallback(path))
                     }
                 }
@@ -186,6 +223,15 @@ impl SsmService {
 
                             Ok(Some(value))
                         } else {
+                            if let Some(redis) = &self.redis {
+                                let _ = redis
+                                    .set_with_ttl(
+                                        &cache_key,
+                                        SSM_CACHE_MISS_MARKER,
+                                        SSM_CACHE_MISS_TTL,
+                                    )
+                                    .await;
+                            }
                             Ok(try_dev_encryption_fallback(path))
                         }
                     }
@@ -195,6 +241,11 @@ impl SsmService {
                             "SSM failed after retry for {}: {}, returning None as fallback",
                             path, e
                         );
+                        if let Some(redis) = &self.redis {
+                            let _ = redis
+                                .set_with_ttl(&cache_key, SSM_CACHE_MISS_MARKER, SSM_CACHE_MISS_TTL)
+                                .await;
+                        }
                         Ok(try_dev_encryption_fallback(path))
                     }
                     Err(_) => {
@@ -203,6 +254,11 @@ impl SsmService {
                             "SSM timeout after retry for {}, returning None as fallback",
                             path
                         );
+                        if let Some(redis) = &self.redis {
+                            let _ = redis
+                                .set_with_ttl(&cache_key, SSM_CACHE_MISS_MARKER, SSM_CACHE_MISS_TTL)
+                                .await;
+                        }
                         Ok(try_dev_encryption_fallback(path))
                     }
                 }

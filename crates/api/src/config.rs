@@ -42,6 +42,27 @@ pub struct AppState {
 }
 
 impl AppConfig {
+    /// Strip connection parameters that sqlx doesn't recognize (e.g. channel_binding=require from Neon).
+    /// Prevents "ignoring unrecognized connect parameter" warnings in logs.
+    fn sanitize_database_url(url: &str) -> String {
+        if let Some((base, query)) = url.split_once('?') {
+            let params: Vec<&str> = query
+                .split('&')
+                .filter(|p| {
+                    let name = p.split('=').next().unwrap_or("");
+                    name != "channel_binding"
+                })
+                .collect();
+            if params.is_empty() {
+                base.to_string()
+            } else {
+                format!("{}?{}", base, params.join("&"))
+            }
+        } else {
+            url.to_string()
+        }
+    }
+
     pub async fn load() -> anyhow::Result<Self> {
         // Check if .env.local exists to detect local development
         // This ensures we only use .env.local REDIS_URL in local dev, not in Fly.io deployments
@@ -133,7 +154,7 @@ impl AppConfig {
         // Extract values from batched parameters
         // In local dev, prioritize environment variables; in production, prioritize SSM
         let expected_path = format!("/leadsnebula/{}/rust/db/connection_url", env_normalized);
-        let database_url = if is_local_dev {
+        let mut database_url = if is_local_dev {
             // Local dev: try environment variable first, then SSM
             std::env::var("DATABASE_URL")
                 .ok()
@@ -161,6 +182,7 @@ impl AppConfig {
                     )
                 })?
         };
+        database_url = Self::sanitize_database_url(&database_url);
 
         // Redis URL: Always use prod path for both environments (shared Redis instance)
         // In local development (when .env.local exists), use REDIS_URL from .env.local
@@ -561,18 +583,20 @@ impl AppState {
                 );
             }
             Ok((Ok(Some(_)), Ok(None))) => {
-                warn!(
+                tracing::debug!(
                     "SSM pre-fetch: deterministic_key found but salt not found (will fetch on first request)"
                 );
             }
             Ok((Ok(Some(_)), Err(e))) => {
-                warn!(
+                tracing::debug!(
                     "SSM pre-fetch: deterministic_key found but salt fetch failed (will fetch on first request): {}",
                     e
                 );
             }
             Ok((Ok(None), _)) => {
-                warn!("SSM pre-fetch: deterministic_key not found (will fetch on first request)");
+                tracing::debug!(
+                    "SSM pre-fetch: deterministic_key not found (will fetch on first request)"
+                );
             }
             Ok((Err(e), _)) => {
                 warn!(

@@ -58,6 +58,8 @@ async fn login(
 ) -> Result<Json<LoginResponse>, StatusCode> {
     use tracing::{error, info, warn};
 
+    // Log at warn so it appears with default RUST_LOG=warn (helps debug "timeout with no logs")
+    warn!("Auth /api/auth/login request received");
     info!("Login attempt for email: {}", payload.email);
 
     // Find user by email (case-insensitive)

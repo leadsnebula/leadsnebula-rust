@@ -191,6 +191,14 @@ async fn create_lead(
         .unwrap_or("ping")
         .to_lowercase();
 
+    // Log at warn so it appears with default RUST_LOG=warn (helps debug "leads not selling" / no logs)
+    tracing::warn!(
+        vertical = %lead_data.vertical,
+        request_type = %request_type,
+        publisher_id = %publisher.id,
+        "Carina /api/v1/leads request received"
+    );
+
     // #region agent log
     // Debug instrumentation: Log publisher info for lead creation
     let log_entry = serde_json::json!({

@@ -3,7 +3,7 @@ use leadsnebula_core::models::ping_tree::PingTree;
 use leadsnebula_core::models::vertical::Vertical;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Pre-warm cache on startup by loading common data
 /// This reduces cold start latency for the first few requests
@@ -203,7 +203,7 @@ pub async fn pre_warm_ssm_keys(
             true
         }
         Ok(None) => {
-            warn!(
+            debug!(
                 "SSM parameter not found (expected for warmup): {}",
                 det_path
             );
@@ -226,7 +226,7 @@ pub async fn pre_warm_ssm_keys(
             true
         }
         Ok(None) => {
-            warn!(
+            debug!(
                 "SSM parameter not found (expected for warmup): {}",
                 salt_path
             );
