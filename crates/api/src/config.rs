@@ -54,7 +54,7 @@ impl AppConfig {
         if is_local_dev {
             // Verify REDIS_URL was loaded (main.rs already loaded .env.local)
             if let Ok(redis_url) = std::env::var("REDIS_URL") {
-                tracing::info!(
+                tracing::debug!(
                     "REDIS_URL found in environment: {}...",
                     if redis_url.len() > 30 {
                         format!("{}...", &redis_url[..30])
@@ -84,7 +84,7 @@ impl AppConfig {
 
             if !has_all_env_vars {
                 // Some env vars missing, try SSM as fallback
-                tracing::info!("Local development: some environment variables missing, attempting SSM fallback");
+                tracing::debug!("Local development: some environment variables missing, attempting SSM fallback");
                 if let Ok(ssm_service) = SsmService::new(environment.clone(), None).await {
                     let ssm_arc = Arc::new(ssm_service);
                     let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
@@ -133,7 +133,7 @@ impl AppConfig {
         // Extract values from batched parameters
         // In local dev, prioritize environment variables; in production, prioritize SSM
         let expected_path = format!("/leadsnebula/{}/rust/db/connection_url", env_normalized);
-        let database_url = if is_local_dev {
+        let database_url_raw = if is_local_dev {
             // Local dev: try environment variable first, then SSM
             std::env::var("DATABASE_URL")
                 .ok()
@@ -161,6 +161,8 @@ impl AppConfig {
                     )
                 })?
         };
+        // Strip connection params that sqlx doesn't support (avoids "ignoring unrecognized connect parameter" warnings)
+        let database_url = Self::sanitize_database_url(&database_url_raw);
 
         // Redis URL: Always use prod path for both environments (shared Redis instance)
         // In local development (when .env.local exists), use REDIS_URL from .env.local
@@ -172,7 +174,7 @@ impl AppConfig {
             // Local development: prioritize REDIS_URL from .env.local
             match std::env::var("REDIS_URL") {
                 Ok(redis_url) => {
-                    info!(
+                    tracing::debug!(
                         "Using REDIS_URL from .env.local for local development: {}",
                         if redis_url.len() > 20 {
                             format!("{}...", &redis_url[..20])
@@ -358,10 +360,7 @@ impl AppConfig {
             })
             .unwrap_or(5); // Increased from 2 to 5 for better connection readiness
 
-        info!(
-            "Configuration loaded successfully for environment: {}",
-            environment
-        );
+        info!("Config loaded (environment={})", environment);
 
         Ok(Self {
             database_url,
@@ -375,17 +374,24 @@ impl AppConfig {
             from_email,
         })
     }
+
+    /// Strip connection params that sqlx doesn't support (e.g. channel_binding) to avoid noisy warnings.
+    fn sanitize_database_url(url: &str) -> String {
+        let mut u = url.to_string();
+        u = u.replace("&channel_binding=require", "");
+        u = u.replace("?channel_binding=require&", "?");
+        u = u.replace("?channel_binding=require", "");
+        u
+    }
 }
 
 impl AppState {
     pub async fn new() -> anyhow::Result<Self> {
         let config = AppConfig::load().await?;
 
-        // Parallelize database and Redis initialization for faster startup
-        info!("Initializing database and Redis connections in parallel...");
+        info!("Connecting to database and Redis...");
 
         let db_future = async {
-            info!("Connecting to database...");
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 create_pool(&config.database_url),
@@ -415,27 +421,23 @@ impl AppState {
         // Handle database result
         let db_pool = match db_result {
             Ok(Ok(pool)) => {
-                info!("Database connection pool created successfully");
                 let pool_arc = Arc::new(pool);
 
                 // CRITICAL: Pre-warm database SYNCHRONOUSLY (prevents first-request cold start)
-                // Execute a simple query to wake up Neon and ensure connection pool is ready
-                info!("Pre-warming database connection pool...");
                 let db_warmup_start = std::time::Instant::now();
                 match sqlx::query("SELECT 1").execute(pool_arc.as_ref()).await {
                     Ok(_) => {
                         let duration_ms = db_warmup_start.elapsed().as_millis();
-                        if duration_ms > 50 {
-                            warn!(
-                                db_warmup_ms = duration_ms,
-                                "DB pre-warm slow (may indicate cold start)"
-                            );
-                        } else {
-                            info!("DB pre-warmed successfully ({}ms)", duration_ms);
-                        }
+                        info!(
+                            db_connect_ms = duration_ms,
+                            "Database connected ({}ms)", duration_ms
+                        );
                     }
                     Err(e) => {
-                        warn!("DB pre-warm failed (non-critical): {}", e);
+                        warn!(
+                            "Database pre-warm failed; first request may be slower. Error: {}",
+                            e
+                        );
                     }
                 }
 
@@ -458,22 +460,17 @@ impl AppState {
         let redis = match redis_result {
             Some(Ok(Some(client))) => {
                 // CRITICAL: Pre-warm Redis connection SYNCHRONOUSLY (prevents first-request cold start)
-                info!("Pre-warming Redis connection pool...");
                 let redis_warmup_start = std::time::Instant::now();
                 match client.ping().await {
                     Ok(_) => {
                         let duration_ms = redis_warmup_start.elapsed().as_millis();
-                        if duration_ms > 10 {
-                            warn!(
-                                redis_warmup_ms = duration_ms,
-                                "Redis pre-warm slow (may indicate cold start)"
-                            );
-                        } else {
-                            info!("Redis pre-warmed successfully ({}ms)", duration_ms);
-                        }
+                        info!(
+                            redis_connect_ms = duration_ms,
+                            "Redis connected ({}ms)", duration_ms
+                        );
                     }
                     Err(e) => {
-                        warn!("Redis pre-warm failed (non-critical): {}", e);
+                        warn!("Redis pre-warm failed; cache may be slower. Error: {}", e);
                     }
                 }
                 Some(client)
@@ -540,10 +537,8 @@ impl AppState {
             env_normalized
         );
 
-        info!("Pre-fetching SSM encryption keys synchronously during startup...");
         let ssm_prefetch_start = std::time::Instant::now();
         let prefetch_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            // Fetch both keys in parallel for faster startup
             let (det_result, salt_result) = tokio::join!(
                 ssm.get_parameter(&det_path, true),
                 ssm.get_parameter(&salt_path, true)
@@ -552,37 +547,24 @@ impl AppState {
         })
         .await;
 
+        let ssm_prefetch_ms = ssm_prefetch_start.elapsed().as_millis();
         match prefetch_result {
             Ok((Ok(Some(_)), Ok(Some(_)))) => {
-                let duration_ms = ssm_prefetch_start.elapsed().as_millis();
                 info!(
-                    ssm_prefetch_ms = duration_ms,
-                    "SSM encryption keys pre-fetched and cached successfully during startup"
+                    ssm_encryption_ms = ssm_prefetch_ms,
+                    "Encryption keys loaded from SSM ({}ms)", ssm_prefetch_ms
                 );
             }
-            Ok((Ok(Some(_)), Ok(None))) => {
-                warn!(
-                    "SSM pre-fetch: deterministic_key found but salt not found (will fetch on first request)"
+            Ok((Ok(Some(_)), Ok(None))) | Ok((Ok(Some(_)), Err(_))) => {
+                tracing::debug!(
+                    "Encryption keys: det loaded; salt on first use ({}ms)",
+                    ssm_prefetch_ms
                 );
             }
-            Ok((Ok(Some(_)), Err(e))) => {
-                warn!(
-                    "SSM pre-fetch: deterministic_key found but salt fetch failed (will fetch on first request): {}",
-                    e
-                );
-            }
-            Ok((Ok(None), _)) => {
-                warn!("SSM pre-fetch: deterministic_key not found (will fetch on first request)");
-            }
-            Ok((Err(e), _)) => {
-                warn!(
-                    "SSM pre-fetch failed (non-critical, will fetch on first request): {}",
-                    e
-                );
-            }
-            Err(_) => {
-                warn!(
-                    "SSM pre-fetch timed out after 5s (non-critical, will fetch on first request)"
+            Ok((Ok(None), _)) | Ok((Err(_), _)) | Err(_) => {
+                tracing::debug!(
+                    "Encryption keys: SSM fallback or timeout ({}ms)",
+                    ssm_prefetch_ms
                 );
             }
         }
@@ -640,92 +622,57 @@ async fn init_redis(
         })
         .unwrap_or_else(|| "(hidden)".to_string());
 
-    info!("Connecting to Redis at {}...", display_url);
+    tracing::debug!("Connecting to Redis at {}...", display_url);
 
-    // First connection attempt with configurable timeout (shorter for local dev)
-    info!(
-        "🔵 Starting Redis connection attempt ({}s timeout)...",
-        timeout_seconds
-    );
-    let start_time = std::time::Instant::now();
     let connect_result =
         tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), async {
-            info!("🔵 Inside timeout wrapper - calling RedisClient::new()...");
             RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle).await
         })
         .await;
-    let elapsed = start_time.elapsed();
-    info!("🔵 Redis connection attempt completed in {:?}", elapsed);
 
     match connect_result {
-        Ok(Ok(client)) => {
-            info!("✅ Redis connection created successfully");
-            // Verify connection with a ping
-            match client.ping().await {
-                Ok(pong) => {
-                    info!("Redis ping successful: {}", pong);
-                    Ok(Some(Arc::new(client)))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Redis connection created but ping failed: {}. Continuing without Redis cache.",
-                        e
-                    );
-                    Ok(None)
-                }
+        Ok(Ok(client)) => match client.ping().await {
+            Ok(_) => Ok(Some(Arc::new(client))),
+            Err(e) => {
+                tracing::warn!("Redis ping failed: {}. Continuing without Redis cache.", e);
+                Ok(None)
             }
-        }
+        },
         Ok(Err(e)) => {
-            let error_source = e
-                .source()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            tracing::warn!(
-                "❌ Failed to connect to Redis: {} (source: {}). Retrying in 2 seconds...",
-                e,
-                error_source
-            );
-            // In local development, don't retry - fail fast
+            tracing::warn!("Redis connection failed: {}. Retrying in 2s...", e);
             if is_local_dev {
-                tracing::warn!("❌ Redis connection failed. Skipping Redis in local development.");
+                tracing::warn!("Redis unavailable in local dev; continuing without cache.");
                 return Ok(None);
             }
 
-            // Retry once after 2 seconds (only in non-local environments)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            info!("Retrying Redis connection...");
+            tracing::debug!("Retrying Redis connection...");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_seconds),
                 RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle),
             )
             .await
             {
-                Ok(Ok(client)) => {
-                    info!("✅ Redis connection created successfully on retry");
-                    match client.ping().await {
-                        Ok(pong) => {
-                            info!("Redis ping successful on retry: {}", pong);
-                            Ok(Some(Arc::new(client)))
-                        }
-                        Err(e2) => {
-                            tracing::warn!(
-                                "Redis connection created on retry but ping failed: {}. Continuing without Redis cache.",
-                                e2
-                            );
-                            Ok(None)
-                        }
+                Ok(Ok(client)) => match client.ping().await {
+                    Ok(_) => Ok(Some(Arc::new(client))),
+                    Err(e2) => {
+                        tracing::warn!(
+                            "Redis ping failed on retry: {}. Continuing without Redis cache.",
+                            e2
+                        );
+                        Ok(None)
                     }
-                }
+                },
                 Ok(Err(e2)) => {
                     tracing::warn!(
-                        "❌ Redis connection failed after retry: {}. Continuing without Redis cache.",
+                        "Redis connection failed after retry: {}. Continuing without Redis cache.",
                         e2
                     );
                     Ok(None)
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "❌ Redis connection timed out after retry ({} seconds). Continuing without Redis cache.",
+                        "Redis connection timed out ({}s). Continuing without Redis cache.",
                         timeout_seconds
                     );
                     Ok(None)
@@ -733,54 +680,46 @@ async fn init_redis(
             }
         }
         Err(_) => {
-            // In local development, don't retry - fail fast
             if is_local_dev {
                 tracing::warn!(
-                    "❌ Redis connection timed out after {} seconds. Skipping Redis in local development.",
+                    "Redis connection timed out ({}s). Skipping Redis in local dev.",
                     timeout_seconds
                 );
                 return Ok(None);
             }
 
             tracing::warn!(
-                "❌ Redis connection timed out after {} seconds. Retrying in 2 seconds...",
+                "Redis connection timed out ({}s). Retrying in 2s...",
                 timeout_seconds
             );
-            // Retry once after 2 seconds (only in non-local environments)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            info!("Retrying Redis connection after timeout...");
+            tracing::debug!("Retrying Redis connection...");
             match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_seconds),
                 RedisClient::new(redis_url, environment.to_string(), pool_size, min_idle),
             )
             .await
             {
-                Ok(Ok(client)) => {
-                    info!("✅ Redis connection created successfully on retry");
-                    match client.ping().await {
-                        Ok(pong) => {
-                            info!("Redis ping successful on retry: {}", pong);
-                            Ok(Some(Arc::new(client)))
-                        }
-                        Err(e2) => {
-                            tracing::warn!(
-                                "Redis connection created on retry but ping failed: {}. Continuing without Redis cache.",
-                                e2
-                            );
-                            Ok(None)
-                        }
+                Ok(Ok(client)) => match client.ping().await {
+                    Ok(_) => Ok(Some(Arc::new(client))),
+                    Err(e2) => {
+                        tracing::warn!(
+                            "Redis ping failed on retry: {}. Continuing without Redis cache.",
+                            e2
+                        );
+                        Ok(None)
                     }
-                }
+                },
                 Ok(Err(e2)) => {
                     tracing::warn!(
-                        "❌ Redis connection failed after retry: {}. Continuing without Redis cache.",
+                        "Redis connection failed after retry: {}. Continuing without Redis cache.",
                         e2
                     );
                     Ok(None)
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "❌ Redis connection timed out after retry ({} seconds). Continuing without Redis cache.",
+                        "Redis connection timed out ({}s). Continuing without Redis cache.",
                         timeout_seconds
                     );
                     Ok(None)

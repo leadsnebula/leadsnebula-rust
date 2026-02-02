@@ -9,11 +9,10 @@ use tracing::{info, warn};
 /// This reduces cold start latency for the first few requests
 /// OPTIMIZED: Parallelize all warmup operations to reduce total time
 pub async fn pre_warm_cache(state: &AppState) {
-    info!("Starting cache pre-warming...");
     let start = std::time::Instant::now();
 
     if state.cache.is_none() {
-        warn!("Cache not available, skipping pre-warm");
+        info!("Cache not configured; skipping warmup");
         return;
     }
 
@@ -48,17 +47,21 @@ pub async fn pre_warm_cache(state: &AppState) {
     // Group 3: SSM keys (independent, can run in parallel with everything)
     let ssm_keys_warmed = pre_warm_ssm_keys(&state.ssm, &state.config.environment).await;
 
-    // Check buyer integration types (internal vs external) for diagnostics
-    let buyer_integration_types = check_buyer_integration_types(pool).await;
-    info!(
-        "Buyer integration types: {} internal, {} external",
-        buyer_integration_types.internal_count, buyer_integration_types.external_count
-    );
+    let _ = check_buyer_integration_types(pool).await; // diagnostics only, no startup log
 
     let duration_ms = start.elapsed().as_millis();
-    info!(
-        "Cache pre-warming completed in {}ms: {} verticals, {} ping trees, {} SSM keys, {} buyers, {} campaigns, {} integrations, {} qual configs, {} buyer_ids, {} ping_tree_campaigns",
-        duration_ms, verticals_warmed, ping_trees_warmed, ssm_keys_warmed, buyers_warmed, campaigns_warmed, integrations_warmed, qual_configs_warmed, buyer_ids_warmed, ping_tree_campaigns_warmed
+    info!("Cache warmup done ({}ms)", duration_ms);
+    tracing::debug!(
+        "Cache warmup counts: verticals={}, ping_trees={}, ssm_keys={}, buyers={}, campaigns={}, integrations={}, qual_configs={}, buyer_ids={}, ping_tree_campaigns={}",
+        verticals_warmed,
+        ping_trees_warmed,
+        ssm_keys_warmed,
+        buyers_warmed,
+        campaigns_warmed,
+        integrations_warmed,
+        qual_configs_warmed,
+        buyer_ids_warmed,
+        ping_tree_campaigns_warmed
     );
 }
 
@@ -95,6 +98,7 @@ async fn check_buyer_integration_types(pool: &PgPool) -> BuyerIntegrationTypes {
     }
 }
 
+#[allow(dead_code)]
 struct BuyerIntegrationTypes {
     internal_count: usize,
     external_count: usize,
@@ -197,53 +201,25 @@ pub async fn pre_warm_ssm_keys(
         "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
         env_norm
     );
-    let det_key_cached = match ssm.get_parameter(&det_path, true).await {
+    let _det_key_cached = match ssm.get_parameter(&det_path, true).await {
         Ok(Some(_)) => {
             warmed += 1;
             true
         }
-        Ok(None) => {
-            warn!(
-                "SSM parameter not found (expected for warmup): {}",
-                det_path
-            );
-            false
-        }
-        Err(e) => {
-            warn!("Failed to pre-warm SSM key {}: {}", det_path, e);
-            false
-        }
+        Ok(None) | Err(_) => false,
     };
 
-    // Pre-warm key derivation salt
     let salt_path = format!(
         "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
         env_norm
     );
-    let salt_key_cached = match ssm.get_parameter(&salt_path, true).await {
+    let _salt_key_cached = match ssm.get_parameter(&salt_path, true).await {
         Ok(Some(_)) => {
             warmed += 1;
             true
         }
-        Ok(None) => {
-            warn!(
-                "SSM parameter not found (expected for warmup): {}",
-                salt_path
-            );
-            false
-        }
-        Err(e) => {
-            warn!("Failed to pre-warm SSM key {}: {}", salt_path, e);
-            false
-        }
+        Ok(None) | Err(_) => false,
     };
-
-    // Log cache status after pre-warm
-    info!(
-        "SSM pre-warm cache keys: det_key={}, salt={}",
-        if det_key_cached { "hit" } else { "miss" },
-        if salt_key_cached { "hit" } else { "miss" }
-    );
 
     warmed
 }
@@ -513,7 +489,7 @@ pub async fn start_periodic_warmup(state: Arc<AppState>) {
 
     loop {
         interval.tick().await;
-        info!("Running periodic cache warm-up...");
+        tracing::debug!("Running periodic cache warm-up...");
         pre_warm_cache(&state).await;
     }
 }

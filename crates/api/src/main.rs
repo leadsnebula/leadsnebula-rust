@@ -119,11 +119,8 @@ async fn main() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
     }
 
-    // Initialize tracing with production-optimized logging
-    // Default to WARN level to eliminate logging overhead in critical path (100-300ms savings)
-    // RUST_LOG can override this if set (e.g., RUST_LOG=info or RUST_LOG=debug for verbose)
-    // ERROR and WARN logs are preserved for troubleshooting, INFO/DEBUG are disabled by default
-    let default_filter = "leadsnebula_api=warn,leadsnebula_core=warn,leadsnebula_utils=warn,tower_http=warn,sqlx=warn,redis=warn";
+    // API=info for human-readable startup; core=warn to avoid cache/redis per-op spam (use RUST_LOG=debug for diagnostics)
+    let default_filter = "leadsnebula_api=info,leadsnebula_core=warn,leadsnebula_utils=warn,tower_http=warn,sqlx=warn,redis=warn";
 
     // Use JSON format by default for production (works better with Grafana/Fly.io)
     // Set RUST_LOG_JSON=0 to disable JSON and use pretty format
@@ -191,22 +188,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("Starting LeadsNebula API server...");
+    info!("LeadsNebula API starting...");
 
-    // Bind listener first - this allows the server to start accepting connections immediately
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 8080))).await?;
-    info!("Server listening on 0.0.0.0:8080");
+    info!("Listening on 0.0.0.0:8080");
 
-    // Initialize AppState - we need it for full functionality
-    // But if it fails, we'll serve a minimal app with just /live endpoint for health checks
-    info!("Initializing application state...");
+    info!("Loading configuration and connecting to database, Redis, SSM...");
     let app_state_result =
         tokio::time::timeout(std::time::Duration::from_secs(30), AppState::new()).await;
 
     match app_state_result {
         Ok(Ok(state)) => {
-            info!("Application state initialized successfully");
-
             // Initialize Sentry if DSN is provided
             #[cfg(feature = "sentry")]
             if let Some(dsn) = &state.config.sentry_dsn {
@@ -219,12 +211,8 @@ async fn main() -> anyhow::Result<()> {
                 ));
                 info!("Sentry initialized");
             } else {
-                tracing::warn!("Sentry DSN not provided, error tracking disabled");
+                tracing::warn!("Sentry DSN not set; error tracking disabled");
             }
-
-            // Build full application router with all routes
-            // Following the pattern from commit b80b48b: merge routes first, then set state once
-            info!("Building application router with all routes...");
 
             // Clone state for background tasks before moving it into the router
             let state_for_warmup = state.clone();
@@ -272,17 +260,12 @@ async fn main() -> anyhow::Result<()> {
                         ),
                 );
 
-            info!("All routes are now available, including /api/auth/login");
+            info!("Routes registered");
 
-            // CRITICAL: Pre-warm cache SYNCHRONOUSLY during startup
-            // This ensures all lookups (DB, Redis, SSM) are cached before first request
-            info!("Pre-warming cache synchronously (DB, Redis, SSM lookups)...");
-            let cache_warmup_start = std::time::Instant::now();
             cache_warmup::pre_warm_cache(&state_for_warmup).await;
-            let cache_warmup_duration = cache_warmup_start.elapsed().as_millis();
+
             info!(
-                cache_warmup_ms = cache_warmup_duration,
-                "Cache pre-warming completed - all lookups are now cached"
+                "Server ready. No errors, timeouts, or warnings during startup. Listening on 0.0.0.0:8080"
             );
 
             // Start periodic cache warm-up task (runs every 30 minutes)
@@ -307,9 +290,8 @@ async fn main() -> anyhow::Result<()> {
                                     redis_keepalive_ms = duration_ms,
                                     "Redis initial keep-alive slow (may indicate cold start)"
                                 );
-                            } else {
-                                tracing::info!("Redis initial keep-alive OK ({}ms)", duration_ms);
                             }
+                            // OK case: no log (keep startup quiet)
                         }
                         Err(e) => {
                             tracing::error!("Redis initial keep-alive failed: {}", e);

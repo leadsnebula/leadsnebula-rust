@@ -17,6 +17,46 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+/// Parse and validate the request Origin header for WebAuthn.
+/// Allows: localhost (any port, http/https), and https://*.leadsnebula.com or https://leadsnebula.com.
+/// Returns None if header missing or invalid.
+fn webauthn_origin_from_request(
+    origin_header: Option<&axum::http::HeaderValue>,
+) -> Option<url::Url> {
+    let s = origin_header.and_then(|v| v.to_str().ok())?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let url = url::Url::parse(s).ok()?;
+    let host = url.host_str()?;
+    let scheme = url.scheme();
+    // localhost (any port)
+    if host == "localhost" && (scheme == "http" || scheme == "https") {
+        return Some(url);
+    }
+    // https only for production domains
+    if scheme != "https" {
+        return None;
+    }
+    // leadsnebula.com or *.leadsnebula.com
+    if host == "leadsnebula.com" || host.ends_with(".leadsnebula.com") {
+        return Some(url);
+    }
+    None
+}
+
+/// RP ID to use for a given WebAuthn origin URL (from webauthn_origin_from_request).
+fn webauthn_rp_id_for_origin(origin: &url::Url) -> String {
+    let host = origin.host_str().unwrap_or("");
+    if host == "localhost" {
+        "localhost".to_string()
+    } else if host == "leadsnebula.com" || host.ends_with(".leadsnebula.com") {
+        "leadsnebula.com".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 // Helper function to check if user is admin
 // For now, checks if user owns the instance (instance_user_id matches)
 // TODO: Implement proper role-based access control when instance_user_roles table exists
@@ -633,29 +673,33 @@ async fn passkey_registration_options(
 
     #[cfg(feature = "webauthn")]
     {
-        // Determine RP ID and origin from environment
-        let rp_id: String = if state.config.environment == "development" {
-            "localhost".to_string()
+        // Prefer request Origin so dev.dashboard.leadsnebula.com and production dashboard use correct origin
+        let (rp_id, url) = if let Some(origin_url) =
+            webauthn_origin_from_request(headers.get(axum::http::header::ORIGIN))
+        {
+            let rp_id = webauthn_rp_id_for_origin(&origin_url);
+            (rp_id, origin_url)
         } else {
-            std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
-        };
-
-        // For local development, check if HTTPS is configured via environment variable
-        // If not set, default to HTTP (passkeys won't work without HTTPS)
-        // For production, always use HTTPS (required for passkeys)
-        let origin: String = if state.config.environment == "development" {
-            std::env::var("WEBAUTHN_LOCAL_HTTPS")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
-        } else {
-            format!("https://{}", rp_id)
+            // Fallback: env-based (e.g. when Origin header missing)
+            let rp_id: String = if state.config.environment == "development" {
+                "localhost".to_string()
+            } else {
+                std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
+            };
+            let origin: String = if state.config.environment == "development" {
+                std::env::var("WEBAUTHN_LOCAL_HTTPS")
+                    .unwrap_or_else(|_| "http://localhost:3000".to_string())
+            } else {
+                format!("https://{}", rp_id)
+            };
+            let parsed = url::Url::parse(&origin).map_err(|e| {
+                error!("Failed to parse origin URL: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            (rp_id, parsed)
         };
 
         // Create WebAuthn instance
-        let url = url::Url::parse(&origin).map_err(|e| {
-            error!("Failed to parse origin URL: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
         let webauthn = WebauthnBuilder::new(&rp_id, &url)
             .map_err(|e| {
                 error!("Failed to create WebAuthn builder: {}", e);
@@ -843,29 +887,32 @@ async fn register_passkey(
             })));
         }
 
-        // Determine RP ID and origin
-        let rp_id: String = if state.config.environment == "development" {
-            "localhost".to_string()
+        // Use same origin as registration_options (request Origin so dev.dashboard and production match)
+        let (rp_id, url) = if let Some(origin_url) =
+            webauthn_origin_from_request(headers.get(axum::http::header::ORIGIN))
+        {
+            let rp_id = webauthn_rp_id_for_origin(&origin_url);
+            (rp_id, origin_url)
         } else {
-            std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
-        };
-
-        // For local development, check if HTTPS is configured via environment variable
-        // If not set, default to HTTP (passkeys won't work without HTTPS)
-        // For production, always use HTTPS (required for passkeys)
-        let origin: String = if state.config.environment == "development" {
-            std::env::var("WEBAUTHN_LOCAL_HTTPS")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
-        } else {
-            format!("https://{}", rp_id)
+            let rp_id: String = if state.config.environment == "development" {
+                "localhost".to_string()
+            } else {
+                std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
+            };
+            let origin: String = if state.config.environment == "development" {
+                std::env::var("WEBAUTHN_LOCAL_HTTPS")
+                    .unwrap_or_else(|_| "http://localhost:3000".to_string())
+            } else {
+                format!("https://{}", rp_id)
+            };
+            let parsed = url::Url::parse(&origin).map_err(|e| {
+                error!("Failed to parse origin URL: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            (rp_id, parsed)
         };
 
         // Create WebAuthn instance
-        let url = url::Url::parse(&origin).map_err(|e| {
-            error!("Failed to parse origin URL: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
         let webauthn = WebauthnBuilder::new(&rp_id, &url)
             .map_err(|e| {
                 error!("Failed to create WebAuthn builder: {}", e);

@@ -14,7 +14,27 @@ use crate::AppState;
 pub fn health_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
+        .route("/poke", get(poke_endpoint))
         .route("/metrics", get(metrics_endpoint))
+}
+
+/// Lightweight DB warmup endpoint for form flows (e.g. only.solar).
+/// Runs SELECT 1 to wake Neon/connection pool; does not check Redis.
+/// Use /health for full health checks; use /poke to avoid overloading /health.
+async fn poke_endpoint(State(state): State<AppState>) -> Response {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sqlx::query("SELECT 1").execute(&*state.db_pool),
+    )
+    .await
+    {
+        Ok(Ok(_)) => (StatusCode::OK, axum::Json(json!({ "ok": true }))).into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({ "ok": false })),
+        )
+            .into_response(),
+    }
 }
 
 // Export liveness_check for use in main.rs when AppState is unavailable
