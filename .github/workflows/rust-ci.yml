@@ -2,9 +2,9 @@ name: Rust CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [dev]
   pull_request:
-    branches: [main, dev]
+    branches: [dev]
 
 env:
   CARGO_TERM_COLOR: always
@@ -531,8 +531,8 @@ jobs:
     name: Build Release
     runs-on: ubuntu-latest
     needs: [lint, test-unit, test-integration]
-    # Only build release if we're on a branch that will deploy
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    # Only build release when pushing to dev (dev deploy runs after CI)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     steps:
       - uses: actions/checkout@v4
         with:
