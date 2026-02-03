@@ -1,5 +1,11 @@
 # LeadsNebula Rust Application Rules
 
+## Git: No Push Without Approval (Gospel)
+
+- **NEVER** run `git push` (or push to any remote) unless the user has explicitly asked you to push.
+- Do not push after committing. Do not push to "deploy" or "so you can test." Only the user pushes.
+- Before committing: run `cargo fmt --all -- --check` and full pre-commit validation locally; fix any failures. Do not commit code that would fail CI (e.g. format check).
+
 ## Core Principles
 
 ### Simplicity and Elegance First

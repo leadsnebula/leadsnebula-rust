@@ -449,8 +449,7 @@ impl AppState {
                         let duration_ms = db_warmup_start.elapsed().as_millis();
                         info!(
                             db_warmup_ms = duration_ms,
-                            "DB pre-warm done ({}ms)",
-                            duration_ms
+                            "DB pre-warm done ({}ms)", duration_ms
                         );
                     }
                     Err(e) => {

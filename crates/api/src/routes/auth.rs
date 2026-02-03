@@ -71,7 +71,11 @@ async fn login(
     .await
     .map_err(|e| {
         error!("Database error during login lookup: {}", e);
-        info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=false, error=db_lookup)", start.elapsed().as_millis());
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, error=db_lookup)",
+            start.elapsed().as_millis()
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -88,7 +92,11 @@ async fn login(
         }
         None => {
             warn!("Login failed: User not found for email: {}", payload.email);
-            info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=false, reason=user_not_found)", start.elapsed().as_millis());
+            info!(
+                duration_ms = start.elapsed().as_millis(),
+                "Login completed in {}ms (success=false, reason=user_not_found)",
+                start.elapsed().as_millis()
+            );
             return Ok(Json(LoginResponse {
                 success: false,
                 token: None,
@@ -104,7 +112,11 @@ async fn login(
     // Check if user is confirmed
     if !user.is_confirmed() {
         warn!("Login failed: User {} not confirmed", user.email);
-        info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=false, reason=not_confirmed)", start.elapsed().as_millis());
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, reason=not_confirmed)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -122,7 +134,11 @@ async fn login(
             "Login failed: User {} is not active (status: {})",
             user.email, user.status
         );
-        info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=false, reason=account_suspended)", start.elapsed().as_millis());
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, reason=account_suspended)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -154,7 +170,11 @@ async fn login(
 
     if !password_valid {
         warn!("Login failed: Invalid password for user: {}", user.email);
-        info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=false, reason=invalid_password)", start.elapsed().as_millis());
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, reason=invalid_password)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -175,7 +195,11 @@ async fn login(
     .await
     .map_err(|e| {
         error!("Database error checking OTP status: {}", e);
-        info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=false, error=db_otp_check)", start.elapsed().as_millis());
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, error=db_otp_check)",
+            start.elapsed().as_millis()
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?
     .flatten();
@@ -212,7 +236,11 @@ async fn login(
             "OTP required for user: {}, returning login token",
             user.email
         );
-        info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=otp_required)", start.elapsed().as_millis());
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=otp_required)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -232,7 +260,11 @@ async fn login(
         .encode(user.id.to_string(), user.email.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    info!(duration_ms = start.elapsed().as_millis(), "Login completed in {}ms (success=true)", start.elapsed().as_millis());
+    info!(
+        duration_ms = start.elapsed().as_millis(),
+        "Login completed in {}ms (success=true)",
+        start.elapsed().as_millis()
+    );
     Ok(Json(LoginResponse {
         success: true,
         token: Some(token),
