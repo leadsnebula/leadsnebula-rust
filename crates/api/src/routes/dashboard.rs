@@ -17,6 +17,76 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+/// Resolve WebAuthn RP ID and origin. In non-development, uses the request's Origin header
+/// when present and valid (HTTPS, host matches our domain) so dev.dashboard.leadsnebula.com works.
+fn webauthn_rp_id_and_origin(
+    environment: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(String, String), StatusCode> {
+    let origin_header_str = headers
+        .get("origin")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    let rp_id: String = if environment == "development" {
+        "localhost".to_string()
+    } else {
+        std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
+    };
+
+    let (origin, rp_id_used) = if environment == "development" {
+        // Prefer request Origin in development so 127.0.0.1 works (secure-context carveout);
+        // fall back to WEBAUTHN_LOCAL_HTTPS or http://localhost:3000.
+        let fallback_o = std::env::var("WEBAUTHN_LOCAL_HTTPS")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string());
+        if !origin_header_str.is_empty() {
+            if let Ok(url) = url::Url::parse(origin_header_str) {
+                let host = url.host_str().unwrap_or("");
+                if url.scheme() == "https" && host == "localhost.localdomain" {
+                    // Use .localdomain so passkey managers (e.g. Proton Pass) that reject RP ID "localhost" can be tested.
+                    (
+                        origin_header_str.to_string(),
+                        "localhost.localdomain".to_string(),
+                    )
+                } else if url.scheme() == "https" && (host == "localhost" || host == "127.0.0.1") {
+                    let rp = if host == "127.0.0.1" {
+                        "127.0.0.1".to_string()
+                    } else {
+                        rp_id.clone()
+                    };
+                    (origin_header_str.to_string(), rp)
+                } else {
+                    (fallback_o, rp_id)
+                }
+            } else {
+                (fallback_o, rp_id)
+            }
+        } else {
+            (fallback_o, rp_id)
+        }
+    } else {
+        // Use request Origin when present and valid (HTTPS, host is our domain or subdomain)
+        let fallback_origin = format!("https://{}", rp_id);
+        let origin_header = origin_header_str;
+        if origin_header.is_empty() {
+            (fallback_origin, rp_id.clone())
+        } else if let Ok(url) = url::Url::parse(origin_header) {
+            let scheme_ok = url.scheme() == "https";
+            let host = url.host_str().unwrap_or("");
+            let host_matches = host == rp_id || host.ends_with(&format!(".{}", rp_id));
+            if scheme_ok && host_matches {
+                (origin_header.to_string(), rp_id)
+            } else {
+                (fallback_origin, rp_id)
+            }
+        } else {
+            (fallback_origin, rp_id)
+        }
+    };
+
+    Ok((rp_id_used, origin))
+}
+
 // Helper function to check if user is admin
 // For now, checks if user owns the instance (instance_user_id matches)
 // TODO: Implement proper role-based access control when instance_user_roles table exists
@@ -219,6 +289,7 @@ pub fn dashboard_routes() -> Router<AppState> {
             post(passkey_registration_options),
         )
         .route("/api/security/passkeys/register", post(register_passkey))
+        .route("/api/security/passkeys/:id", delete(delete_passkey))
 }
 
 // Security API
@@ -268,10 +339,54 @@ async fn get_security_status(
     })?
     .flatten();
 
+    // Load passkeys for this user (so the frontend can list and delete them)
+    // DB columns created_at/last_used_at are TIMESTAMP (no TZ); use NaiveDateTime to match.
+    #[derive(sqlx::FromRow)]
+    struct PasskeyRow {
+        id: Uuid,
+        name: Option<String>,
+        passkey_type: Option<String>,
+        created_at: Option<chrono::NaiveDateTime>,
+        last_used_at: Option<chrono::NaiveDateTime>,
+    }
+    let passkey_rows: Vec<PasskeyRow> = sqlx::query_as::<_, PasskeyRow>(
+        "SELECT id, name, passkey_type, created_at, last_used_at FROM webauthn_credentials WHERE instance_user_id = $1 ORDER BY created_at ASC",
+    )
+    .bind(user.id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading passkeys: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let passkeys: Vec<serde_json::Value> = passkey_rows
+        .into_iter()
+        .map(|r| {
+            let created_at_rfc3339 = r
+                .created_at
+                .map(|t| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(t, chrono::Utc)
+                        .to_rfc3339()
+                })
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+            let last_used_at_rfc3339 = r.last_used_at.map(|t| {
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(t, chrono::Utc)
+                    .to_rfc3339()
+            });
+            serde_json::json!({
+                "id": r.id.to_string(),
+                "name": r.name.unwrap_or_else(|| "Passkey".to_string()),
+                "type": r.passkey_type.unwrap_or_else(|| "platform".to_string()),
+                "created_at": created_at_rfc3339,
+                "last_used_at": last_used_at_rfc3339,
+            })
+        })
+        .collect();
+
     Ok(Json(serde_json::json!({
         "success": true,
         "otp_enabled": otp_enabled.unwrap_or(false),
-        "passkeys": []
+        "passkeys": passkeys
     })))
 }
 
@@ -633,44 +748,66 @@ async fn passkey_registration_options(
 
     #[cfg(feature = "webauthn")]
     {
-        // Determine RP ID and origin from environment
-        let rp_id: String = if state.config.environment == "development" {
-            "localhost".to_string()
-        } else {
-            std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
-        };
+        let (rp_id, origin) = webauthn_rp_id_and_origin(&state.config.environment, &headers)?;
 
-        // For local development, check if HTTPS is configured via environment variable
-        // If not set, default to HTTP (passkeys won't work without HTTPS)
-        // For production, always use HTTPS (required for passkeys)
-        let origin: String = if state.config.environment == "development" {
-            std::env::var("WEBAUTHN_LOCAL_HTTPS")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
-        } else {
-            format!("https://{}", rp_id)
-        };
-
-        // Create WebAuthn instance
+        // Create WebAuthn instance. The url crate treats "localhost" as no host, so
+        // rp_origin.domain() is None and webauthn-rs returns Configuration. Use a
+        // synthetic origin that passes the check and add the real browser origin.
         let url = url::Url::parse(&origin).map_err(|e| {
             error!("Failed to parse origin URL: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        let webauthn = WebauthnBuilder::new(&rp_id, &url)
-            .map_err(|e| {
+        let webauthn = match WebauthnBuilder::new(&rp_id, &url) {
+            Ok(builder) => builder
+                .allow_any_port(rp_id == "localhost.localdomain")
+                .rp_name("LeadsNebula")
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build WebAuthn instance: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?,
+            Err(webauthn_rs::prelude::WebauthnError::Configuration) if rp_id == "localhost" => {
+                let builder_url =
+                    url::Url::parse("https://localhost.localdomain").map_err(|e| {
+                        error!("Failed to parse localhost workaround URL: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                WebauthnBuilder::new(&rp_id, &builder_url)
+                    .map_err(|e| {
+                        error!(
+                            "Failed to create WebAuthn builder (localhost workaround): {}",
+                            e
+                        );
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+                    .append_allowed_origin(&url)
+                    .allow_any_port(true)
+                    .rp_name("LeadsNebula")
+                    .build()
+                    .map_err(|e| {
+                        error!(
+                            "Failed to build WebAuthn instance (localhost workaround): {}",
+                            e
+                        );
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+            }
+            Err(_) if rp_id == "127.0.0.1" => {
+                return Ok(Json(serde_json::json!({
+                    "success": false,
+                    "error": "Passkey registration from 127.0.0.1 is not supported by the server library. Please use https://localhost:3000 and ensure your certificate is trusted (e.g. mkcert)."
+                })));
+            }
+            Err(e) => {
                 error!("Failed to create WebAuthn builder: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .rp_name("LeadsNebula")
-            .build()
-            .map_err(|e| {
-                error!("Failed to build WebAuthn instance: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
 
         // Create registration options
         let user_id_bytes = user.id.as_bytes().to_vec();
-        let (ccr, _reg_session) = webauthn
+        let (ccr, reg_session) = webauthn
             .start_passkey_registration(
                 Uuid::from_bytes(user_id_bytes.try_into().map_err(|_| {
                     error!("Invalid user ID format");
@@ -691,27 +828,22 @@ async fn passkey_registration_options(
         rng.fill_bytes(&mut challenge_token_bytes);
         let challenge_token = hex::encode(challenge_token_bytes);
 
-        // Store registration session in Redis (5 minute expiration)
-        // Serialize the PasskeyRegistration session for later verification
+        // Store full PasskeyRegistration session in Redis for verification (same challenge as options)
         let cache_key = format!("webauthn_registration:{}:{}", user.id, challenge_token);
         if let Some(redis) = &state.redis {
-            // Store the challenge and user_id for verification
-            // Store challenge from the CreationChallengeResponse
-            // The challenge is in the public_key field of the response
-            // Serialize CreationChallengeResponse to extract challenge
-            let ccr_json = serde_json::to_value(&ccr).map_err(|e| {
-                error!("Failed to serialize CreationChallengeResponse: {}", e);
+            let reg_session_json = serde_json::to_value(&reg_session).map_err(|e| {
+                error!("Failed to serialize PasskeyRegistration: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-            let challenge_data = serde_json::json!({
-                "challenge": ccr_json.get("challenge").cloned().unwrap_or(serde_json::Value::Null),
-                "user_id": user.id.to_string()
+            let cache_data = serde_json::json!({
+                "user_id": user.id.to_string(),
+                "reg_session": reg_session_json
             });
             redis
-                .set_with_ttl(&cache_key, &challenge_data.to_string(), 300)
+                .set_with_ttl(&cache_key, &cache_data.to_string(), 300)
                 .await
                 .map_err(|e| {
-                    error!("Failed to store challenge in Redis: {}", e);
+                    error!("Failed to store registration session in Redis: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
         } else {
@@ -824,7 +956,7 @@ async fn register_passkey(
 
         let cached_data: serde_json::Value =
             serde_json::from_str(&cached_data_str).map_err(|_| {
-                error!("Failed to parse cached challenge data");
+                error!("Failed to parse cached registration data");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
@@ -832,7 +964,7 @@ async fn register_passkey(
             .get("user_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                error!("Invalid challenge data format");
+                error!("Invalid cached data format: missing user_id");
                 StatusCode::BAD_REQUEST
             })?;
 
@@ -843,40 +975,72 @@ async fn register_passkey(
             })));
         }
 
-        // Determine RP ID and origin
-        let rp_id: String = if state.config.environment == "development" {
-            "localhost".to_string()
-        } else {
-            std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
-        };
+        let reg_session_value = cached_data.get("reg_session").ok_or_else(|| {
+            error!(
+                "Invalid cached data format: missing reg_session (store full PasskeyRegistration)"
+            );
+            StatusCode::BAD_REQUEST
+        })?;
+        let reg_session: webauthn_rs::prelude::PasskeyRegistration =
+            serde_json::from_value(reg_session_value.clone()).map_err(|e| {
+                error!("Failed to deserialize PasskeyRegistration: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
 
-        // For local development, check if HTTPS is configured via environment variable
-        // If not set, default to HTTP (passkeys won't work without HTTPS)
-        // For production, always use HTTPS (required for passkeys)
-        let origin: String = if state.config.environment == "development" {
-            std::env::var("WEBAUTHN_LOCAL_HTTPS")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
-        } else {
-            format!("https://{}", rp_id)
-        };
+        let (rp_id, origin) = webauthn_rp_id_and_origin(&state.config.environment, &headers)?;
 
-        // Create WebAuthn instance
+        // Create WebAuthn instance (same rp_id/origin as registration_options; localhost workaround as in passkey_registration_options)
         let url = url::Url::parse(&origin).map_err(|e| {
             error!("Failed to parse origin URL: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        let webauthn = WebauthnBuilder::new(&rp_id, &url)
-            .map_err(|e| {
+        let webauthn = match WebauthnBuilder::new(&rp_id, &url) {
+            Ok(builder) => builder
+                .allow_any_port(rp_id == "localhost.localdomain")
+                .rp_name("LeadsNebula")
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build WebAuthn instance: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?,
+            Err(webauthn_rs::prelude::WebauthnError::Configuration) if rp_id == "localhost" => {
+                let builder_url =
+                    url::Url::parse("https://localhost.localdomain").map_err(|e| {
+                        error!("Failed to parse localhost workaround URL: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                WebauthnBuilder::new(&rp_id, &builder_url)
+                    .map_err(|e| {
+                        error!(
+                            "Failed to create WebAuthn builder (localhost workaround): {}",
+                            e
+                        );
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+                    .append_allowed_origin(&url)
+                    .allow_any_port(true)
+                    .rp_name("LeadsNebula")
+                    .build()
+                    .map_err(|e| {
+                        error!(
+                            "Failed to build WebAuthn instance (localhost workaround): {}",
+                            e
+                        );
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+            }
+            Err(_) if rp_id == "127.0.0.1" => {
+                return Ok(Json(serde_json::json!({
+                    "success": false,
+                    "error": "Passkey registration from 127.0.0.1 is not supported. Please use https://localhost:3000."
+                })));
+            }
+            Err(e) => {
                 error!("Failed to create WebAuthn builder: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .rp_name("LeadsNebula")
-            .build()
-            .map_err(|e| {
-                error!("Failed to build WebAuthn instance: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
 
         // Parse credential from request
         let reg_pkc =
@@ -886,29 +1050,18 @@ async fn register_passkey(
                     StatusCode::BAD_REQUEST
                 })?;
 
-        // Recreate the registration session to verify against
-        // Note: In a production system, we should store the full PasskeyRegistration session
-        // in Redis, but for now we'll recreate it and verify the challenge matches
-        let user_id_bytes = user.id.as_bytes().to_vec();
-        let user_uuid = Uuid::from_bytes(user_id_bytes.try_into().map_err(|_| {
-            error!("Invalid user ID format");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?);
-
-        let (_ccr, reg_session) = webauthn
-            .start_passkey_registration(user_uuid, &user.email, &user.email, None)
-            .map_err(|e| {
-                error!("Failed to create registration session: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        // Verify the credential
+        // Verify the credential using the stored session (same challenge we sent to the client)
         let passkey = webauthn
             .finish_passkey_registration(&reg_pkc, &reg_session)
             .map_err(|e| {
                 error!("Failed to verify credential: {}", e);
                 StatusCode::BAD_REQUEST
             })?;
+
+        // One-time use: remove registration session from Redis
+        if let Some(redis) = &state.redis {
+            let _ = redis.delete(&cache_key).await;
+        }
 
         // Determine passkey type from credential
         // Check if it's a platform authenticator (soft) or cross-platform (physical)
@@ -983,6 +1136,53 @@ async fn register_passkey(
         let _ = payload;
         Err(StatusCode::NOT_IMPLEMENTED)
     }
+}
+
+async fn delete_passkey(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(passkey_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::auth::JwtService;
+    use tracing::error;
+    use uuid::Uuid;
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let user_id = Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let passkey_uuid = Uuid::parse_str(&passkey_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let result =
+        sqlx::query("DELETE FROM webauthn_credentials WHERE id = $1 AND instance_user_id = $2")
+            .bind(passkey_uuid)
+            .bind(user_id)
+            .execute(state.db_pool.as_ref())
+            .await
+            .map_err(|e| {
+                error!("Database error deleting passkey: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    if result.rows_affected() == 0 {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "Passkey not found or you do not have permission to delete it."
+        })));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Passkey deleted successfully."
+    })))
 }
 
 // Temporary handler to test - will be replaced
@@ -5713,37 +5913,6 @@ async fn list_leads(
         }
     });
 
-    // #region agent log
-    // Debug instrumentation: Log instance_id used for query
-    let log_entry = serde_json::json!({
-        "sessionId": "debug-session",
-        "runId": "run1",
-        "hypothesisId": "A",
-        "location": "dashboard.rs:5714",
-        "message": "List leads - instance_id and params",
-        "data": {
-            "user_id": user.id.to_string(),
-            "instance_id": instance_id.map(|id| id.to_string()),
-            "page": page,
-            "per_page": per_page,
-            "search_term": search_term.clone()
-        },
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&log_entry).unwrap_or_default()
-        );
-    }
-    // #endregion
-
     // Build base query with search support
     // OPTIMIZATION: Only load basic fields - no payloads/PII (loaded lazily via /leads/:id/details endpoint)
     let base_query = if let Some(search) = search_term.as_ref() {
@@ -5859,65 +6028,6 @@ async fn list_leads(
             error!("Database error fetching leads: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    // #region agent log
-    // Debug instrumentation: Log query results and check publisher instance_id
-    let leads_count = leads_query.len();
-    let lead_uuids: Vec<String> = leads_query
-        .iter()
-        .take(5)
-        .filter_map(|row| {
-            use sqlx::Row;
-            row.try_get::<uuid::Uuid, _>("uuid")
-                .ok()
-                .map(|id| id.to_string())
-        })
-        .collect();
-
-    // Check publisher instance_id for debugging
-    let publisher_instance_check = if let Some(_inst_id) = instance_id {
-        match sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-            "SELECT instance_id FROM publishers WHERE id IN (SELECT DISTINCT publisher_id FROM leads WHERE created_at > NOW() - INTERVAL '5 minutes' AND publisher_id IS NOT NULL) AND deleted_at IS NULL LIMIT 1"
-        )
-        .fetch_optional(state.db_pool.as_ref())
-        .await {
-            Ok(Some(Some(id))) => Some(id.to_string()),
-            Ok(Some(None)) | Ok(None) => None,
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    let log_entry = serde_json::json!({
-        "sessionId": "debug-session",
-        "runId": "run1",
-        "hypothesisId": "A",
-        "location": "dashboard.rs:5810",
-        "message": "List leads - query results",
-        "data": {
-            "instance_id": instance_id.map(|id| id.to_string()),
-            "leads_count": leads_count,
-            "first_5_lead_uuids": lead_uuids,
-            "page": page,
-            "per_page": per_page,
-            "recent_publisher_instance_id": publisher_instance_check
-        },
-        "timestamp": chrono::Utc::now().timestamp_millis()
-    });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&log_entry).unwrap_or_default()
-        );
-    }
-    // #endregion
 
     // Get total count for pagination (before applying limit/offset)
     let total_count_query = if let Some(search) = search_term.as_ref() {

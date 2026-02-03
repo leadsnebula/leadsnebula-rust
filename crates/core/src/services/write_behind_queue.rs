@@ -434,36 +434,6 @@ impl WriteBehindQueue {
             + payload_updates.len()
             + lead_creations.len();
 
-        // #region agent log
-        // Debug instrumentation: Log batch flush with lead creations count
-        if !lead_creations.is_empty() {
-            let log_entry = serde_json::json!({
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "A",
-                "location": "write_behind_queue.rs:437",
-                "message": "Flushing batch with lead creations",
-                "data": {
-                    "lead_creations_count": lead_creations.len(),
-                    "total_batch_size": batch_size
-                },
-                "timestamp": chrono::Utc::now().timestamp_millis()
-            });
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-            {
-                use std::io::Write;
-                let _ = writeln!(
-                    file,
-                    "{}",
-                    serde_json::to_string(&log_entry).unwrap_or_default()
-                );
-            }
-        }
-        // #endregion
-
         // Run lead creation first so leads exist before buyer_responses (FK buyer_responses_lead_id_fkey)
         let creation_result = Self::batch_create_leads(&lead_creations, pool).await;
         // Then run the rest in parallel
@@ -489,32 +459,6 @@ impl WriteBehindQueue {
 
         // Log errors (non-blocking)
         if let Err(e) = creation_result {
-            // #region agent log
-            let log_entry = serde_json::json!({
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "A",
-                "location": "write_behind_queue.rs:459",
-                "message": "Lead creation batch failed",
-                "data": {
-                    "error": e.to_string(),
-                    "lead_creations_count": lead_creations.len()
-                },
-                "timestamp": chrono::Utc::now().timestamp_millis()
-            });
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-            {
-                use std::io::Write;
-                let _ = writeln!(
-                    file,
-                    "{}",
-                    serde_json::to_string(&log_entry).unwrap_or_default()
-                );
-            }
-            // #endregion
             tracing::warn!("Failed to batch create leads: {}", e);
         }
         if let Err(e) = pulsar_result {
@@ -1103,33 +1047,6 @@ impl WriteBehindQueue {
             return Ok(());
         }
 
-        // #region agent log
-        // Debug instrumentation: Log batch_create_leads entry
-        let log_entry = serde_json::json!({
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "A",
-            "location": "write_behind_queue.rs:980",
-            "message": "batch_create_leads called",
-            "data": {
-                "creations_count": creations.len()
-            },
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                file,
-                "{}",
-                serde_json::to_string(&log_entry).unwrap_or_default()
-            );
-        }
-        // #endregion
-
         // Process each lead creation individually (encryption happens here)
         for task in creations {
             if let BackgroundTask::LeadCreation {
@@ -1161,34 +1078,6 @@ impl WriteBehindQueue {
                 pii_encryption_key,
             } = task
             {
-                // #region agent log
-                // Debug instrumentation: Log processing individual lead creation
-                let log_entry = serde_json::json!({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "A",
-                    "location": "write_behind_queue.rs:1014",
-                    "message": "Processing lead creation task",
-                    "data": {
-                        "uuid": uuid.to_string(),
-                        "publisher_id": publisher_id.to_string(),
-                        "event_id": event_id.clone()
-                    },
-                    "timestamp": chrono::Utc::now().timestamp_millis()
-                });
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(
-                        file,
-                        "{}",
-                        serde_json::to_string(&log_entry).unwrap_or_default()
-                    );
-                }
-                // #endregion
                 // Encrypt PII fields in batch (using shared key if available)
                 let encrypt_pii = |value: Option<String>| -> Option<String> {
                     if let (Some(val), Some(key)) = (value, pii_encryption_key) {
@@ -1251,32 +1140,6 @@ impl WriteBehindQueue {
                 let mut tx = match pool.begin().await {
                     Ok(t) => t,
                     Err(e) => {
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1062",
-                            "message": "Failed to start transaction",
-                            "data": {
-                                "uuid": uuid.to_string(),
-                                "error": e.to_string()
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
                         tracing::error!("Failed to start transaction for lead creation: {}", e);
                         continue;
                     }
@@ -1331,99 +1194,16 @@ impl WriteBehindQueue {
                 let returned_uuid = match lead_uuid_result {
                     Ok(row) => {
                         use sqlx::Row;
-                        let ret_uuid = row.get::<uuid::Uuid, _>(0);
-                        // #region agent log
-                        // Debug instrumentation: Log successful INSERT
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1120",
-                            "message": "INSERT query succeeded",
-                            "data": {
-                                "expected_uuid": uuid.to_string(),
-                                "returned_uuid": ret_uuid.to_string(),
-                                "uuid_match": ret_uuid == *uuid
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
-                        ret_uuid
+                        row.get::<uuid::Uuid, _>(0)
                     }
                     Err(e) => {
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1123",
-                            "message": "Database error creating lead",
-                            "data": {
-                                "uuid": uuid.to_string(),
-                                "error": e.to_string(),
-                                "error_type": format!("{:?}", e)
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
                         tracing::error!("Database error creating lead: {}", e);
                         let _ = tx.rollback().await;
                         continue;
                     }
                 };
 
-                // #region agent log
-                // Debug instrumentation: Verify UUID matches
                 if returned_uuid != *uuid {
-                    let log_entry = serde_json::json!({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A",
-                        "location": "write_behind_queue.rs:1258",
-                        "message": "UUID mismatch in lead creation - ROLLING BACK",
-                        "data": {
-                            "expected_uuid": uuid.to_string(),
-                            "returned_uuid": returned_uuid.to_string(),
-                            "publisher_id": publisher_id.to_string()
-                        },
-                        "timestamp": chrono::Utc::now().timestamp_millis()
-                    });
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            file,
-                            "{}",
-                            serde_json::to_string(&log_entry).unwrap_or_default()
-                        );
-                    }
                     tracing::error!(
                         "UUID mismatch: expected {}, got {} - rolling back transaction",
                         uuid,
@@ -1433,34 +1213,6 @@ impl WriteBehindQueue {
                     continue; // Skip commit if UUID doesn't match
                 }
                 let lead_uuid = *uuid; // Use the UUID we passed in (not the returned one, which should match)
-
-                // #region agent log
-                // Debug instrumentation: Log before ping insert
-                let log_entry = serde_json::json!({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "A",
-                    "location": "write_behind_queue.rs:1275",
-                    "message": "UUID verified, proceeding with ping insert",
-                    "data": {
-                        "lead_uuid": lead_uuid.to_string()
-                    },
-                    "timestamp": chrono::Utc::now().timestamp_millis()
-                });
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(
-                        file,
-                        "{}",
-                        serde_json::to_string(&log_entry).unwrap_or_default()
-                    );
-                }
-                // #endregion
-                // #endregion
 
                 // Generate ping_id
                 let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
@@ -1484,63 +1236,9 @@ impl WriteBehindQueue {
                 let ping_id_val = match ping_id_result {
                     Ok(row) => {
                         use sqlx::Row;
-                        let id = row.get::<i64, _>("id");
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1335",
-                            "message": "Ping insert succeeded",
-                            "data": {
-                                "lead_uuid": lead_uuid.to_string(),
-                                "ping_id_val": id
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
-                        id
+                        row.get::<i64, _>("id")
                     }
                     Err(e) => {
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1342",
-                            "message": "Ping insert failed (non-critical)",
-                            "data": {
-                                "lead_uuid": lead_uuid.to_string(),
-                                "error": e.to_string(),
-                                "error_type": format!("{:?}", e)
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
                         tracing::warn!(
                             "Failed to create ping record for lead {} (non-critical): {}",
                             lead_uuid,
@@ -1557,34 +1255,6 @@ impl WriteBehindQueue {
                 if ping_id_val > 0 {
                     // Build ping-only payload (no PII, just qualification data)
                     let ping_only_payload = if strategy == "ping_post" {
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1460",
-                            "message": "Building ping-only payload for ping_post strategy",
-                            "data": {
-                                "strategy": strategy.clone(),
-                                "lead_uuid": lead_uuid.to_string(),
-                                "request_payload_keys": request_payload.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>())
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
-
                         // Extract fields from request_payload (flat structure) for ping-only payload
                         let mut ping_obj = serde_json::Map::new();
 
@@ -1650,67 +1320,8 @@ impl WriteBehindQueue {
 
                         let ping_payload_result = serde_json::json!({ "lead": ping_obj });
 
-                        // #region agent log
-                        let log_entry2 = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1500",
-                            "message": "Ping-only payload built",
-                            "data": {
-                                "lead_uuid": lead_uuid.to_string(),
-                                "ping_payload_keys": ping_payload_result.as_object().and_then(|o| o.get("lead")).and_then(|l| l.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>()),
-                                "has_pii_fields": {
-                                    "first_name": ping_payload_result.as_object().and_then(|o| o.get("lead")).and_then(|l| l.as_object()).and_then(|o| o.get("first_name")).is_some(),
-                                    "last_name": ping_payload_result.as_object().and_then(|o| o.get("lead")).and_then(|l| l.as_object()).and_then(|o| o.get("last_name")).is_some(),
-                                    "email": ping_payload_result.as_object().and_then(|o| o.get("lead")).and_then(|l| l.as_object()).and_then(|o| o.get("email")).is_some()
-                                },
-                                "request_type": ping_payload_result.as_object().and_then(|o| o.get("lead")).and_then(|l| l.as_object()).and_then(|o| o.get("request_type"))
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry2).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
-
                         ping_payload_result
                     } else {
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1501",
-                            "message": "Using original request_payload (not ping_post strategy)",
-                            "data": {
-                                "strategy": strategy.clone(),
-                                "lead_uuid": lead_uuid.to_string()
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
                         // For non-ping_post strategies, use original request_payload
                         request_payload.clone()
                     };
@@ -1760,34 +1371,6 @@ impl WriteBehindQueue {
                     .await;
 
                     if let Err(e) = ping_payload_result {
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A",
-                            "location": "write_behind_queue.rs:1359",
-                            "message": "Ping payload insert failed (non-critical)",
-                            "data": {
-                                "lead_uuid": lead_uuid.to_string(),
-                                "ping_id_val": ping_id_val,
-                                "error": e.to_string(),
-                                "error_type": format!("{:?}", e)
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                serde_json::to_string(&log_entry).unwrap_or_default()
-                            );
-                        }
-                        // #endregion
                         tracing::warn!(
                             "Failed to create ping_payloads record for lead {} (non-critical): {}",
                             lead_uuid,
@@ -1797,93 +1380,11 @@ impl WriteBehindQueue {
                 }
 
                 // Commit transaction
-                // #region agent log
-                // Debug instrumentation: Log before commit
-                let log_entry_before_commit = serde_json::json!({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "A",
-                    "location": "write_behind_queue.rs:1362",
-                    "message": "About to commit transaction",
-                    "data": {
-                        "uuid": lead_uuid.to_string(),
-                        "ping_id_val": ping_id_val
-                    },
-                    "timestamp": chrono::Utc::now().timestamp_millis()
-                });
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(
-                        file,
-                        "{}",
-                        serde_json::to_string(&log_entry_before_commit).unwrap_or_default()
-                    );
-                }
-                // #endregion
-
                 let commit_result = tx.commit().await;
                 if let Err(e) = commit_result {
-                    // #region agent log
-                    let log_entry = serde_json::json!({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A",
-                        "location": "write_behind_queue.rs:1380",
-                        "message": "Failed to commit transaction",
-                        "data": {
-                            "uuid": lead_uuid.to_string(),
-                            "error": e.to_string(),
-                            "error_type": format!("{:?}", e)
-                        },
-                        "timestamp": chrono::Utc::now().timestamp_millis()
-                    });
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            file,
-                            "{}",
-                            serde_json::to_string(&log_entry).unwrap_or_default()
-                        );
-                    }
-                    // #endregion
                     tracing::error!("Failed to commit transaction for lead {}: {}", lead_uuid, e);
                 } else {
-                    // #region agent log
                     let creation_duration_ms = creation_start.elapsed().as_millis() as u64;
-                    let log_entry = serde_json::json!({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A",
-                        "location": "write_behind_queue.rs:1400",
-                        "message": "Lead creation committed successfully",
-                        "data": {
-                            "uuid": lead_uuid.to_string(),
-                            "duration_ms": creation_duration_ms,
-                            "ping_id_val": ping_id_val
-                        },
-                        "timestamp": chrono::Utc::now().timestamp_millis()
-                    });
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/home/badinoff/projects/leadsnebula/.cursor/debug.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            file,
-                            "{}",
-                            serde_json::to_string(&log_entry).unwrap_or_default()
-                        );
-                    }
-                    // #endregion
                     // Log lead creation (async, non-blocking - 0ms impact)
                     async_log::log_lead_creation(lead_uuid, creation_duration_ms);
                 }
