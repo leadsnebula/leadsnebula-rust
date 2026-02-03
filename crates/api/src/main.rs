@@ -119,17 +119,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
     }
 
-    // Initialize tracing with production-optimized logging
-    // Default to WARN level to eliminate logging overhead in critical path (100-300ms savings)
-    // RUST_LOG can override this if set (e.g., RUST_LOG=info or RUST_LOG=debug for verbose)
-    // ERROR and WARN logs are preserved for troubleshooting, INFO/DEBUG are disabled by default
-    let default_filter = "leadsnebula_api=warn,leadsnebula_core=warn,leadsnebula_utils=warn,tower_http=warn,sqlx=warn,redis=warn";
+    // Initialize tracing: default INFO for API (startup + request flow), WARN for deps to reduce noise
+    // RUST_LOG overrides (e.g. RUST_LOG=debug). Production can set RUST_LOG=warn to quiet startup.
+    let default_filter = "leadsnebula_api=info,leadsnebula_core=warn,leadsnebula_utils=warn,tower_http=warn,sqlx=warn,redis=warn";
 
-    // Use JSON format by default for production (works better with Grafana/Fly.io)
-    // Set RUST_LOG_JSON=0 to disable JSON and use pretty format
+    // Local dev: human-readable logs. Production: JSON for Fly.io/Grafana. RUST_LOG_JSON=0 forces pretty.
     let use_json = std::env::var("RUST_LOG_JSON")
         .map(|v| v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(true); // Default to JSON
+        .unwrap_or_else(|_| !is_local_dev);
 
     #[cfg(feature = "profiling")]
     {
@@ -283,6 +280,17 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 cache_warmup_ms = cache_warmup_duration,
                 "Cache pre-warming completed - all lookups are now cached"
+            );
+
+            // Single startup summary so logs are minimally useful: SSM, DB, Redis, listen
+            let redis_status = if state_for_warmup.redis.is_some() {
+                "connected"
+            } else {
+                "disabled"
+            };
+            info!(
+                "Startup complete. SSM: ready | DB: connected | Redis: {} | Listening: 0.0.0.0:8080",
+                redis_status
             );
 
             // Start periodic cache warm-up task (runs every 30 minutes)

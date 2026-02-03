@@ -447,14 +447,11 @@ impl AppState {
                 match sqlx::query("SELECT 1").execute(pool_arc.as_ref()).await {
                     Ok(_) => {
                         let duration_ms = db_warmup_start.elapsed().as_millis();
-                        if duration_ms > 50 {
-                            warn!(
-                                db_warmup_ms = duration_ms,
-                                "DB pre-warm slow (may indicate cold start)"
-                            );
-                        } else {
-                            info!("DB pre-warmed successfully ({}ms)", duration_ms);
-                        }
+                        info!(
+                            db_warmup_ms = duration_ms,
+                            "DB pre-warm done ({}ms)",
+                            duration_ms
+                        );
                     }
                     Err(e) => {
                         warn!("DB pre-warm failed (non-critical): {}", e);
