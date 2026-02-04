@@ -71,11 +71,7 @@ impl SsmService {
         let env_local_cwd = std::path::Path::new(".env.local").exists();
         let env_local_rust = std::path::Path::new("rust/.env.local").exists();
         let is_local_dev = env_local_cwd || env_local_rust || self.env == "dev";
-        let timeout_ms = if is_local_dev {
-            8000
-        } else {
-            200
-        };
+        let timeout_ms = if is_local_dev { 8000 } else { 200 };
         let retry_timeout_ms = timeout_ms;
 
         // Fetch from SSM with timeout + single retry + graceful fallback

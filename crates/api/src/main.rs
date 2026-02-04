@@ -255,18 +255,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(
-                            CorsLayer::new()
-                                .allow_origin(tower_http::cors::Any)
-                                .allow_methods(tower_http::cors::Any)
-                                .allow_headers([
-                                    axum::http::header::AUTHORIZATION,
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderName::from_static("x-api-key"),
-                                    axum::http::HeaderName::from_static("x-hmac-signature"),
-                                ])
-                                .expose_headers(tower_http::cors::Any),
-                        ),
+                        .layer(CorsLayer::permissive()),
                 );
 
             info!("All routes are now available, including /api/auth/login");
@@ -445,18 +434,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(
-                            CorsLayer::new()
-                                .allow_origin(tower_http::cors::Any)
-                                .allow_methods(tower_http::cors::Any)
-                                .allow_headers([
-                                    axum::http::header::AUTHORIZATION,
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderName::from_static("x-api-key"),
-                                    axum::http::HeaderName::from_static("x-hmac-signature"),
-                                ])
-                                .expose_headers(tower_http::cors::Any),
-                        ),
+                        .layer(CorsLayer::permissive()),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;
@@ -471,18 +449,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(
-                            CorsLayer::new()
-                                .allow_origin(tower_http::cors::Any)
-                                .allow_methods(tower_http::cors::Any)
-                                .allow_headers([
-                                    axum::http::header::AUTHORIZATION,
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderName::from_static("x-api-key"),
-                                    axum::http::HeaderName::from_static("x-hmac-signature"),
-                                ])
-                                .expose_headers(tower_http::cors::Any),
-                        ),
+                        .layer(CorsLayer::permissive()),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;
