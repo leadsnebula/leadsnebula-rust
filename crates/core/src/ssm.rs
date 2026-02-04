@@ -67,10 +67,12 @@ impl SsmService {
             }
         }
 
-        // Timeout: longer for local and dev (Fly dev) so SSM has time to respond; short for prod
-        let is_local_dev = std::path::Path::new(".env.local").exists();
-        let timeout_ms = if is_local_dev || self.env == "dev" {
-            3000
+        // Timeout: longer for local and dev so SSM has time to respond from WSL/slow networks; short for prod
+        let env_local_cwd = std::path::Path::new(".env.local").exists();
+        let env_local_rust = std::path::Path::new("rust/.env.local").exists();
+        let is_local_dev = env_local_cwd || env_local_rust || self.env == "dev";
+        let timeout_ms = if is_local_dev {
+            8000
         } else {
             200
         };
