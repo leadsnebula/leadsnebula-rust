@@ -190,6 +190,7 @@ impl SsmService {
                 warn!("SSM timeout for {} (first attempt), retrying...", path);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+                let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
                 let retry_future = self
                     .client
                     .get_parameter()
@@ -246,8 +247,8 @@ impl SsmService {
                         }
                         Ok(try_dev_encryption_fallback(path))
                     }
-                    Err(_) => {
-                        // Timeout on retry - graceful fallback
+                    _ => {
+                        // Timeout on retry (or other) - graceful fallback
                         warn!(
                             "SSM timeout after retry for {}, returning None as fallback",
                             path
