@@ -11,9 +11,18 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
+
+/// CORS layer that mirrors the request Origin so browsers always get a valid Access-Control-Allow-Origin.
+/// Fixes "Missing Header" / blocked login when dashboard (e.g. dev.dashboard.leadsnebula.com) calls api.leadsnebula.com.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
 
 // Use mimalloc for faster allocations (only when feature is enabled)
 #[cfg(feature = "mimalloc")]
@@ -255,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(cors_layer()),
                 );
 
             info!("All routes are now available, including /api/auth/login");
@@ -434,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(cors_layer()),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;
@@ -449,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(CorsLayer::permissive()),
+                        .layer(cors_layer()),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;
