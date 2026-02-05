@@ -1,5 +1,5 @@
-// Note: health_routes() and health_check() are currently unused because we only serve minimal app
-// They will be used when we implement full app serving after AppState initialization
+// When AppState initializes successfully, health_routes() is merged in main.rs and
+// /health, /poke, and /metrics are served. On init failure, only /live is served.
 #![allow(dead_code)]
 
 use axum::extract::State;
@@ -18,9 +18,9 @@ pub fn health_routes() -> Router<AppState> {
         .route("/metrics", get(metrics_endpoint))
 }
 
-/// Lightweight DB warmup endpoint for form flows (e.g. only.solar).
-/// Runs SELECT 1 to wake Neon/connection pool; does not check Redis.
-/// Use /health for full health checks; use /poke to avoid overloading /health.
+/// GET /poke — lightweight DB warmup for form flows (e.g. only.solar).
+/// No auth; runs SELECT 1 only. Use this instead of /health for warming to avoid
+/// overloading health checks (monitoring, rate limits). Returns 200 + { "ok": true } or 503.
 async fn poke_endpoint(State(state): State<AppState>) -> Response {
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),

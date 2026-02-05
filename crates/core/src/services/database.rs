@@ -3,12 +3,31 @@ use std::time::Duration;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
 use tracing::{info, warn};
 
+/// Strip connection parameters that sqlx doesn't recognize (e.g. channel_binding=require from Neon).
+/// Prevents "ignoring unrecognized connect parameter" warnings in logs.
+fn strip_channel_binding(url: &str) -> String {
+    if let Some((base, query)) = url.split_once('?') {
+        let params: Vec<&str> = query
+            .split('&')
+            .filter(|p| p.split('=').next().unwrap_or("") != "channel_binding")
+            .collect();
+        if params.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}?{}", base, params.join("&"))
+        }
+    } else {
+        url.to_string()
+    }
+}
+
 pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
     info!("Creating database connection pool");
+    let database_url = strip_channel_binding(database_url);
 
     // Wake up Neon free-tier instance with a simple connection attempt
     // This helps reduce cold-start delays when Neon has suspended
-    if let Ok(mut conn) = sqlx::PgConnection::connect(database_url).await {
+    if let Ok(mut conn) = sqlx::PgConnection::connect(&database_url).await {
         if let Err(e) = sqlx::query("SELECT 1").execute(&mut conn).await {
             warn!("Neon wake-up query failed (non-critical): {}", e);
         } else {
@@ -23,7 +42,7 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
         .max_delay(Duration::from_secs(5))
         .take(5); // More retries for Neon wake-up
 
-    let database_url_clone = database_url.to_string();
+    let database_url_clone = database_url.clone();
     let pool = Retry::spawn(retry_strategy, move || {
         let url = database_url_clone.clone();
         async move {

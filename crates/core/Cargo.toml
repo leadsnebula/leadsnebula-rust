@@ -45,7 +45,7 @@ tokio-retry = { workspace = true }
 
 # Optional features
 sentry = { version = "0.32", optional = true }
-webauthn-rs = { version = "0.4", optional = true }
+webauthn-rs = { version = "0.4", optional = true, features = ["danger-allow-state-serialisation"] }
 totp-rs = { version = "5", optional = true }
 url = { version = "2", optional = true }
 

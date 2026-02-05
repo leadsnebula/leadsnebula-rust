@@ -293,25 +293,39 @@ jobs:
           echo "Waiting for deployment to stabilize..."
           sleep 30
           echo "Checking machine status..."
-          # Wait for machine to be in "started" state
+          # Accept "started" (running) or "stopped" (autostopped / scale-to-zero). Fail on crash/destroyed/unknown.
           for i in {1..15}; do
             STATUS=$(flyctl machines list --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.[0].state // "unknown"' || echo "unknown")
-            if [ "$STATUS" = "started" ]; then
-              echo "✅ Machine is started - deployment successful"
-              echo "ℹ️  Fly.io will continue monitoring health checks automatically"
-              exit 0
-            fi
-            if [ "$i" -eq 15 ]; then
-              echo "⚠️  Machine status still $STATUS after 15 attempts"
-              echo "Checking app status and logs..."
-              flyctl status --app ${{ env.APP_NAME }} || true
-              echo "=== Recent logs ==="
-              flyctl logs --app ${{ env.APP_NAME }} --no-tail || true
-              exit 1
-            else
-              echo "Machine status: $STATUS (attempt $i/15)..."
-              sleep 2
-            fi
+            case "$STATUS" in
+              started)
+                echo "✅ Machine is started - deployment successful"
+                echo "ℹ️  Fly.io will continue monitoring health checks automatically"
+                exit 0
+                ;;
+              stopped)
+                echo "✅ Machine is stopped (Fly.io autostop/scale-to-zero) - deployment successful"
+                echo "ℹ️  Machine will start on first request. Image was updated successfully."
+                exit 0
+                ;;
+              crashed|destroyed)
+                echo "❌ Machine in bad state: $STATUS"
+                flyctl status --app ${{ env.APP_NAME }} || true
+                echo "=== Recent logs ==="
+                flyctl logs --app ${{ env.APP_NAME }} --no-tail || true
+                exit 1
+                ;;
+              *)
+                if [ "$i" -eq 15 ]; then
+                  echo "⚠️  Machine status still $STATUS after 15 attempts"
+                  flyctl status --app ${{ env.APP_NAME }} || true
+                  echo "=== Recent logs ==="
+                  flyctl logs --app ${{ env.APP_NAME }} --no-tail || true
+                  exit 1
+                fi
+                echo "Machine status: $STATUS (attempt $i/15)..."
+                sleep 2
+                ;;
+            esac
           done
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

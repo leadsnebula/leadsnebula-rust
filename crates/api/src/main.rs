@@ -11,9 +11,18 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
+
+/// CORS layer that mirrors the request Origin so browsers always get a valid Access-Control-Allow-Origin.
+/// Fixes "Missing Header" / blocked login when dashboard (e.g. dev.dashboard.leadsnebula.com) calls api.leadsnebula.com.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
 
 // Use mimalloc for faster allocations (only when feature is enabled)
 #[cfg(feature = "mimalloc")]
@@ -119,14 +128,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
     }
 
-    // API=info for human-readable startup; core=warn to avoid cache/redis per-op spam (use RUST_LOG=debug for diagnostics)
+    // Initialize tracing: default INFO for API (startup + request flow), WARN for deps to reduce noise
+    // RUST_LOG overrides (e.g. RUST_LOG=debug). Production can set RUST_LOG=warn to quiet startup.
     let default_filter = "leadsnebula_api=info,leadsnebula_core=warn,leadsnebula_utils=warn,tower_http=warn,sqlx=warn,redis=warn";
 
-    // Use JSON format by default for production (works better with Grafana/Fly.io)
-    // Set RUST_LOG_JSON=0 to disable JSON and use pretty format
+    // Local dev: human-readable logs. Production: JSON for Fly.io/Grafana. RUST_LOG_JSON=0 forces pretty.
     let use_json = std::env::var("RUST_LOG_JSON")
         .map(|v| v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(true); // Default to JSON
+        .unwrap_or_else(|_| !is_local_dev);
 
     #[cfg(feature = "profiling")]
     {
@@ -246,18 +255,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(
-                            CorsLayer::new()
-                                .allow_origin(tower_http::cors::Any)
-                                .allow_methods(tower_http::cors::Any)
-                                .allow_headers([
-                                    axum::http::header::AUTHORIZATION,
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderName::from_static("x-api-key"),
-                                    axum::http::HeaderName::from_static("x-hmac-signature"),
-                                ])
-                                .expose_headers(tower_http::cors::Any),
-                        ),
+                        .layer(cors_layer()),
                 );
 
             info!("Routes registered");
@@ -266,6 +264,17 @@ async fn main() -> anyhow::Result<()> {
 
             info!(
                 "Server ready. No errors, timeouts, or warnings during startup. Listening on 0.0.0.0:8080"
+            );
+
+            // Single startup summary so logs are minimally useful: SSM, DB, Redis, listen
+            let redis_status = if state_for_warmup.redis.is_some() {
+                "connected"
+            } else {
+                "disabled"
+            };
+            info!(
+                "Startup complete. SSM: ready | DB: connected | Redis: {} | Listening: 0.0.0.0:8080",
+                redis_status
             );
 
             // Start periodic cache warm-up task (runs every 30 minutes)
@@ -419,18 +428,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(
-                            CorsLayer::new()
-                                .allow_origin(tower_http::cors::Any)
-                                .allow_methods(tower_http::cors::Any)
-                                .allow_headers([
-                                    axum::http::header::AUTHORIZATION,
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderName::from_static("x-api-key"),
-                                    axum::http::HeaderName::from_static("x-hmac-signature"),
-                                ])
-                                .expose_headers(tower_http::cors::Any),
-                        ),
+                        .layer(cors_layer()),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;
@@ -445,18 +443,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(
                     ServiceBuilder::new()
                         .layer(TraceLayer::new_for_http())
-                        .layer(
-                            CorsLayer::new()
-                                .allow_origin(tower_http::cors::Any)
-                                .allow_methods(tower_http::cors::Any)
-                                .allow_headers([
-                                    axum::http::header::AUTHORIZATION,
-                                    axum::http::header::CONTENT_TYPE,
-                                    axum::http::HeaderName::from_static("x-api-key"),
-                                    axum::http::HeaderName::from_static("x-hmac-signature"),
-                                ])
-                                .expose_headers(tower_http::cors::Any),
-                        ),
+                        .layer(cors_layer()),
                 );
             // In axum 0.7, Router<()> supports into_make_service()
             axum::serve(listener, minimal_app.into_make_service()).await?;

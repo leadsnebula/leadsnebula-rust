@@ -2,7 +2,10 @@
 // It will be used when we implement full app serving after AppState initialization
 #![allow(dead_code)]
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
+use axum::{
+    extract::rejection::JsonRejection, extract::State, http::StatusCode, response::Json,
+    routing::post, Router,
+};
 use leadsnebula_core::auth::{verify_password, JwtService};
 use leadsnebula_core::models::user::User;
 use serde::{Deserialize, Serialize};
@@ -52,24 +55,72 @@ pub fn auth_routes() -> Router<AppState> {
         .route("/api/auth/verify-otp-login", post(verify_otp_login))
 }
 
+fn bad_request_login_response(message: &str) -> (StatusCode, Json<LoginResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(LoginResponse {
+            success: false,
+            token: None,
+            user: None,
+            error: Some(message.to_string()),
+            requires_otp: None,
+            login_token: None,
+            message: None,
+        }),
+    )
+}
+
+fn server_error_login_response() -> (StatusCode, Json<LoginResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(LoginResponse {
+            success: false,
+            token: None,
+            user: None,
+            error: Some("Server error. Please try again.".to_string()),
+            requires_otp: None,
+            login_token: None,
+            message: None,
+        }),
+    )
+}
+
 async fn login(
     State(state): State<AppState>,
-    Json(payload): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, StatusCode> {
+    payload: Result<Json<LoginRequest>, JsonRejection>,
+) -> Result<Json<LoginResponse>, (StatusCode, Json<LoginResponse>)> {
+    use std::time::Instant;
     use tracing::{error, info, warn};
 
-    info!("Login attempt for email: {}", payload.email);
+    let payload = payload.map_err(|e| {
+        warn!("Login invalid request body: {}", e);
+        bad_request_login_response("Invalid request. Send JSON with email and password.")
+    })?;
+    let payload = payload.0;
+
+    // Validate required fields (defensive; extractor already requires them)
+    let email = payload.email.trim();
+    let password = payload.password.as_str();
+    if email.is_empty() || password.is_empty() {
+        return Err(bad_request_login_response(
+            "Email and password are required.",
+        ));
+    }
+
+    let start = Instant::now();
+    info!("Login request received for {}", email);
 
     // Find user by email (case-insensitive)
+    let email_lower = email.to_lowercase();
     let user = sqlx::query_as::<_, User>(
         "SELECT * FROM instance_users WHERE LOWER(email) = LOWER($1) LIMIT 1",
     )
-    .bind(&payload.email)
+    .bind(&email_lower)
     .fetch_optional(state.db_pool.as_ref())
     .await
     .map_err(|e| {
         error!("Database error during login lookup: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        server_error_login_response()
     })?;
 
     let user = match user {
@@ -84,7 +135,12 @@ async fn login(
             u
         }
         None => {
-            warn!("Login failed: User not found for email: {}", payload.email);
+            warn!("Login failed: User not found for email: {}", email);
+            info!(
+                duration_ms = start.elapsed().as_millis(),
+                "Login completed in {}ms (success=false, reason=user_not_found)",
+                start.elapsed().as_millis()
+            );
             return Ok(Json(LoginResponse {
                 success: false,
                 token: None,
@@ -100,6 +156,11 @@ async fn login(
     // Check if user is confirmed
     if !user.is_confirmed() {
         warn!("Login failed: User {} not confirmed", user.email);
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, reason=not_confirmed)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -117,6 +178,11 @@ async fn login(
             "Login failed: User {} is not active (status: {})",
             user.email, user.status
         );
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, reason=account_suspended)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -129,17 +195,8 @@ async fn login(
     }
 
     // Verify password
-    info!("Verifying password for user: {}", user.email);
-    info!(
-        "Password hash prefix: {}...",
-        &user.encrypted_password.chars().take(20).collect::<String>()
-    );
-
-    let password_valid = match verify_password(&payload.password, &user.encrypted_password) {
-        Ok(valid) => {
-            info!("Password verification result: {}", valid);
-            valid
-        }
+    let password_valid = match verify_password(password, &user.encrypted_password) {
+        Ok(valid) => valid,
         Err(e) => {
             error!("Password verification error: {}", e);
             false
@@ -148,6 +205,11 @@ async fn login(
 
     if !password_valid {
         warn!("Login failed: Invalid password for user: {}", user.email);
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=false, reason=invalid_password)",
+            start.elapsed().as_millis()
+        );
         return Ok(Json(LoginResponse {
             success: false,
             token: None,
@@ -168,7 +230,7 @@ async fn login(
     .await
     .map_err(|e| {
         error!("Database error checking OTP status: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        server_error_login_response()
     })?
     .flatten();
 
@@ -197,12 +259,17 @@ async fn login(
         )
         .map_err(|e| {
             error!("Failed to generate login token: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            server_error_login_response()
         })?;
 
         info!(
             "OTP required for user: {}, returning login token",
             user.email
+        );
+        info!(
+            duration_ms = start.elapsed().as_millis(),
+            "Login completed in {}ms (success=otp_required)",
+            start.elapsed().as_millis()
         );
         return Ok(Json(LoginResponse {
             success: false,
@@ -221,8 +288,13 @@ async fn login(
     let jwt_service = JwtService::new(state.config.jwt_secret.clone());
     let token = jwt_service
         .encode(user.id.to_string(), user.email.clone())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| server_error_login_response())?;
 
+    info!(
+        duration_ms = start.elapsed().as_millis(),
+        "Login completed in {}ms (success=true)",
+        start.elapsed().as_millis()
+    );
     Ok(Json(LoginResponse {
         success: true,
         token: Some(token),
@@ -361,8 +433,8 @@ async fn verify_otp_login(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let otp_secret: Option<String> = otp_row.try_get("secret").ok();
-    let backup_codes_json: Option<String> = otp_row.try_get("backup_codes").ok();
+    let otp_secret: Option<String> = otp_row.try_get("secret_encrypted").ok();
+    let backup_codes_json: Option<String> = otp_row.try_get("backup_codes_encrypted").ok();
 
     let secret = otp_secret.ok_or_else(|| {
         error!("OTP secret not found");

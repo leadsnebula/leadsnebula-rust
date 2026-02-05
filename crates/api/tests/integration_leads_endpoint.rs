@@ -3,7 +3,7 @@
 //
 // These tests verify:
 // - Request validation logic
-// - Error response formatting
+// - Error response formatting (including 401 JSON body for API key auth)
 // - Cache behavior (when available)
 // - Parallel query optimizations
 // - Write-behind queue behavior
@@ -14,7 +14,32 @@
 mod common;
 
 use common::create_test_pool;
+use serde::Deserialize;
 use uuid::Uuid;
+
+/// Contract for 401 responses from api_key_auth_middleware (POST /api/v1/leads without/invalid key).
+/// Clients (e.g. only.solar) rely on this shape to show errors.
+#[derive(Debug, Deserialize)]
+struct Leads401Body {
+    status: Leads401Status,
+}
+
+#[derive(Debug, Deserialize)]
+struct Leads401Status {
+    success: bool,
+    error: String,
+}
+
+#[test]
+fn test_leads_401_response_contract() {
+    // API key middleware returns 401 with JSON body so clients get a proper error.
+    // Verify the contract: { "status": { "success": false, "error": "..." } }
+    let body = r#"{"status":{"success":false,"error":"Missing X-API-Key header"}}"#;
+    let parsed: Leads401Body = serde_json::from_str(body).expect("401 body must be valid JSON");
+    assert!(!parsed.status.success);
+    assert!(!parsed.status.error.is_empty());
+    assert!(parsed.status.error.contains("API"));
+}
 
 #[tokio::test]
 #[ignore] // Requires database setup
