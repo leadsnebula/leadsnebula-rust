@@ -14,10 +14,12 @@ primary_region = "iad"
 [http_service]
   internal_port = 8080
   force_https = true
-  # Manual control only: machine stays up when started, stays off when stopped. No auto-stop, no auto-start.
+  # Production: keep one machine running so api.leadsnebula.com always responds.
+  # No auto-stop (machine stays up when idle). No auto-start (traffic does not wake stopped machines).
+  # To turn off: fly scale count 0 -a leadsnebula-rust. To turn on: fly scale count 1 then fly machine start <id>.
   auto_stop_machines = "off"
   auto_start_machines = false
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
 
   [[http_service.checks]]

@@ -8,8 +8,34 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
 use leadsnebula_core::models::publisher::Publisher;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct ApiErrorBody {
+    status: ApiErrorStatus,
+}
+
+#[derive(Serialize)]
+struct ApiErrorStatus {
+    success: bool,
+    error: String,
+}
+
+fn unauthorized_json(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ApiErrorBody {
+            status: ApiErrorStatus {
+                success: false,
+                error: message.to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
 
 pub async fn api_key_auth_middleware(
     State(state): State<AppState>,
@@ -26,7 +52,7 @@ pub async fn api_key_auth_middleware(
         Some(key) => key,
         None => {
             tracing::warn!("Missing X-API-Key header");
-            return StatusCode::UNAUTHORIZED.into_response();
+            return unauthorized_json("Missing X-API-Key header");
         }
     };
 
@@ -51,7 +77,7 @@ pub async fn api_key_auth_middleware(
             Ok(Some(p)) => p,
             Ok(None) => {
                 tracing::warn!("Invalid API key provided");
-                return StatusCode::UNAUTHORIZED.into_response();
+                return unauthorized_json("Invalid or unknown API key");
             }
             Err(e) => {
                 tracing::error!(
@@ -67,7 +93,7 @@ pub async fn api_key_auth_middleware(
             Ok(Some(p)) => p,
             Ok(None) => {
                 tracing::warn!("Invalid API key provided");
-                return StatusCode::UNAUTHORIZED.into_response();
+                return unauthorized_json("Invalid or unknown API key");
             }
             Err(e) => {
                 tracing::error!(
@@ -85,7 +111,7 @@ pub async fn api_key_auth_middleware(
             publisher.id,
             publisher.status
         );
-        return StatusCode::UNAUTHORIZED.into_response();
+        return unauthorized_json("Publisher account is not active");
     }
 
     // Record request (non-blocking, ignore errors)
