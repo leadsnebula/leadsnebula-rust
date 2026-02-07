@@ -190,6 +190,7 @@ impl SsmService {
                 warn!("SSM timeout for {} (first attempt), retrying...", path);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+                let cache_key = format!("{}:ssm:{}:{}", self.env, path, with_decryption);
                 let retry_future = self
                     .client
                     .get_parameter()
@@ -246,65 +247,8 @@ impl SsmService {
                         }
                         Ok(try_dev_encryption_fallback(path))
                     }
-                    Err(_) => {
-                        warn!(
-                            "SSM: {} timed out (using fallback if configured)",
-                            path.rsplit('/').next().unwrap_or(path)
-                        );
-                        Ok(try_dev_encryption_fallback(path))
-                    }
-                }
-            }
-            Err(_) => {
-                warn!(
-                    "SSM: {} slow to respond (retrying)",
-                    path.rsplit('/').next().unwrap_or(path)
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                let retry_future = self
-                    .client
-                    .get_parameter()
-                    .name(path)
-                    .with_decryption(with_decryption)
-                    .send();
-
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(retry_timeout_ms),
-                    retry_future,
-                )
-                .await
-                {
-                    Ok(Ok(response)) => {
-                        if let Some(param) = response.parameter() {
-                            let value = param.value().unwrap_or("").to_string();
-
-                            // Cache the value
-                            if let Some(redis) = &self.redis {
-                                let cache_key =
-                                    format!("{}:ssm:{}:{}", self.env, path, with_decryption);
-                                let ttl = if path.contains("/encryption/") {
-                                    604800
-                                } else {
-                                    86400
-                                };
-                                let _ = redis.set_with_ttl(&cache_key, &value, ttl).await;
-                            }
-
-                            Ok(Some(value))
-                        } else {
-                            Ok(try_dev_encryption_fallback(path))
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        warn!(
-                            "SSM: {} not available (using fallback if configured): {}",
-                            path.rsplit('/').next().unwrap_or(path),
-                            e
-                        );
-                        Ok(try_dev_encryption_fallback(path))
-                    }
-                    Err(_) => {
+                    _ => {
+                        // Timeout on retry (or other) - graceful fallback
                         warn!(
                             "SSM: {} timed out (using fallback if configured)",
                             path.rsplit('/').next().unwrap_or(path)

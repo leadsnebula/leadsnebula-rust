@@ -394,15 +394,6 @@ impl AppConfig {
             from_email,
         })
     }
-
-    /// Strip connection params that sqlx doesn't support (e.g. channel_binding) to avoid noisy warnings.
-    fn sanitize_database_url(url: &str) -> String {
-        let mut u = url.to_string();
-        u = u.replace("&channel_binding=require", "");
-        u = u.replace("?channel_binding=require&", "?");
-        u = u.replace("?channel_binding=require", "");
-        u
-    }
 }
 
 impl AppState {
