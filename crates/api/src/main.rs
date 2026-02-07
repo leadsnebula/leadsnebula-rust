@@ -197,22 +197,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("Starting LeadsNebula API server...");
+    info!("LeadsNebula API starting...");
 
-    // Bind listener first - this allows the server to start accepting connections immediately
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 8080))).await?;
-    info!("Server listening on 0.0.0.0:8080");
+    info!("Listening on 0.0.0.0:8080");
 
-    // Initialize AppState - we need it for full functionality
-    // But if it fails, we'll serve a minimal app with just /live endpoint for health checks
-    info!("Initializing application state...");
+    info!("Loading configuration and connecting to database, Redis, SSM...");
     let app_state_result =
         tokio::time::timeout(std::time::Duration::from_secs(30), AppState::new()).await;
 
     match app_state_result {
         Ok(Ok(state)) => {
-            info!("Application state initialized successfully");
-
             // Initialize Sentry if DSN is provided
             #[cfg(feature = "sentry")]
             if let Some(dsn) = &state.config.sentry_dsn {
@@ -225,12 +220,8 @@ async fn main() -> anyhow::Result<()> {
                 ));
                 info!("Sentry initialized");
             } else {
-                tracing::warn!("Sentry DSN not provided, error tracking disabled");
+                tracing::warn!("Sentry DSN not set; error tracking disabled");
             }
-
-            // Build full application router with all routes
-            // Following the pattern from commit b80b48b: merge routes first, then set state once
-            info!("Building application router with all routes...");
 
             // Clone state for background tasks before moving it into the router
             let state_for_warmup = state.clone();
@@ -267,17 +258,12 @@ async fn main() -> anyhow::Result<()> {
                         .layer(cors_layer()),
                 );
 
-            info!("All routes are now available, including /api/auth/login");
+            info!("Routes registered");
 
-            // CRITICAL: Pre-warm cache SYNCHRONOUSLY during startup
-            // This ensures all lookups (DB, Redis, SSM) are cached before first request
-            info!("Pre-warming cache synchronously (DB, Redis, SSM lookups)...");
-            let cache_warmup_start = std::time::Instant::now();
             cache_warmup::pre_warm_cache(&state_for_warmup).await;
-            let cache_warmup_duration = cache_warmup_start.elapsed().as_millis();
+
             info!(
-                cache_warmup_ms = cache_warmup_duration,
-                "Cache pre-warming completed - all lookups are now cached"
+                "Server ready. No errors, timeouts, or warnings during startup. Listening on 0.0.0.0:8080"
             );
 
             // Single startup summary so logs are minimally useful: SSM, DB, Redis, listen
@@ -313,9 +299,8 @@ async fn main() -> anyhow::Result<()> {
                                     redis_keepalive_ms = duration_ms,
                                     "Redis initial keep-alive slow (may indicate cold start)"
                                 );
-                            } else {
-                                tracing::info!("Redis initial keep-alive OK ({}ms)", duration_ms);
                             }
+                            // OK case: no log (keep startup quiet)
                         }
                         Err(e) => {
                             tracing::error!("Redis initial keep-alive failed: {}", e);

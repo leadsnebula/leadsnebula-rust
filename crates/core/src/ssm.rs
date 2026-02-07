@@ -235,10 +235,10 @@ impl SsmService {
                         }
                     }
                     Ok(Err(e)) => {
-                        // Second failure - graceful fallback
                         warn!(
-                            "SSM failed after retry for {}: {}, returning None as fallback",
-                            path, e
+                            "SSM: {} not available (using fallback if configured): {}",
+                            path.rsplit('/').next().unwrap_or(path),
+                            e
                         );
                         if let Some(redis) = &self.redis {
                             let _ = redis
@@ -250,8 +250,8 @@ impl SsmService {
                     _ => {
                         // Timeout on retry (or other) - graceful fallback
                         warn!(
-                            "SSM timeout after retry for {}, returning None as fallback",
-                            path
+                            "SSM: {} timed out (using fallback if configured)",
+                            path.rsplit('/').next().unwrap_or(path)
                         );
                         if let Some(redis) = &self.redis {
                             let _ = redis
