@@ -1,5 +1,12 @@
 # Cargo-deny configuration file
-# This file configures license checking for the Rust project
+# This file configures license checking and advisory checks for the Rust project
+
+[advisories]
+# time 0.3.45: RUSTSEC-2026-0009 (Denial of Service via Stack Exhaustion)
+# Transitive dependency; no patched version available yet. Low risk for server backend.
+ignore = [
+    { id = "RUSTSEC-2026-0009", reason = "time crate transitive dep; DoS via stack exhaustion low risk for our use" },
+]
 
 [licenses]
 # Version 2: use new config format (removes deprecated keys)
