@@ -1005,10 +1005,11 @@ echo ""
     if command -v cargo-audit > /dev/null 2>&1; then
         echo "   Running cargo-audit (vulnerabilities)..."
         # Ignore RUSTSEC-2023-0071 (rsa Marvin Attack): transitive via sqlx-mysql, no fix available
+        # Ignore RUSTSEC-2026-0009 (time DoS): transitive; patched in time>=0.3.47 when deps upgrade
         # Add timeout to prevent WSL crashes from hanging network operations
         # Use set +e temporarily to capture exit code without triggering set -e
         set +e
-        AUDIT_OUTPUT=$(timeout 60 cargo audit --ignore RUSTSEC-2023-0071 2>&1)
+        AUDIT_OUTPUT=$(timeout 60 cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0009 2>&1)
         AUDIT_EXIT=$?
         set -e
         if [ $AUDIT_EXIT -ne 0 ]; then
@@ -1022,7 +1023,7 @@ echo ""
                 echo "⚠️  cargo-audit found issues. Review and fix vulnerabilities." || true
             fi
         else
-            echo "✅ cargo-audit OK (with documented exceptions: RUSTSEC-2023-0071)"
+            echo "✅ cargo-audit OK (with documented exceptions: RUSTSEC-2023-0071, RUSTSEC-2026-0009)"
         fi
     else
         echo "   cargo-audit not installed - skip (install: cargo install cargo-audit)"

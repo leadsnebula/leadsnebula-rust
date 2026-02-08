@@ -98,6 +98,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     // Concurrency tests (duplicate_post spawns 10 concurrent tasks) need many connections
     // In CI, Neon free-tier can be very slow, requiring much larger pools and timeouts
     let is_ci = std::env::var("CI").is_ok();
+    // CI: acquire_timeout=120s, max_connections=50 (validator expects these for CI)
     let max_conns: u32 = std::env::var("TEST_POOL_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse().ok())

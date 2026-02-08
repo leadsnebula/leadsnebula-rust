@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Extension, Path, Request, State},
     http::StatusCode,
     response::Json,
     routing::{delete, get, post, put},
@@ -19,9 +19,14 @@ use crate::AppState;
 
 /// Resolve WebAuthn RP ID and origin. In non-development, uses the request's Origin header
 /// when present and valid (HTTPS, host matches our domain) so dev.dashboard.leadsnebula.com works.
+///
+/// When `use_host_as_rp_id` is true, uses the origin's host as rp_id (host-bound) for passkey
+/// managers that reject parent-domain rpId (e.g. Proton Pass). When false, uses parent-domain rpId
+/// so passkeys work across subdomains.
 fn webauthn_rp_id_and_origin(
     environment: &str,
     headers: &axum::http::HeaderMap,
+    use_host_as_rp_id: bool,
 ) -> Result<(String, String), StatusCode> {
     let origin_header_str = headers
         .get("origin")
@@ -65,18 +70,41 @@ fn webauthn_rp_id_and_origin(
             (fallback_o, rp_id)
         }
     } else {
-        // Use request Origin when present and valid (HTTPS, host is our domain or subdomain)
+        // Use request Origin when present and valid (HTTPS, host is our domain or subdomain).
         let fallback_origin = format!("https://{}", rp_id);
         let origin_header = origin_header_str;
         if origin_header.is_empty() {
+            tracing::info!(
+                "Passkey: no Origin header received (possible proxy stripping). Using fallback origin={}",
+                fallback_origin
+            );
             (fallback_origin, rp_id.clone())
         } else if let Ok(url) = url::Url::parse(origin_header) {
             let scheme_ok = url.scheme() == "https";
             let host = url.host_str().unwrap_or("");
             let host_matches = host == rp_id || host.ends_with(&format!(".{}", rp_id));
             if scheme_ok && host_matches {
-                (origin_header.to_string(), rp_id)
+                // Parent-domain: rp_id stays as leadsnebula.com so passkeys work across subdomains.
+                // Host-bound: use exact host for passkey managers that reject parent-domain (e.g. Proton Pass).
+                let effective_rp_id = if use_host_as_rp_id {
+                    host.to_string()
+                } else {
+                    rp_id.clone()
+                };
+                tracing::info!(
+                    "Passkey: origin={} rp_id={} (use_host_as_rp_id={})",
+                    origin_header,
+                    effective_rp_id,
+                    use_host_as_rp_id
+                );
+                (origin_header.to_string(), effective_rp_id)
             } else {
+                tracing::warn!(
+                    "Passkey: origin {} invalid (scheme_ok={} host_matches={}). Using fallback.",
+                    origin_header,
+                    scheme_ok,
+                    host_matches
+                );
                 (fallback_origin, rp_id)
             }
         } else {
@@ -198,6 +226,10 @@ pub fn dashboard_routes() -> Router<AppState> {
             "/api/v1/dashboard/publishers/:id/generate-hmac-secret_encrypted",
             post(generate_publisher_hmac_secret_encrypted),
         )
+        .route(
+            "/api/v1/dashboard/publishers/:publisher_id/audit_logs",
+            get(list_publisher_audit_logs),
+        )
         .route("/api/v1/dashboard/buyers", get(list_buyers))
         .route("/api/v1/dashboard/buyers", post(create_buyer))
         .route("/api/v1/dashboard/buyers/:id", get(get_buyer))
@@ -290,6 +322,7 @@ pub fn dashboard_routes() -> Router<AppState> {
         )
         .route("/api/security/passkeys/register", post(register_passkey))
         .route("/api/security/passkeys/:id", delete(delete_passkey))
+        .route("/api/security/audit_logs", get(list_security_audit_logs))
 }
 
 // Security API
@@ -387,6 +420,77 @@ async fn get_security_status(
         "success": true,
         "otp_enabled": otp_enabled.unwrap_or(false),
         "passkeys": passkeys
+    })))
+}
+
+async fn list_security_audit_logs(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use leadsnebula_core::auth::JwtService;
+    use sqlx::Row;
+    use tracing::error;
+    use uuid::Uuid;
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let user_id = Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let logs = sqlx::query(
+        r#"
+        SELECT al.id, al.action_type, al.details, al.created_at, al.updated_at,
+               u.email as user_email, u.first_name as user_first_name, u.last_name as user_last_name
+        FROM audit_logs al
+        LEFT JOIN instance_users u ON al.instance_user_id = u.id
+        WHERE al.instance_user_id = $1
+          AND al.action_type IN ('otp_enabled', 'otp_disabled', 'passkey_registered', 'passkey_deleted')
+        ORDER BY al.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing security audit logs: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let audit_logs: Vec<serde_json::Value> = logs
+        .iter()
+        .map(|row| {
+            let user_name = match (
+                row.try_get::<Option<String>, _>("user_first_name").ok().flatten(),
+                row.try_get::<Option<String>, _>("user_last_name").ok().flatten(),
+            ) {
+                (Some(first), Some(last)) if !first.is_empty() || !last.is_empty() => {
+                    format!("{} {}", first, last).trim().to_string()
+                }
+                _ => row.try_get::<Option<String>, _>("user_email").ok().flatten().unwrap_or_else(|| "Unknown".to_string()),
+            };
+            let details_value = row.try_get::<serde_json::Value, _>("details").ok().unwrap_or_else(|| serde_json::json!({}));
+            serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").ok(),
+                "action_type": row.try_get::<String, _>("action_type").ok(),
+                "user": user_name,
+                "details": details_value,
+                "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok().map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "audit_logs": audit_logs
     })))
 }
 
@@ -598,6 +702,55 @@ async fn verify_otp(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    if let Some(instance_id) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten()
+    {
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "otp_enabled",
+            "target_type": "Security",
+            "target_id": user.id.to_string(),
+            "target_name": user.email,
+            "context": { "reason": "User enabled OTP 2FA", "request_id": request_id, "ip_address": ip_address, "user_agent": user_agent, "method": "POST", "endpoint": "/api/security/otp/verify", "source": "dashboard_web_ui" },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            Some(instance_id),
+            Some(user.id),
+            "otp_enabled",
+            Some("Security"),
+            Some(user.id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
+
     Ok(Json(serde_json::json!({
         "success": true,
         "backup_codes_encrypted": backup_codes_encrypted
@@ -668,6 +821,55 @@ async fn disable_otp(
         error!("Database error disabling OTP: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    if let Some(instance_id) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(user.id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten()
+    {
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "otp_disabled",
+            "target_type": "Security",
+            "target_id": user.id.to_string(),
+            "target_name": user.email,
+            "context": { "reason": "User disabled OTP 2FA", "request_id": request_id, "ip_address": ip_address, "user_agent": user_agent, "method": "POST", "endpoint": "/api/security/otp/disable", "source": "dashboard_web_ui" },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            Some(instance_id),
+            Some(user.id),
+            "otp_disabled",
+            Some("Security"),
+            Some(user.id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -748,7 +950,11 @@ async fn passkey_registration_options(
 
     #[cfg(feature = "webauthn")]
     {
-        let (rp_id, origin) = webauthn_rp_id_and_origin(&state.config.environment, &headers)?;
+        let use_host_as_rp_id = std::env::var("WEBAUTHN_USE_HOST_AS_RP_ID")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let (rp_id, origin) =
+            webauthn_rp_id_and_origin(&state.config.environment, &headers, use_host_as_rp_id)?;
 
         // Create WebAuthn instance. The url crate treats "localhost" as no host, so
         // rp_origin.domain() is None and webauthn-rs returns Configuration. Use a
@@ -885,11 +1091,31 @@ async fn passkey_registration_options(
             options_json
         };
 
-        Ok(Json(serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
             "options": transformed_options,
             "challenge_token": challenge_token
-        })))
+        });
+        // Include WebAuthn debug info when X-Debug-Webauthn: 1 to verify Origin header
+        if headers
+            .get("x-debug-webauthn")
+            .and_then(|h| h.to_str().ok())
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert(
+                    "webauthn_debug".to_string(),
+                    serde_json::json!({
+                        "origin_received": headers.get("origin").and_then(|h| h.to_str().ok()).unwrap_or("(no Origin header)"),
+                        "rp_id": rp_id,
+                        "origin_used": origin,
+                        "use_host_as_rp_id": use_host_as_rp_id
+                    }),
+                );
+            }
+        }
+        Ok(Json(response))
     }
 
     #[cfg(not(feature = "webauthn"))]
@@ -987,7 +1213,11 @@ async fn register_passkey(
                 StatusCode::BAD_REQUEST
             })?;
 
-        let (rp_id, origin) = webauthn_rp_id_and_origin(&state.config.environment, &headers)?;
+        let use_host_as_rp_id = std::env::var("WEBAUTHN_USE_HOST_AS_RP_ID")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let (rp_id, origin) =
+            webauthn_rp_id_and_origin(&state.config.environment, &headers, use_host_as_rp_id)?;
 
         // Create WebAuthn instance (same rp_id/origin as registration_options; localhost workaround as in passkey_registration_options)
         let url = url::Url::parse(&origin).map_err(|e| {
@@ -1118,6 +1348,55 @@ async fn register_passkey(
             let _ = redis.delete(&cache_key).await;
         }
 
+        if let Some(instance_id) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user.id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten()
+        {
+            let ip_address = headers
+                .get("x-forwarded-for")
+                .or_else(|| headers.get("x-real-ip"))
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+            let user_agent = headers
+                .get("user-agent")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
+            let request_id = headers
+                .get("x-request-id")
+                .or_else(|| headers.get("x-correlation-id"))
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let audit_details = serde_json::json!({
+                "action": "passkey_registered",
+                "target_type": "Security",
+                "target_id": user.id.to_string(),
+                "target_name": payload.name,
+                "context": { "reason": "User registered passkey", "request_id": request_id, "ip_address": ip_address, "user_agent": user_agent, "method": "POST", "endpoint": "/api/security/passkeys/register", "source": "dashboard_web_ui" },
+                "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+                "outcome": "success",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+            let _ = create_audit_log(
+                state.db_pool.as_ref(),
+                Some(instance_id),
+                Some(user.id),
+                "passkey_registered",
+                Some("Security"),
+                Some(user.id),
+                audit_details,
+                serde_json::json!({}),
+                ip_address.as_deref(),
+                user_agent.as_deref(),
+            )
+            .await;
+        }
+
         Ok(Json(serde_json::json!({
             "success": true,
             "passkey": {
@@ -1177,6 +1456,55 @@ async fn delete_passkey(
             "success": false,
             "error": "Passkey not found or you do not have permission to delete it."
         })));
+    }
+
+    if let Some(instance_id) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten()
+    {
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "passkey_deleted",
+            "target_type": "Security",
+            "target_id": user_id.to_string(),
+            "target_name": passkey_id,
+            "context": { "reason": "User deleted passkey", "request_id": request_id, "ip_address": ip_address, "user_agent": user_agent, "method": "DELETE", "endpoint": format!("/api/security/passkeys/{}", passkey_id), "source": "dashboard_web_ui" },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            Some(instance_id),
+            Some(user_id),
+            "passkey_deleted",
+            Some("Security"),
+            Some(user_id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
     }
 
     Ok(Json(serde_json::json!({
@@ -1343,6 +1671,8 @@ async fn list_publishers(
 
 async fn create_publisher(
     State(state): State<AppState>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<CreatePublisherRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use leadsnebula_core::encryption::EncryptionService;
@@ -1487,6 +1817,64 @@ async fn create_publisher(
         }
     }
 
+    {
+        let instance_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user.id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "create",
+            "target_type": "Publisher",
+            "target_id": publisher_id.to_string(),
+            "target_name": payload.name,
+            "context": {
+                "reason": "User created publisher via dashboard",
+                "request_id": request_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "method": "POST",
+                "endpoint": "/api/v1/dashboard/publishers",
+                "source": "dashboard_web_ui"
+            },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "after": { "name": payload.name, "email": payload.email, "status": "active" }
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            instance_id,
+            Some(user.id),
+            "publisher_created",
+            Some("Publisher"),
+            Some(publisher_id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
+
     Ok(Json(serde_json::json!({
         "success": true,
         "publisher": {
@@ -1570,9 +1958,27 @@ async fn get_publisher(
 async fn update_publisher(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<UpdatePublisherRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::error;
+
+    let publisher_before = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error fetching publisher: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let publisher_before = match &publisher_before {
+        Some(p) => p,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
 
     // Build update query dynamically
     let mut query_builder = sqlx::QueryBuilder::new("UPDATE publishers SET ");
@@ -1666,6 +2072,103 @@ async fn update_publisher(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let publisher_after = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(after) = publisher_after {
+        let instance_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user.id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let before_json = serde_json::json!({
+            "name": publisher_before.name,
+            "email": publisher_before.email,
+            "status": publisher_before.status,
+            "representative_first_name": publisher_before.representative_first_name,
+            "representative_last_name": publisher_before.representative_last_name,
+            "address_street": publisher_before.address_street,
+            "address_city": publisher_before.address_city,
+            "address_state": publisher_before.address_state,
+            "address_zip": publisher_before.address_zip,
+            "timezone": publisher_before.timezone,
+            "ein_tin": publisher_before.ein_tin,
+            "hmac_required": publisher_before.hmac_required,
+        });
+        let after_json = serde_json::json!({
+            "name": after.name,
+            "email": after.email,
+            "status": after.status,
+            "representative_first_name": after.representative_first_name,
+            "representative_last_name": after.representative_last_name,
+            "address_street": after.address_street,
+            "address_city": after.address_city,
+            "address_state": after.address_state,
+            "address_zip": after.address_zip,
+            "timezone": after.timezone,
+            "ein_tin": after.ein_tin,
+            "hmac_required": after.hmac_required,
+        });
+        let audit_details = serde_json::json!({
+            "action": "update",
+            "target_type": "Publisher",
+            "target_id": id.to_string(),
+            "target_name": after.name,
+            "actor": { "id": user.id.to_string(), "email": user.email },
+            "before": before_json,
+            "after": after_json,
+            "context": {
+                "reason": "User updated publisher via dashboard",
+                "request_id": request_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "method": "POST",
+                "endpoint": format!("/api/v1/dashboard/publishers/{}", id),
+                "source": "dashboard_web_ui"
+            },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            instance_id,
+            Some(user.id),
+            "publisher_updated",
+            Some("Publisher"),
+            Some(id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
+
     Ok(Json(serde_json::json!({
         "success": true,
         "message": "Publisher updated successfully"
@@ -1675,12 +2178,80 @@ async fn update_publisher(
 async fn delete_publisher(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let publisher_before = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+        "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     sqlx::query("UPDATE publishers SET deleted_at = NOW() WHERE id = $1")
         .bind(id)
         .execute(state.db_pool.as_ref())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(pub_before) = publisher_before {
+        let instance_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user.id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "delete",
+            "target_type": "Publisher",
+            "target_id": id.to_string(),
+            "target_name": pub_before.name,
+            "context": {
+                "reason": "User deleted publisher via dashboard",
+                "request_id": request_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "method": "DELETE",
+                "endpoint": format!("/api/v1/dashboard/publishers/{}", id),
+                "source": "dashboard_web_ui"
+            },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "before": { "name": pub_before.name, "email": pub_before.email }
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            instance_id,
+            Some(user.id),
+            "publisher_deleted",
+            Some("Publisher"),
+            Some(id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1691,6 +2262,8 @@ async fn delete_publisher(
 async fn regenerate_publisher_api_key(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use leadsnebula_core::encryption::EncryptionService;
     use rand::Rng;
@@ -1698,7 +2271,7 @@ async fn regenerate_publisher_api_key(
     use tracing::error;
 
     // Verify publisher exists
-    let _publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+    let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
         "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
@@ -1745,6 +2318,63 @@ async fn regenerate_publisher_api_key(
         error!("Database error updating API key: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    {
+        let instance_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user.id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "api_key_rotated",
+            "target_type": "Publisher",
+            "target_id": id.to_string(),
+            "target_name": publisher.name,
+            "context": {
+                "reason": "User regenerated API key via dashboard",
+                "request_id": request_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "method": "POST",
+                "endpoint": format!("/api/v1/dashboard/publishers/{}/regenerate-api-key", id),
+                "source": "dashboard_web_ui"
+            },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            instance_id,
+            Some(user.id),
+            "publisher_api_key_rotated",
+            Some("Publisher"),
+            Some(id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1826,13 +2456,15 @@ async fn get_publisher_api_key(
 async fn generate_publisher_hmac_secret_encrypted(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use rand::Rng;
     use sha2::{Digest, Sha256};
     use tracing::error;
 
     // Verify publisher exists
-    let _publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
+    let publisher = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
         "SELECT * FROM publishers WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
@@ -1869,6 +2501,63 @@ async fn generate_publisher_hmac_secret_encrypted(
         error!("Database error updating HMAC secret_encrypted: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    {
+        let instance_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user.id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+        let ip_address = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let request_id = headers
+            .get("x-request-id")
+            .or_else(|| headers.get("x-correlation-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let audit_details = serde_json::json!({
+            "action": "hmac_secret_generated",
+            "target_type": "Publisher",
+            "target_id": id.to_string(),
+            "target_name": publisher.name,
+            "context": {
+                "reason": "User generated HMAC secret via dashboard",
+                "request_id": request_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "method": "POST",
+                "endpoint": format!("/api/v1/dashboard/publishers/{}/generate-hmac-secret_encrypted", id),
+                "source": "dashboard_web_ui"
+            },
+            "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+            "outcome": "success",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let _ = create_audit_log(
+            state.db_pool.as_ref(),
+            instance_id,
+            Some(user.id),
+            "publisher_hmac_secret_generated",
+            Some("Publisher"),
+            Some(id),
+            audit_details,
+            serde_json::json!({}),
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -5592,6 +6281,78 @@ async fn load_zip_codes_from_tables(
 }
 
 // Audit Log API
+async fn list_publisher_audit_logs(
+    State(state): State<AppState>,
+    Path(publisher_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use sqlx::Row;
+    use tracing::error;
+
+    let logs = sqlx::query(
+        r#"
+        SELECT 
+            al.id,
+            al.instance_id,
+            al.instance_user_id,
+            al.action_type,
+            al.resource_type,
+            al.resource_id,
+            al.details,
+            al.affected_resources,
+            al.ip_address,
+            al.user_agent,
+            al.created_at,
+            al.updated_at,
+            u.email as user_email,
+            u.first_name as user_first_name,
+            u.last_name as user_last_name
+        FROM audit_logs al
+        LEFT JOIN instance_users u ON al.instance_user_id = u.id
+        WHERE al.resource_type = 'Publisher' AND al.resource_id = $1
+        ORDER BY al.created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .bind(publisher_id)
+    .fetch_all(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error listing publisher audit logs: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let audit_logs: Vec<serde_json::Value> = logs
+        .iter()
+        .map(|row| {
+            let user_name = match (
+                row.try_get::<Option<String>, _>("user_first_name").ok().flatten(),
+                row.try_get::<Option<String>, _>("user_last_name").ok().flatten(),
+            ) {
+                (Some(first), Some(last)) if !first.is_empty() || !last.is_empty() => {
+                    format!("{} {}", first, last).trim().to_string()
+                }
+                _ => row.try_get::<Option<String>, _>("user_email").ok().flatten().unwrap_or_else(|| "Unknown".to_string()),
+            };
+
+            let details_value = row.try_get::<serde_json::Value, _>("details").ok().unwrap_or_else(|| serde_json::json!({}));
+
+            serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id").ok(),
+                "action_type": row.try_get::<String, _>("action_type").ok(),
+                "user": user_name,
+                "details": details_value,
+                "affected_resources": row.try_get::<serde_json::Value, _>("affected_resources").ok().unwrap_or_else(|| serde_json::json!({})),
+                "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok().map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "audit_logs": audit_logs
+    })))
+}
+
 async fn list_buyer_audit_logs(
     State(state): State<AppState>,
     Path(buyer_id): Path<Uuid>,
@@ -5932,6 +6693,7 @@ async fn list_leads(
                 l.ping_id,
                 l.post_id,
                 l.vertical_id,
+                l.vertical_data,
                 v.slug as vertical_slug,
                 v.name as vertical_name,
                 p.name as publisher_name,
@@ -5987,6 +6749,7 @@ async fn list_leads(
                 l.ping_id,
                 l.post_id,
                 l.vertical_id,
+                l.vertical_data,
                 v.slug as vertical_slug,
                 v.name as vertical_name,
                 p.name as publisher_name,
@@ -6101,6 +6864,22 @@ async fn list_leads(
             .ok()
             .flatten();
 
+        // Extract auction_timing from vertical_data (post_ms, total_ms from AtomicAuctionTiming)
+        let auction_timing: Option<serde_json::Value> = row
+            .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("vertical_data")
+            .ok()
+            .flatten()
+            .and_then(|j| j.0.get("auction_timing").cloned());
+
+        let post_ms: Option<f64> = auction_timing
+            .as_ref()
+            .and_then(|at| at.get("post_ms"))
+            .and_then(|v| v.as_f64());
+        let total_ms: Option<f64> = auction_timing
+            .as_ref()
+            .and_then(|at| at.get("total_ms"))
+            .and_then(|v| v.as_f64());
+
         // Fetch price from post_payloads
         let price: Option<f64> = row.try_get::<Option<f64>, _>("price").ok().flatten();
 
@@ -6141,6 +6920,7 @@ async fn list_leads(
             "price": price,
             "submitted_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("submitted_at").ok().flatten().map(|d| d.to_rfc3339()),
             "processing_time_ms": processing_time_ms,
+            "auction_timing": if post_ms.is_some() || total_ms.is_some() { serde_json::json!({ "post_ms": post_ms, "total_ms": total_ms }) } else { serde_json::Value::Null },
             "publisher_name": row.try_get::<Option<String>, _>("publisher_name").ok().flatten(),
             "buyer_name": row.try_get::<Option<String>, _>("buyer_name").ok().flatten(),
             // PII and payloads are NOT included - loaded lazily via /leads/:id/details endpoint
@@ -6860,11 +7640,12 @@ async fn get_lead_details(
         .ok()
         .flatten();
 
-    // Extract auction_timing from vertical_data (post_ms, total_ms from AtomicAuctionTiming)
+    // Extract full vertical_data (auction_timing + verbose for gear modal / compliance)
     let vertical_data: Option<sqlx::types::Json<serde_json::Value>> = lead_row
         .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("vertical_data")
         .ok()
         .flatten();
+    let vertical_data_value = vertical_data.as_ref().map(|j| j.0.clone());
     let auction_timing: Option<serde_json::Value> = vertical_data
         .as_ref()
         .and_then(|j| j.0.get("auction_timing").cloned());
@@ -6905,6 +7686,7 @@ async fn get_lead_details(
                 "post_ms": post_ms,
                 "total_ms": total_ms,
             }),
+            "vertical_data": vertical_data_value,
         },
     });
 

@@ -3,7 +3,7 @@
 
 use axum::{
     extract::{Extension, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::post,
     Router,
@@ -162,10 +162,89 @@ pub fn leads_routes() -> Router<AppState> {
     Router::new().route("/api/v1/leads", post(create_lead))
 }
 
+/// Extract request context for compliance/verbose (ISO 27001, SOC 2, NIST).
+/// Caller can pass ip_address from lead PII if already decrypted, or None.
+#[allow(clippy::too_many_arguments)]
+fn request_context_from_headers(
+    headers: &HeaderMap,
+    endpoint: &str,
+    method: &str,
+    reason: &str,
+    source: &str,
+    outcome: &str,
+    target_type: &str,
+    target_id: &str,
+    action: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let ip_address = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+    let ip_address_v4 = headers
+        .get("x-client-ipv4")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim().to_string());
+    let ip_address_v6 = headers
+        .get("x-client-ipv6")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim().to_string());
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let request_id = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("x-correlation-id"))
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = headers
+        .get("x-session-id")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let referer = headers
+        .get("referer")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let mut context = serde_json::Map::new();
+    context.insert("endpoint".to_string(), serde_json::json!(endpoint));
+    context.insert("method".to_string(), serde_json::json!(method));
+    context.insert("reason".to_string(), serde_json::json!(reason));
+    context.insert("source".to_string(), serde_json::json!(source));
+    context.insert("request_id".to_string(), serde_json::json!(request_id));
+    context.insert("ip_address".to_string(), serde_json::json!(ip_address));
+    if ip_address_v4.is_some() || ip_address_v6.is_some() {
+        context.insert(
+            "ip_address_v4".to_string(),
+            serde_json::json!(ip_address_v4),
+        );
+        context.insert(
+            "ip_address_v6".to_string(),
+            serde_json::json!(ip_address_v6),
+        );
+    }
+    context.insert("user_agent".to_string(), serde_json::json!(user_agent));
+    context.insert("referer".to_string(), serde_json::json!(referer));
+    context.insert("session_id".to_string(), serde_json::json!(session_id));
+    serde_json::json!({
+        "context": serde_json::Value::Object(context),
+        "compliance": { "standard": "ISO_27001_SOC2_NIST", "version": "2024" },
+        "outcome": outcome,
+        "timestamp": timestamp.to_rfc3339(),
+        "target_type": target_type,
+        "target_id": target_id,
+        "target_name": serde_json::Value::Null,
+        "action": action
+    })
+}
+
 async fn create_lead(
     State(state): State<AppState>,
     Extension(publisher): Extension<Publisher>,
     Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
     Json(payload): Json<LeadRequest>,
 ) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
     // BLAME-SHIFTING: Track total wall-clock time from request start
@@ -1005,6 +1084,81 @@ async fn create_lead(
                 // Encryption of buyer_responses moved to background job/cron - spawn overhead eliminated
                 // If encryption is needed, it should be handled by a separate background task or write-behind queue
 
+                // Build auction_timing with TRUE total wall time (lead arrival → final result)
+                // For POST: timing only covers this request; use (now - lead.created_at) for real total
+                let pre_checks_ms = timing.get_pre_checks_ms();
+                let post_ms = timing.get_post_sent_ms();
+                let db_operations_ms = metrics.get_total_query_time_ms();
+                let total_wall_ms = chrono::Utc::now()
+                    .signed_duration_since(lead.created_at)
+                    .num_milliseconds()
+                    .clamp(0, i64::MAX) as u64;
+                let mut auction_timing_base = serde_json::Map::new();
+                auction_timing_base.insert("request_type".to_string(), serde_json::json!("post"));
+                auction_timing_base.insert(
+                    "pre_checks_ms".to_string(),
+                    serde_json::json!(pre_checks_ms),
+                );
+                auction_timing_base.insert("post_ms".to_string(), serde_json::json!(post_ms));
+                auction_timing_base.insert(
+                    "db_operations_ms".to_string(),
+                    serde_json::json!(db_operations_ms),
+                );
+                auction_timing_base
+                    .insert("total_ms".to_string(), serde_json::json!(total_wall_ms));
+                let outcome_str = if routing_result.success && routing_result.status == "sold" {
+                    "success"
+                } else {
+                    "failure"
+                };
+                let verbose_obj = request_context_from_headers(
+                    &headers,
+                    "/api/v1/leads",
+                    "POST",
+                    "Lead post (buyer post)",
+                    "carina_api",
+                    outcome_str,
+                    "Lead",
+                    &lead.uuid.to_string(),
+                    "post",
+                    chrono::Utc::now(),
+                );
+                let mut verbose_map = verbose_obj.as_object().cloned().unwrap_or_default();
+                let mut processing_times = serde_json::Map::new();
+                processing_times.insert(
+                    "pre_checks_ms".to_string(),
+                    serde_json::json!(pre_checks_ms),
+                );
+                processing_times.insert("post_ms".to_string(), serde_json::json!(post_ms));
+                processing_times.insert(
+                    "db_operations_ms".to_string(),
+                    serde_json::json!(db_operations_ms),
+                );
+                processing_times.insert("total_ms".to_string(), serde_json::json!(total_wall_ms));
+                verbose_map.insert(
+                    "processing_times".to_string(),
+                    serde_json::Value::Object(processing_times),
+                );
+                let auction_timing_data = serde_json::json!({
+                    "auction_timing": serde_json::Value::Object(auction_timing_base),
+                    "verbose": serde_json::Value::Object(verbose_map)
+                });
+                // Merge auction_timing + verbose into existing vertical_data if present
+                let vertical_data_to_store = if let Some(obj) = lead.vertical_data.as_object() {
+                    let mut merged = obj.clone();
+                    merged.insert(
+                        "auction_timing".to_string(),
+                        auction_timing_data["auction_timing"].clone(),
+                    );
+                    merged.insert(
+                        "verbose".to_string(),
+                        auction_timing_data["verbose"].clone(),
+                    );
+                    serde_json::Value::Object(merged)
+                } else {
+                    auction_timing_data
+                };
+
                 // Update lead final state via write-behind queue (decoupled from critical path)
                 if routing_result.success && routing_result.status == "sold" {
                     // Set final post_id and mark sold only if our in-progress token is still present
@@ -1019,7 +1173,7 @@ async fn create_lead(
                             post_id: routing_result.post_id.clone(),
                             sold_at: true,
                             inprog_token: Some(inprog_token.clone()),
-                            vertical_data: None,
+                            vertical_data: Some(vertical_data_to_store),
                         },
                     );
                 } else {
@@ -1035,7 +1189,7 @@ async fn create_lead(
                             post_id: Some("".to_string()),
                             sold_at: false,
                             inprog_token: Some(inprog_token.clone()),
-                            vertical_data: None,
+                            vertical_data: Some(vertical_data_to_store),
                         },
                     );
                 }
@@ -2363,22 +2517,32 @@ async fn create_lead(
             metrics_arc.log_summary("carina");
 
             // Single-line auction duration summary (informative only)
+            let pre_checks_ms = timing_arc.get_pre_checks_ms();
             let ping_auction_ms = timing_arc.get_ping_auction_ms();
+            let qualification_ms = timing_arc.get_qualification_ms();
             let post_sent_ms = timing_arc.get_post_sent_ms();
             let total_ms = timing_arc.get_total_ms();
 
             // Store auction timing in vertical_data for frontend reporting
-            // Include per-buyer timings for detailed analysis
+            // Include per-buyer timings and all processing times for verbose/compliance
             let mut auction_timing_base = serde_json::Map::new();
             auction_timing_base.insert("request_type".to_string(), serde_json::json!(request_type));
+            auction_timing_base.insert(
+                "pre_checks_ms".to_string(),
+                serde_json::json!(pre_checks_ms),
+            );
             auction_timing_base.insert(
                 "ping_auction_ms".to_string(),
                 serde_json::json!(ping_auction_ms),
             );
+            auction_timing_base.insert(
+                "qualification_ms".to_string(),
+                serde_json::json!(qualification_ms),
+            );
             auction_timing_base.insert("post_ms".to_string(), serde_json::json!(post_sent_ms));
             auction_timing_base.insert("total_ms".to_string(), serde_json::json!(total_ms));
 
-            // Add per-buyer timings if available
+            // Add per-buyer timings if available (each buyer ping as separate datapoint)
             if let Some(ref per_buyer) = routing_result.per_buyer_timings {
                 auction_timing_base.insert(
                     "per_buyer_timings".to_string(),
@@ -2386,8 +2550,63 @@ async fn create_lead(
                 );
             }
 
+            let outcome_str = if routing_result.success {
+                "success"
+            } else {
+                "failure"
+            };
+            let verbose_obj = request_context_from_headers(
+                &headers,
+                "/api/v1/leads",
+                "POST",
+                "Lead submission (auction processing)",
+                "carina_api",
+                outcome_str,
+                "Lead",
+                &lead_uuid.to_string(),
+                &request_type,
+                chrono::Utc::now(),
+            );
+            let mut verbose_map = verbose_obj.as_object().cloned().unwrap_or_default();
+            let db_operations_ms = metrics.get_total_query_time_ms();
+            let mut processing_times = serde_json::Map::new();
+            processing_times.insert(
+                "pre_checks_ms".to_string(),
+                serde_json::json!(pre_checks_ms),
+            );
+            processing_times.insert(
+                "ping_auction_ms".to_string(),
+                serde_json::json!(ping_auction_ms),
+            );
+            processing_times.insert(
+                "qualification_ms".to_string(),
+                serde_json::json!(qualification_ms),
+            );
+            processing_times.insert("post_ms".to_string(), serde_json::json!(post_sent_ms));
+            processing_times.insert(
+                "db_operations_ms".to_string(),
+                serde_json::json!(db_operations_ms),
+            );
+            processing_times.insert("total_ms".to_string(), serde_json::json!(total_ms));
+            if let Some(ref per_buyer) = routing_result.per_buyer_timings {
+                processing_times.insert(
+                    "per_buyer_timings".to_string(),
+                    serde_json::json!(per_buyer),
+                );
+            }
+            verbose_map.insert(
+                "processing_times".to_string(),
+                serde_json::Value::Object(processing_times),
+            );
+
+            auction_timing_base.insert(
+                "db_operations_ms".to_string(),
+                serde_json::json!(db_operations_ms),
+            );
+
             let auction_timing_data = serde_json::json!({
-                "auction_timing": serde_json::Value::Object(auction_timing_base)
+                "auction_timing": serde_json::Value::Object(auction_timing_base),
+                "verbose": serde_json::Value::Object(verbose_map)
             });
 
             // Determine final status with explicit sold detection
