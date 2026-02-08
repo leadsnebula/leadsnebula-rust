@@ -269,8 +269,8 @@ jobs:
           # Set pool settings for CI (Neon free-tier can be slow)
           echo "TEST_POOL_MAX_CONNECTIONS=50" >> $GITHUB_ENV
           echo "TEST_POOL_ACQUIRE_TIMEOUT_SECS=120" >> $GITHUB_ENV
-          
-      - name: Build workspace (single compile: bins + test targets)
+
+      - name: "Build workspace (single compile: bins + test targets)"
         if: steps.needs-integration.outputs.needs_tests == 'true'
         run: |
           echo "🔨 Building workspace (run-migrations, warm-test-pool, all test binaries)..."
@@ -304,7 +304,7 @@ jobs:
           sleep 2
           echo "✅ Neon compute warmed"
 
-      - name: Run integration tests (two-phase: matches autotestsall.sh)
+      - name: "Run integration tests (two-phase: matches autotestsall.sh)"
         if: steps.needs-integration.outputs.needs_tests == 'true'
         env:
           CI: "true"
