@@ -29,6 +29,7 @@ mod async_persistence_tests {
         let pool_arc = Arc::new(pool.clone());
         let encryption_key = Arc::new(vec![0u8; 32]);
 
+        // Minimal setup: 1 buyer, 1 campaign — sufficient for full routing functionality verification
         // Set up test data in a single transaction (1 connection instead of 9)
         // Retry transaction begin with exponential backoff to handle PoolTimedOut
         let mut tx = {

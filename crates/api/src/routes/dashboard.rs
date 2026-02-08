@@ -6251,6 +6251,7 @@ async fn get_lead_details(
             l.sold_at,
             l.created_at,
             l.updated_at,
+            l.vertical_data,
             l.first_name_encrypted,
             l.last_name_encrypted,
             l.email_encrypted,
@@ -6859,6 +6860,23 @@ async fn get_lead_details(
         .ok()
         .flatten();
 
+    // Extract auction_timing from vertical_data (post_ms, total_ms from AtomicAuctionTiming)
+    let vertical_data: Option<sqlx::types::Json<serde_json::Value>> = lead_row
+        .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>("vertical_data")
+        .ok()
+        .flatten();
+    let auction_timing: Option<serde_json::Value> = vertical_data
+        .as_ref()
+        .and_then(|j| j.0.get("auction_timing").cloned());
+    let post_ms: Option<f64> = auction_timing
+        .as_ref()
+        .and_then(|at| at.get("post_ms"))
+        .and_then(|v| v.as_f64());
+    let total_ms: Option<f64> = auction_timing
+        .as_ref()
+        .and_then(|at| at.get("total_ms"))
+        .and_then(|v| v.as_f64());
+
     let response_json = serde_json::json!({
         "success": true,
         "lead": {
@@ -6883,6 +6901,10 @@ async fn get_lead_details(
             },
             "ping_payloads": ping_payloads,
             "post_payload": post_payload,
+            "auction_timing": serde_json::json!({
+                "post_ms": post_ms,
+                "total_ms": total_ms,
+            }),
         },
     });
 
