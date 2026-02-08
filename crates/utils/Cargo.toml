@@ -93,6 +93,10 @@ path = "src/bin/fix-migration-hash.rs"
 name = "cleanup-instance-data"
 path = "src/bin/cleanup-instance-data.rs"
 
+[[bin]]
+name = "warm-test-pool"
+path = "src/bin/warm-test-pool.rs"
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }

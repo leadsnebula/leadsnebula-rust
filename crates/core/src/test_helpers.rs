@@ -19,8 +19,11 @@ static MIGRATION_CACHE: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(H
 /// Note: `PgPool::clone()` is cheap (Arc-based), so cached pools are efficiently shared.
 pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     // Load environment files if present (non-fatal)
-    let _ = dotenvy::from_filename(".env.local");
-    let _ = dotenvy::dotenv();
+    // Do not overwrite DATABASE_URL when already set (e.g. by autotestsall with ephemeral branch)
+    if std::env::var("DATABASE_URL").is_err() {
+        let _ = dotenvy::from_filename(".env.local");
+        let _ = dotenvy::dotenv();
+    }
 
     let database_url = std::env::var("DATABASE_URL")
         .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set for integration tests"))?;
@@ -109,8 +112,10 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(if is_ci {
             120 // CI: Much longer timeout for Neon free-tier cold starts and slowness
+        } else if is_ephemeral {
+            90 // Local Neon: 8 parallel tests can compete; 90s handles cold-start edge cases
         } else {
-            60 // Local: 60s is sufficient for concurrency tests
+            60 // Local non-Neon: 60s is sufficient for concurrency tests
         });
 
     // Retry pool creation with exponential backoff for Neon free-tier cold starts
@@ -122,12 +127,26 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
     let mut retries = 0;
     let max_retries = 5;
     let pool = loop {
-        match PgPoolOptions::new()
+        let mut opts = PgPoolOptions::new()
             .max_connections(max_conns_clone)
-            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs_clone))
-            .connect(&database_url_clone)
-            .await
+            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs_clone));
+
+        // Set statement_timeout on every connection - prevents individual queries from hanging
+        if database_url_clone.contains("ci-local-")
+            || database_url_clone.contains("test-")
+            || database_url_clone.contains("neon.tech")
         {
+            opts = opts.after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '120s'")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        match opts.connect(&database_url_clone).await {
             Ok(p) => {
                 // Quick health test
                 match sqlx::query("SELECT 1").execute(&p).await {
@@ -173,21 +192,12 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
 
     // Set statement timeout for migrations - Neon free-tier can be very slow
     // This must be set before migrations run, as migrations can take 60+ seconds
-    let is_test_env = database_url.contains("ci-local-")
+    let _is_test_env = database_url.contains("ci-local-")
         || database_url.contains("test-")
         || std::env::var("TEST_MODE").is_ok()
         || std::env::var("NEON_BRANCH").is_ok()
         || std::env::var("CI").is_ok()
         || std::env::var("EPHEMERAL_DB").is_ok();
-
-    if is_test_env {
-        // Set 120s timeout for test environments (migrations can be very slow on Neon free-tier,
-        // especially when many tests run in parallel and compete for database resources)
-        sqlx::query("SET statement_timeout = '120s'")
-            .execute(&pool)
-            .await
-            .ok(); // Non-critical - if this fails, migrations will use default timeout
-    }
 
     // Find migrations directory
     if let Ok(migrations_path) = find_migrations_dir() {
@@ -293,7 +303,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 // Also check if key tables exist (ping_tree_publishers, webauthn_credentials with platform_user_id)
                 // This is a more reliable indicator than just checking the migrations table
                 let migrations_check = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(15),
                     sqlx::query_scalar::<_, i64>(
                         "SELECT COUNT(*) FROM _sqlx_migrations WHERE success = true",
                     )
@@ -307,7 +317,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
 
                 // Also check if key tables/columns exist (more reliable than just checking migrations table)
                 let key_tables_exist = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(15),
                     sqlx::query_scalar::<_, bool>(
                         "SELECT EXISTS (
                             SELECT 1 FROM information_schema.tables WHERE table_name = 'ping_tree_publishers'
@@ -324,6 +334,10 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                 // Migrations are already applied if either:
                 // 1. Migrations table has records, OR
                 // 2. Key tables/columns exist (more reliable - survives migrations table drops)
+                //
+                // IMPORTANT: Do NOT assume migrations applied when checks timeout - that is dangerous.
+                // If we can't determine state, we must run migrations; warm-up should ensure checks
+                // succeed before tests run.
                 let migrations_already_applied = migrations_table_has_records || key_tables_ok;
 
                 // Simple, clean migration logic for test mode
@@ -498,7 +512,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     .await;
 
                     if let Ok(row) = user_otp_fix {
-                        let needs_fix: bool = row.get(0);
+                        let needs_fix: bool = row.get::<bool, _>(0);
                         if needs_fix {
                             sqlx::query("DROP TABLE IF EXISTS user_otp_settings CASCADE")
                                 .execute(&pool)
@@ -527,7 +541,7 @@ pub async fn create_test_pool() -> anyhow::Result<PgPool> {
                     .await;
 
                     if let Ok(row) = webauthn_fix {
-                        let needs_fix: bool = row.get(0);
+                        let needs_fix: bool = row.get::<bool, _>(0);
                         if needs_fix {
                             sqlx::query("DROP TABLE IF EXISTS webauthn_credentials CASCADE")
                                 .execute(&pool)

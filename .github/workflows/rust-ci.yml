@@ -262,6 +262,7 @@ jobs:
           BRANCH_NAME=ci-${{ github.run_id }}
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
           CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          if [[ "$CONNECTION" == *"?"* ]]; then CONNECTION="${CONNECTION}&sslnegotiation=direct"; else CONNECTION="${CONNECTION}?sslnegotiation=direct"; fi
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
           echo "EPHEMERAL_DB=1" >> $GITHUB_ENV
           echo "TEST_MODE=true" >> $GITHUB_ENV
@@ -269,96 +270,61 @@ jobs:
           echo "TEST_POOL_MAX_CONNECTIONS=50" >> $GITHUB_ENV
           echo "TEST_POOL_ACQUIRE_TIMEOUT_SECS=120" >> $GITHUB_ENV
           
-      - name: Verify database connection
+      - name: Build workspace (single compile: bins + test targets)
         if: steps.needs-integration.outputs.needs_tests == 'true'
         run: |
-          echo "Verifying database connection..."
-          # Check if psql is available (it may not be installed in GitHub Actions)
-          if command -v psql > /dev/null 2>&1; then
-            MAX_RETRIES=5
-            RETRY_COUNT=0
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              if timeout 10 psql "$DATABASE_URL" -c "SELECT 1;" > /dev/null 2>&1; then
-                echo "✅ Database connection verified"
-                break
-              else
-                RETRY_COUNT=$((RETRY_COUNT + 1))
-                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                  echo "   Waiting for database to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
-                  sleep 2
-                else
-                  echo "⚠️  Could not verify database connection, but continuing anyway (tests will retry)"
-                fi
-              fi
-            done
-          else
-            echo "⚠️  psql not available, skipping connection verification (tests will verify connection)"
-          fi
-          # Small delay to ensure database is fully ready before tests start
-          echo "Waiting 3 seconds for database to stabilize..."
-          sleep 3
-
-      - name: Build all test binaries (compile once, run many times)
-        if: steps.needs-integration.outputs.needs_tests == 'true'
-        run: |
-          echo "🔨 Building all test binaries upfront to avoid redundant compilation..."
-          # Build all test targets once - this compiles all test binaries
-          # Subsequent test runs will reuse these compiled binaries, saving significant time
-          # Using nextest list to trigger compilation of all test binaries that will be run
+          echo "🔨 Building workspace (run-migrations, warm-test-pool, all test binaries)..."
+          # Single build phase - avoids redundant compilation during migrations and tests
+          cargo build --all-targets --locked --all-features --bin run-migrations --bin warm-test-pool
           cargo nextest list --all-targets --locked --all-features > /dev/null 2>&1 || \
             cargo test --no-run --all-targets --locked --all-features
-          echo "✅ All test binaries built - subsequent test runs will reuse them (no recompilation)"
+          echo "✅ Build complete - migrations, warm-up, and tests will use pre-built binaries"
 
-      - name: Run integration tests (light DB only; heavy/concurrency run locally)
+      - name: Apply migrations and warm up Neon compute
+        if: steps.needs-integration.outputs.needs_tests == 'true'
+        run: |
+          echo "🗄️  Applying migrations and warming up Neon compute..."
+          # Per Neon docs: "Memory buffers are cold after a compute wakes up - initial queries
+          # may take longer until the memory buffers are warmed." Sequential warm-up is reliable;
+          # parallel connections can overwhelm cold Neon and hang.
+          ./target/debug/run-migrations 2>&1 || true
+          timeout 30 ./target/debug/run-migrations 2>/dev/null || true
+          sleep 2
+          timeout 30 ./target/debug/run-migrations 2>/dev/null || true
+          sleep 2
+          # Warm create_test_pool path before integration tests; runs migrations_check,
+          # key_tables_exist, and a trivial query. This warms the exact code path used by tests.
+          echo "Warming create_test_pool path..."
+          if WARM_OUTPUT=$(timeout 90 ./target/debug/warm-test-pool 2>&1); then
+            echo "✅ create_test_pool path warmed"
+          else
+            echo "⚠️ warm-test-pool failed:"
+            echo "$WARM_OUTPUT"
+          fi
+          sleep 2
+          echo "✅ Neon compute warmed"
+
+      - name: Run integration tests (two-phase: matches autotestsall.sh)
         if: steps.needs-integration.outputs.needs_tests == 'true'
         env:
           CI: "true"
           # RUN_HEAVY_TESTS is not set, so heavy tests (30-40s each) are skipped
           # Heavy tests are enabled in local runs via .env.local (RUN_HEAVY_TESTS=true)
+          WRITE_BEHIND_FLUSH_TIMEOUT_SECS: "60"
         run: |
           echo "DATABASE_URL is set (ephemeral Neon branch)"
           
-          # 1. Non-database integration tests - quick, can run in parallel
-          # Health and routes tests don't require database, so they're fast and safe to run in parallel
-          cargo nextest run --test integration_health --test integration_routes --locked --all-features --test-threads=2 || \
-            cargo test --test integration_health --test integration_routes --locked --all-features -- --test-threads=2
+          # Phase 1: DB-heavy integration tests (sequential, matches autotestsall.sh)
+          # MUST run with --test-threads=1 to avoid migration table race conditions
+          echo "Phase 1: DB integration tests (sequential)..."
+          timeout 480 cargo nextest run --test integration_auth --test integration_publisher_crud --test integration_leads_endpoint --test integration_carina_e2e --locked --all-features --run-ignored all --test-threads=1 -E 'not test(optimization_tests)' --profile ci || \
+            timeout 480 cargo test --test integration_auth --test integration_publisher_crud --test integration_leads_endpoint --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored
           
-          # 2. Auth tests - MUST run sequentially (--test-threads=1) to avoid migration table race conditions
-          # Multiple concurrent tests trying to create _sqlx_migrations table causes "duplicate key" errors
-          # Use CI profile for longer timeouts (180s) to handle Neon free-tier cold starts
-          # Also add timeout wrapper to catch hanging tests (420s = 7 minutes) as final safety net
-          # Some tests like test_otp_backup_codes_storage can take longer with nextest due to pool initialization
-          timeout 420 cargo nextest run --test integration_auth --locked --all-features --test-threads=1 --profile ci || \
-            timeout 420 cargo test --test integration_auth --locked --all-features -- --test-threads=1
-          
-          # 3. Publisher CRUD tests - MUST run sequentially (--test-threads=1) to avoid migration table race conditions
-          # Multiple concurrent tests trying to create/drop _sqlx_migrations table causes race conditions
-          timeout 180 cargo nextest run --test integration_publisher_crud --locked --all-features --test-threads=1 --profile ci || \
-            timeout 180 cargo test --test integration_publisher_crud --locked --all-features -- --test-threads=1
-          
-          # 4. E2E tests - MUST run sequentially (--test-threads=1) to avoid migration table race conditions
-          # Run with --run-ignored flag to include tests marked with #[ignore]
-          timeout 240 cargo nextest run --test integration_carina_e2e --locked --all-features --test-threads=1 --run-ignored only --profile ci || \
-            timeout 240 cargo test --test integration_carina_e2e --locked --all-features -- --test-threads=1 --ignored
-          
-          # 5. Database-backed library tests (--ignored) - MUST run sequentially
-          # Heavy tests (30-40s each) are skipped in CI - they check RUN_HEAVY_TESTS env var
-          # Only light tests run here for faster CI iteration
-          # Heavy tests run locally via ./autotests.sh (which sets RUN_HEAVY_TESTS=true)
-          # Use 420 seconds (7 minutes) timeout for remaining light tests
-          timeout 480 cargo nextest run --lib --locked --all-features --test-threads=1 --run-ignored only --profile ci || \
-            timeout 480 cargo test --lib --locked --all-features -- --test-threads=1 --ignored
-          
-          # 6. Optimization and endpoint tests (new tests for 90% coverage)
-          # Heavy optimization tests are skipped in CI (check RUN_HEAVY_TESTS env var)
-          # Only light optimization tests run here for faster CI iteration
-          # Run optimization tests from core crate
-          timeout 240 cargo nextest run --package leadsnebula_core --lib --locked --all-features --test-threads=1 --run-ignored only --profile ci -- optimization_tests || \
-            timeout 240 cargo test --package leadsnebula_core --lib --locked --all-features -- --test-threads=1 --ignored optimization_tests || true
-          
-          # Run endpoint integration tests from api crate (if they exist)
-          timeout 180 cargo nextest run --test integration_leads_endpoint --locked --all-features --test-threads=1 --run-ignored only --profile ci || \
-            timeout 180 cargo test --test integration_leads_endpoint --locked --all-features -- --test-threads=1 --ignored || true
+          # Phase 2: Unit + lib + other tests (parallel, matches autotestsall.sh)
+          echo "Phase 2: Unit + lib + other tests (8 threads)..."
+          timeout 600 cargo nextest run --all-targets --locked --all-features --run-ignored all --test-threads=8 \
+            -E 'not test(optimization_tests) and not test(integration_auth) and not test(integration_publisher_crud) and not test(integration_leads_endpoint) and not test(integration_carina_e2e)' \
+            --profile ci
 
       - name: Show sccache statistics
         if: steps.needs-integration.outputs.needs_tests == 'true'
@@ -779,6 +745,7 @@ jobs:
           BRANCH_NAME=ci-${{ github.run_id }}-coverage
           echo "Using ephemeral Neon branch: $BRANCH_NAME"
           CONNECTION=$($NEONCTL_CMD connection-string "$BRANCH_NAME" --project "$NEON_PROJECT_ID" --api-key "$NEON_API_KEY") || (echo "Failed to get connection string for $BRANCH_NAME" >&2 && exit 1)
+          if [[ "$CONNECTION" == *"?"* ]]; then CONNECTION="${CONNECTION}&sslnegotiation=direct"; else CONNECTION="${CONNECTION}?sslnegotiation=direct"; fi
           echo "DATABASE_URL=$CONNECTION" >> $GITHUB_ENV
 
       - name: Clean build artifacts
