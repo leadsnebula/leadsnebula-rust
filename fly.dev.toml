@@ -5,6 +5,7 @@ primary_region = "iad"
 
 [env]
   ENVIRONMENT = "development"
+  # WEBAUTHN_USE_HOST_AS_RP_ID: set via fly secrets (default true). Passkey registration from dev.dashboard uses domain origin; secret ensures host-bound rp_id for Proton Pass.
 
 [http_service]
   internal_port = 8080
