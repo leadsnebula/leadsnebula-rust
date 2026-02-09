@@ -125,11 +125,11 @@ async fn handle_ping(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // Generate ping_id similar to Ruby: FP_<base64(lead_id|timestamp|result)>
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let payload = format!("{}|{}|accepted", lead_id, timestamp);
-    let encoded = BASE64_STD.encode(payload);
-    let ping_id = format!("FP_{}", encoded);
+    // Unique ping_id per request: FP_<base64(lead_id|ts_ms|nonce|accepted)>
+    let ts_ms = Utc::now().timestamp_millis();
+    let nonce = hex::encode(rand::random::<[u8; 6]>()).to_uppercase();
+    let payload = format!("{}|{}|{}|accepted", lead_id, ts_ms, nonce);
+    let ping_id = format!("FP_{}", BASE64_STD.encode(payload));
     let promise_id = format!(
         "PROMISE_{}",
         hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
@@ -139,10 +139,10 @@ async fn handle_ping(
     let accepted = true; // Default accept for now
 
     if !accepted {
-        let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let payload = format!("{}|{}|rejected", lead_id, timestamp);
-        let encoded = BASE64_STD.encode(payload);
-        let rejected_ping_id = format!("FP_{}", encoded);
+        let ts_ms = Utc::now().timestamp_millis();
+        let nonce = hex::encode(rand::random::<[u8; 6]>()).to_uppercase();
+        let payload = format!("{}|{}|{}|rejected", lead_id, ts_ms, nonce);
+        let rejected_ping_id = format!("FP_{}", BASE64_STD.encode(payload));
         return Ok(Json(PulsarResponse {
             success: false,
             status: "rejected".to_string(),

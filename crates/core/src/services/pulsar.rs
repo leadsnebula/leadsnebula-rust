@@ -46,19 +46,22 @@ fn generate_promise_id() -> String {
     result
 }
 
+/// Generate a unique ping_id per request (millisecond + 6 random hex bytes to avoid collisions).
 #[inline(always)]
 fn generate_ping_id(lead_id: &str) -> String {
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
-    payload.push_str(lead_id);
-    payload.push('|');
-    payload.push_str(&timestamp);
-    payload.push_str("|accepted");
+    let ts_ms = Utc::now().timestamp_millis();
+    let nonce = hex::encode(rand::random::<[u8; 6]>()).to_uppercase();
+    let payload = format!("{}|{}|{}|accepted", lead_id, ts_ms, nonce);
     let encoded = BASE64_STD.encode(payload);
-    let mut ping_id = String::with_capacity(3 + encoded.len());
-    ping_id.push_str("FP_");
-    ping_id.push_str(&encoded);
-    ping_id
+    format!("FP_{}", encoded)
+}
+
+#[inline(always)]
+fn generate_rejected_ping_id(lead_id: &str) -> String {
+    let ts_ms = Utc::now().timestamp_millis();
+    let nonce = hex::encode(rand::random::<[u8; 6]>()).to_uppercase();
+    let payload = format!("{}|{}|{}|rejected", lead_id, ts_ms, nonce);
+    format!("FP_{}", BASE64_STD.encode(payload))
 }
 
 #[inline(always)]
@@ -91,18 +94,8 @@ impl PulsarService {
             .clone()
             .unwrap_or_else(|| lead.uuid.to_string());
 
-        // Generate ping_id similar to Ruby: FP_<base64(lead_id|timestamp|result)>
-        // Optimize string operations with pre-allocated capacity
-        let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
-        payload.push_str(&lead_id);
-        payload.push('|');
-        payload.push_str(&timestamp);
-        payload.push_str("|accepted");
-        let encoded = BASE64_STD.encode(payload);
-        let mut ping_id = String::with_capacity(3 + encoded.len());
-        ping_id.push_str("FP_");
-        ping_id.push_str(&encoded);
+        // Unique ping_id per request: FP_<base64(lead_id|ts_ms|nonce|accepted)>
+        let ping_id = generate_ping_id(&lead_id);
         let promise_id = format!(
             "PROMISE_{}",
             hex::encode(rand::random::<[u8; 6]>()).to_uppercase()
@@ -118,16 +111,7 @@ impl PulsarService {
         let accepted = qual_result.accepted;
 
         if !accepted {
-            let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-            let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
-            payload.push_str(&lead_id);
-            payload.push('|');
-            payload.push_str(&timestamp);
-            payload.push_str("|rejected");
-            let encoded = BASE64_STD.encode(payload);
-            let mut rejected_ping_id = String::with_capacity(3 + encoded.len());
-            rejected_ping_id.push_str("FP_");
-            rejected_ping_id.push_str(&encoded);
+            let rejected_ping_id = generate_rejected_ping_id(&lead_id);
             return Ok(BuyerResponse {
                 success: false,
                 status: "rejected".to_string(),
@@ -380,16 +364,7 @@ impl PulsarService {
         );
 
         if !accepted {
-            let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-            let mut payload = String::with_capacity(lead_id.len() + timestamp.len() + 10);
-            payload.push_str(&lead_id);
-            payload.push('|');
-            payload.push_str(&timestamp);
-            payload.push_str("|rejected");
-            let encoded = BASE64_STD.encode(payload);
-            let mut rejected_ping_id = String::with_capacity(3 + encoded.len());
-            rejected_ping_id.push_str("FP_");
-            rejected_ping_id.push_str(&encoded);
+            let rejected_ping_id = generate_rejected_ping_id(&lead_id);
             return Ok(BuyerResponse {
                 success: false,
                 status: "rejected".to_string(),
