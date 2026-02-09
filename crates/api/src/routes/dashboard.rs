@@ -33,10 +33,12 @@ fn webauthn_rp_id_and_origin(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
+    let rp_id_production =
+        std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string());
     let rp_id: String = if environment == "development" {
         "localhost".to_string()
     } else {
-        std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "leadsnebula.com".to_string())
+        rp_id_production.clone()
     };
 
     let (origin, rp_id_used) = if environment == "development" {
@@ -47,7 +49,24 @@ fn webauthn_rp_id_and_origin(
         if !origin_header_str.is_empty() {
             if let Ok(url) = url::Url::parse(origin_header_str) {
                 let host = url.host_str().unwrap_or("");
-                if url.scheme() == "https" && host == "localhost.localdomain" {
+                // Deployed dev (e.g. dev.dashboard.leadsnebula.com calling dev.leadsnebula.com) sends our domain as Origin.
+                // Use production-style rp_id so passkeys work; otherwise we'd return (localhost, fallback) and cause OriginRpMissmatch.
+                let host_matches_domain =
+                    host == rp_id_production || host.ends_with(&format!(".{}", rp_id_production));
+                if url.scheme() == "https" && host_matches_domain {
+                    let effective_rp_id = if use_host_as_rp_id {
+                        host.to_string()
+                    } else {
+                        rp_id_production.clone()
+                    };
+                    tracing::info!(
+                        "Passkey (dev env, domain origin): origin={} rp_id={} (use_host_as_rp_id={})",
+                        origin_header_str,
+                        effective_rp_id,
+                        use_host_as_rp_id
+                    );
+                    (origin_header_str.to_string(), effective_rp_id)
+                } else if url.scheme() == "https" && host == "localhost.localdomain" {
                     // Use .localdomain so passkey managers (e.g. Proton Pass) that reject RP ID "localhost" can be tested.
                     (
                         origin_header_str.to_string(),
@@ -323,6 +342,10 @@ pub fn dashboard_routes() -> Router<AppState> {
         .route("/api/security/passkeys/register", post(register_passkey))
         .route("/api/security/passkeys/:id", delete(delete_passkey))
         .route("/api/security/audit_logs", get(list_security_audit_logs))
+        .route(
+            "/api/security/password-reset-email",
+            post(send_password_reset_email),
+        )
 }
 
 // Security API
@@ -421,6 +444,95 @@ async fn get_security_status(
         "otp_enabled": otp_enabled.unwrap_or(false),
         "passkeys": passkeys
     })))
+}
+
+/// POST /api/security/password-reset-email — send password reset email for the authenticated user.
+/// Rate-limited by reset_password_sent_at (5 min). Uses SES via EmailService.
+async fn send_password_reset_email(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use base64::Engine;
+    use leadsnebula_core::auth::JwtService;
+    use leadsnebula_core::password_reset::PasswordResetService;
+    use tracing::error;
+    use uuid::Uuid;
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let jwt_service = JwtService::new(state.config.jwt_secret.clone());
+    let claims = jwt_service
+        .decode(token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let user_id = Uuid::parse_str(&claims.user_id).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let user = sqlx::query_as::<_, leadsnebula_core::models::user::User>(
+        "SELECT id, email, encrypted_password, first_name, last_name, status, confirmed_at, created_at, updated_at FROM instance_users WHERE id = $1 AND status = 'active'",
+    )
+    .bind(user_id)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error loading user for password reset: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // Rate limit: do not send again if last reset email was sent within 5 minutes
+    let last_sent: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT reset_password_sent_at FROM instance_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(state.db_pool.as_ref())
+            .await
+            .map_err(|e| {
+                error!("Database error checking reset rate limit: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    if let Some(ts) = last_sent {
+        if chrono::Utc::now().signed_duration_since(ts).num_seconds() < 300 {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "message": "If an account exists for this email, a reset link was already sent. Please check your inbox or try again later."
+            })));
+        }
+    }
+
+    let reset_token = {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    };
+
+    sqlx::query(
+        "UPDATE instance_users SET reset_password_token = $1, reset_password_sent_at = NOW(), updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&reset_token)
+    .bind(user_id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error saving reset token: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let password_reset_service = PasswordResetService::new(
+        state.email_service.clone(),
+        state.config.password_reset_base_url.clone(),
+    );
+    if let Err(e) = password_reset_service
+        .send_reset_email(&user, &reset_token)
+        .await
+    {
+        error!("Failed to send password reset email: {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 async fn list_security_audit_logs(
@@ -577,15 +689,15 @@ async fn setup_otp(
 
     // Generate provisioning URI
     let provisioning_uri = format!(
-        "otpauth://totp/LeadsNebula:{}?secret_encrypted={}&issuer=LeadsNebula",
+        "otpauth://totp/LeadsNebula:{}?secret={}&issuer=LeadsNebula",
         urlencoding::encode(&user.email),
         secret_encrypted
     );
 
-    // Return the secret_encrypted and provisioning URI
-    // Frontend can generate QR code client-side
+    // Return the secret (frontend expects "secret") and provisioning URI.
     Ok(Json(serde_json::json!({
         "success": true,
+        "secret": secret_encrypted,
         "secret_encrypted": secret_encrypted,
         "provisioning_uri": provisioning_uri
     })))
@@ -950,9 +1062,10 @@ async fn passkey_registration_options(
 
     #[cfg(feature = "webauthn")]
     {
+        // Host-bound by default so Proton Pass works (OriginRpMissmatch). Set WEBAUTHN_USE_HOST_AS_RP_ID=false for parent-domain.
         let use_host_as_rp_id = std::env::var("WEBAUTHN_USE_HOST_AS_RP_ID")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
         let (rp_id, origin) =
             webauthn_rp_id_and_origin(&state.config.environment, &headers, use_host_as_rp_id)?;
 
@@ -1214,8 +1327,8 @@ async fn register_passkey(
             })?;
 
         let use_host_as_rp_id = std::env::var("WEBAUTHN_USE_HOST_AS_RP_ID")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
         let (rp_id, origin) =
             webauthn_rp_id_and_origin(&state.config.environment, &headers, use_host_as_rp_id)?;
 
@@ -1570,15 +1683,15 @@ async fn _setup_otp_with_user(
 
     // Generate provisioning URI
     let provisioning_uri = format!(
-        "otpauth://totp/LeadsNebula:{}?secret_encrypted={}&issuer=LeadsNebula",
+        "otpauth://totp/LeadsNebula:{}?secret={}&issuer=LeadsNebula",
         urlencoding::encode(&user.email),
         secret_encrypted
     );
 
-    // Return the secret_encrypted and provisioning URI
-    // Frontend can generate QR code client-side
+    // Return the secret (frontend expects "secret") and provisioning URI.
     Ok(Json(serde_json::json!({
         "success": true,
+        "secret": secret_encrypted,
         "secret_encrypted": secret_encrypted,
         "provisioning_uri": provisioning_uri
     })))
@@ -6879,6 +6992,14 @@ async fn list_leads(
             .as_ref()
             .and_then(|at| at.get("total_ms"))
             .and_then(|v| v.as_f64());
+        // Cumulative total: use the larger of stored total_ms or DB wall-clock processing_time_ms
+        // so we never show a partial (e.g. post-only) time when the real end-to-end time is larger
+        let effective_total_ms: Option<f64> = match (total_ms, processing_time_ms) {
+            (Some(v), Some(p)) => Some(v.max(p)),
+            (Some(v), None) => Some(v),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        };
 
         // Fetch price from post_payloads
         let price: Option<f64> = row.try_get::<Option<f64>, _>("price").ok().flatten();
@@ -6920,7 +7041,7 @@ async fn list_leads(
             "price": price,
             "submitted_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("submitted_at").ok().flatten().map(|d| d.to_rfc3339()),
             "processing_time_ms": processing_time_ms,
-            "auction_timing": if post_ms.is_some() || total_ms.is_some() { serde_json::json!({ "post_ms": post_ms, "total_ms": total_ms }) } else { serde_json::Value::Null },
+            "auction_timing": if post_ms.is_some() || effective_total_ms.is_some() { serde_json::json!({ "post_ms": post_ms, "total_ms": effective_total_ms }) } else { serde_json::Value::Null },
             "publisher_name": row.try_get::<Option<String>, _>("publisher_name").ok().flatten(),
             "buyer_name": row.try_get::<Option<String>, _>("buyer_name").ok().flatten(),
             // PII and payloads are NOT included - loaded lazily via /leads/:id/details endpoint
@@ -7377,61 +7498,18 @@ async fn get_lead_details(
                             br_ping_id_to_pending_key(pid)
                                 .and_then(|k| ping_request_payloads.get(&k).cloned())
                         });
-                        let has_key = via_pending.is_some();
-                        tracing::warn!(
-                            lead_id = %lead_uuid,
-                            ping_id = %pid,
-                            has_key = has_key,
-                            "Dashboard get_lead_details: ping request payload lookup (visible in cargo run)"
-                        );
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "B",
-                            "location": "dashboard.rs:6403",
-                            "message": "Looking up ping request payload",
-                            "data": {
-                                "ping_id": pid,
-                                "ping_request_payloads_has_key": has_key,
-                                "ping_request_payload_keys": via_pending.as_ref().and_then(|p| p.as_ref()).and_then(|p| p.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>())
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/home/badinoff/projects/leadsnebula/.cursor/debug.log") {
-                            use std::io::Write;
-                            let _ = writeln!(file, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
-                        }
-                        // #endregion
                         via_pending
                     })
                     .flatten()
-                    .or_else(|| {
-                        tracing::warn!(
-                            lead_id = %lead_uuid,
-                            ping_id = ?ping_id,
-                            "Dashboard get_lead_details: FALLBACK to original_request_payload (visible in cargo run)"
-                        );
-                        // #region agent log
-                        let log_entry = serde_json::json!({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "B",
-                            "location": "dashboard.rs:6407",
-                            "message": "Falling back to original_request_payload",
-                            "data": {
-                                "ping_id": ping_id.as_ref(),
-                                "original_request_payload_keys": original_request_payload.as_ref().and_then(|p| p.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>())
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis()
-                        });
-                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/home/badinoff/projects/leadsnebula/.cursor/debug.log") {
-                            use std::io::Write;
-                            let _ = writeln!(file, "{}", serde_json::to_string(&log_entry).unwrap_or_default());
-                        }
-                        // #endregion
-                        original_request_payload.clone()
-                    });
+                    .or_else(|| original_request_payload.clone());
+
+                // Per-ping timing for verbose display (ping payloads show ping-phase times, not post)
+                let auction_timing = processing_time_ms.map(|ms| {
+                    serde_json::json!({
+                        "request_type": "ping",
+                        "total_ms": ms,
+                    })
+                });
 
                 serde_json::json!({
                     "id": row.try_get::<i64, _>("id").ok(),
@@ -7444,6 +7522,7 @@ async fn get_lead_details(
                     "status": if is_winner { "W" } else { "L" },
                     "request_payload": ping_request_payload,
                     "response_payload": response_payload,
+                    "auction_timing": auction_timing,
                 })
             })
             .collect()
@@ -7482,6 +7561,7 @@ async fn get_lead_details(
                     "processing_time_ms": None::<f64>,
                     "request_payload": request_payload,
                     "response_payload": response_payload,
+                    "auction_timing": None::<serde_json::Value>,
                 })
             })
             .collect()
