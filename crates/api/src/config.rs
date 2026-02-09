@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use leadsnebula_core::cache::CacheService;
+use leadsnebula_core::email::EmailService;
 use leadsnebula_core::redis::RedisClient;
 use leadsnebula_core::services::database::create_pool;
 use leadsnebula_core::services::write_behind_queue::WriteBehindQueue;
@@ -21,8 +22,10 @@ pub struct AppConfig {
     #[allow(dead_code)] // Used by Sentry initialization in main.rs
     pub sentry_dsn: Option<String>,
     pub environment: String,
-    #[allow(dead_code)] // Used by EmailService when implemented
+    #[allow(dead_code)] // Used by EmailService
     pub from_email: String,
+    /// Base URL for password reset links (e.g. https://app.leadsnebula.com). No trailing slash.
+    pub password_reset_base_url: String,
 }
 
 #[derive(Clone)]
@@ -39,6 +42,8 @@ pub struct AppState {
     pub cache: Option<Arc<CacheService>>,
     #[allow(dead_code)] // Used for batching background database writes
     pub write_behind_queue: Arc<WriteBehindQueue>,
+    #[allow(dead_code)] // Used by password-reset-email route
+    pub email_service: Arc<EmailService>,
 }
 
 impl AppConfig {
@@ -352,6 +357,15 @@ impl AppConfig {
             .or_else(|| std::env::var("FROM_EMAIL").ok())
             .unwrap_or_else(|| "noreply@leadsnebula.com".to_string());
 
+        let password_reset_base_url = params
+            .get(&format!(
+                "/leadsnebula/{}/rust/email/password_reset_base_url",
+                env_normalized
+            ))
+            .cloned()
+            .or_else(|| std::env::var("PASSWORD_RESET_BASE_URL").ok())
+            .unwrap_or_else(|| "https://app.leadsnebula.com".to_string());
+
         // Redis pool size (default: 15, configurable via SSM)
         let redis_pool_size = params
             .get(&format!(
@@ -392,6 +406,7 @@ impl AppConfig {
             sentry_dsn,
             environment,
             from_email,
+            password_reset_base_url,
         })
     }
 }
@@ -606,6 +621,13 @@ impl AppState {
         // Create write-behind queue for batching background database writes
         let write_behind_queue = Arc::new(WriteBehindQueue::new(db_pool.clone()));
 
+        // SES email service (uses default AWS config; From address must be verified in SES)
+        let email_service = Arc::new(
+            EmailService::new(config.from_email.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create EmailService: {}", e))?,
+        );
+
         Ok(Self {
             config,
             db_pool,
@@ -613,6 +635,7 @@ impl AppState {
             ssm,
             cache,
             write_behind_queue,
+            email_service,
         })
     }
 }

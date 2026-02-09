@@ -1,23 +1,28 @@
 use crate::email::EmailService;
 use crate::models::user::User;
+use std::sync::Arc;
 
 pub struct PasswordResetService {
-    email_service: EmailService,
+    email_service: Arc<EmailService>,
+    reset_url_base: String,
     #[allow(dead_code)]
     reset_token_ttl_seconds: u64,
 }
 
 impl PasswordResetService {
-    pub fn new(email_service: EmailService) -> Self {
+    /// * `reset_url_base`: base URL for the reset link (e.g. https://app.leadsnebula.com or https://dev.dashboard.leadsnebula.com). No trailing slash.
+    pub fn new(email_service: Arc<EmailService>, reset_url_base: String) -> Self {
         Self {
             email_service,
+            reset_url_base,
             reset_token_ttl_seconds: 3600, // 1 hour
         }
     }
 
     pub async fn send_reset_email(&self, user: &User, reset_token: &str) -> anyhow::Result<()> {
         let reset_url = format!(
-            "https://app.leadsnebula.com/reset-password?token={}",
+            "{}/reset-password?token={}",
+            self.reset_url_base.trim_end_matches('/'),
             reset_token
         );
 
