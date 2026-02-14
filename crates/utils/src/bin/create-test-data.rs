@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     println!("=== Creating Test Data ===\n");
 
     // 1. Get or create instance
-    let instance_id = get_or_create_instance(&pool).await?;
+    let instance_id = get_or_create_instance(&pool, &database_url).await?;
     println!("✓ Instance ID: {}\n", instance_id);
 
     // 2. Get or create publisher
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn get_or_create_instance(pool: &sqlx::PgPool) -> Result<Uuid> {
+async fn get_or_create_instance(pool: &sqlx::PgPool, database_url: &str) -> Result<Uuid> {
     let instance_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM instances LIMIT 1")
         .fetch_optional(pool)
         .await?;
@@ -58,6 +58,9 @@ async fn get_or_create_instance(pool: &sqlx::PgPool) -> Result<Uuid> {
     if let Some(id) = instance_id {
         return Ok(id);
     }
+
+    // Test instances must only be created in ephemeral DB
+    leadsnebula_core::services::database::require_ephemeral_db_for_test_data(database_url)?;
 
     let new_id = Uuid::new_v4();
     sqlx::query(

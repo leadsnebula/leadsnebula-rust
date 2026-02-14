@@ -1,6 +1,7 @@
 mod cache_warmup;
 mod config;
 mod middleware;
+mod openapi;
 mod routes;
 
 use config::AppState;
@@ -251,6 +252,18 @@ async fn main() -> anyhow::Result<()> {
                         )),
                 )
                 .merge(pulsar_routes()) // No authentication middleware - Pulsar is internal
+                .route(
+                    "/documentation",
+                    axum::routing::get(openapi::serve_scalar_html),
+                )
+                .route(
+                    "/documentation/",
+                    axum::routing::get(openapi::serve_scalar_html),
+                )
+                .route(
+                    "/documentation/openapi.json",
+                    axum::routing::get(openapi::serve_openapi_json),
+                )
                 .with_state(state)
                 .layer(
                     ServiceBuilder::new()

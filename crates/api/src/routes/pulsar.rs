@@ -49,7 +49,6 @@ pub struct PulsarLeadData {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub email: Option<String>,
-    pub mobile_phone: Option<String>,
     pub cell_phone: Option<String>,
     pub state: Option<String>,
     pub city: Option<String>,

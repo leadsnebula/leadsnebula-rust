@@ -86,3 +86,22 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
     info!("Database connection pool created successfully");
     Ok(pool)
 }
+
+/// Ensures test instances and instance_users are only created in ephemeral DBs (never dev/prod).
+/// Call this before any code that inserts test instance or instance_user rows.
+pub fn require_ephemeral_db_for_test_data(database_url: &str) -> anyhow::Result<()> {
+    let is_ephemeral_env = std::env::var("EPHEMERAL_DB").is_ok();
+    let looks_like_ephemeral = database_url.contains("ci-")
+        || database_url.contains("ci-local-")
+        || database_url.contains("ephemeral")
+        || database_url.contains("_test")
+        || database_url.contains("/test");
+    if !is_ephemeral_env || !looks_like_ephemeral {
+        return Err(anyhow::anyhow!(
+            "Creating test instances/instance_users is only allowed on an ephemeral database.\n\
+             Set EPHEMERAL_DB=1 and use a DATABASE_URL for an ephemeral branch (e.g. ci-*).\n\
+             Never create test data in dev or prod."
+        ));
+    }
+    Ok(())
+}

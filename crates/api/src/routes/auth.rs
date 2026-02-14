@@ -6,10 +6,12 @@ use axum::{
     extract::rejection::JsonRejection, extract::State, http::StatusCode, response::Json,
     routing::post, Router,
 };
-use leadsnebula_core::auth::{verify_password, JwtService};
+use leadsnebula_core::auth::{hash_password, verify_password, JwtService};
 use leadsnebula_core::models::user::User;
+use leadsnebula_core::password_policy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tracing::error;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -49,10 +51,24 @@ pub struct VerifyOtpLoginRequest {
     backup_code: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ResetPasswordRequest {
+    token: String,
+    new_password: String,
+}
+
+#[derive(Serialize)]
+pub struct ResetPasswordResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 pub fn auth_routes() -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/verify-otp-login", post(verify_otp_login))
+        .route("/api/auth/reset-password", post(reset_password))
 }
 
 fn bad_request_login_response(message: &str) -> (StatusCode, Json<LoginResponse>) {
@@ -526,5 +542,88 @@ async fn verify_otp_login(
         requires_otp: None,
         login_token: None,
         message: None,
+    }))
+}
+
+/// POST /api/auth/reset-password — set new password using the token from the reset email.
+/// Body: { token: string, new_password: string }. Token is invalidated after use.
+async fn reset_password(
+    State(state): State<AppState>,
+    payload: Result<Json<ResetPasswordRequest>, JsonRejection>,
+) -> Result<Json<ResetPasswordResponse>, (StatusCode, Json<ResetPasswordResponse>)> {
+    let payload = payload.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ResetPasswordResponse {
+                success: false,
+                error: Some("Invalid request. Send JSON with token and new_password.".to_string()),
+            }),
+        )
+    })?;
+    let payload = payload.0;
+
+    let token = payload.token.trim();
+    let new_password = payload.new_password.as_str();
+    if token.is_empty() || new_password.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ResetPasswordResponse {
+                success: false,
+                error: Some("Token and new password are required.".to_string()),
+            }),
+        ));
+    }
+
+    if let Err(e) = password_policy::validate_password(new_password) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ResetPasswordResponse {
+                success: false,
+                error: Some(e.to_string()),
+            }),
+        ));
+    }
+
+    let encrypted = hash_password(new_password).map_err(|e| {
+        error!("Password hash failed during reset: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ResetPasswordResponse {
+                success: false,
+                error: Some("Server error. Please try again.".to_string()),
+            }),
+        )
+    })?;
+
+    let result = sqlx::query(
+        "UPDATE instance_users SET encrypted_password = $1, reset_password_token = NULL, reset_password_sent_at = NULL, updated_at = NOW() WHERE reset_password_token = $2 AND status = 'active'",
+    )
+    .bind(&encrypted)
+    .bind(token)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error during password reset: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ResetPasswordResponse {
+                success: false,
+                error: Some("Server error. Please try again.".to_string()),
+            }),
+        )
+    })?;
+
+    if result.rows_affected() == 0 {
+        return Ok(Json(ResetPasswordResponse {
+            success: false,
+            error: Some(
+                "Invalid or expired reset link. Please request a new password reset.".to_string(),
+            ),
+        }));
+    }
+
+    Ok(Json(ResetPasswordResponse {
+        success: true,
+        error: None,
     }))
 }

@@ -18,9 +18,27 @@ use leadsnebula_core::services::auction_timing::AtomicAuctionTiming;
 use leadsnebula_core::services::diagnostic_metrics::DiagnosticMetrics;
 use leadsnebula_core::services::ssm_key_cache::get_ssm_parameter_cached;
 use simd_json;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
+
+const RATE_LIMIT_PER_HOUR: u32 = 360;
+const RATE_LIMIT_WINDOW_SECONDS: u64 = 3600;
+
+#[derive(Clone, Debug)]
+struct RateBucket {
+    window_start: Instant,
+    count: u32,
+}
+
+static LEAD_RATE_BUCKETS: OnceLock<Mutex<HashMap<String, RateBucket>>> = OnceLock::new();
+
+fn rate_buckets() -> &'static Mutex<HashMap<String, RateBucket>> {
+    LEAD_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn map_error_to_user(err_text: &str) -> (String, String) {
     let lower = err_text.to_lowercase();
@@ -78,6 +96,131 @@ fn map_error_to_user(err_text: &str) -> (String, String) {
     (friendly, technical)
 }
 
+/// Returns the first missing required field name for the given request type, or None if all required fields are present.
+/// campaign_token is optional (required only for ronin campaigns; see post-prechecks validation).
+/// purchase_timeframe is optional for all request types. roof_shade is required for all.
+fn missing_required_lead_field(lead: &LeadData, request_type: &str) -> Option<&'static str> {
+    let check = |name: &'static str, present: bool| -> Option<&'static str> {
+        if present {
+            None
+        } else {
+            Some(name)
+        }
+    };
+    match request_type {
+        "post" => {
+            let r = [
+                ("promise_id", lead.promise_id.is_some()),
+                ("publisher_id", lead.publisher_id.is_some()),
+                ("request_type", lead.request_type.is_some()),
+                ("first_name", lead.first_name.is_some()),
+                ("last_name", lead.last_name.is_some()),
+                ("email", lead.email.is_some()),
+                ("cell_phone", lead.cell_phone.is_some()),
+                ("street_address", lead.street_address.is_some()),
+                ("city", lead.city.is_some()),
+                ("state", lead.state.is_some()),
+                ("zip", lead.zip.is_some()),
+                ("ip_address", lead.ip_address.is_some()),
+                ("monthly_bill", lead.monthly_bill.is_some()),
+                ("own_home", lead.own_home.is_some()),
+                ("roof_shade", lead.roof_shade.is_some()),
+                ("utility_provider", lead.utility_provider.is_some()),
+                ("property_type", lead.property_type.is_some()),
+                ("tcpa_consent", lead.tcpa_consent.is_some()),
+                ("tcpa_language", lead.tcpa_language.is_some()),
+                ("credit_rating", lead.credit_rating.is_some()),
+                ("jornaya_lead_id", lead.jornaya_lead_id.is_some()),
+                ("trusted_form_url", lead.trusted_form_url.is_some()),
+            ];
+            for (name, present) in r {
+                if let Some(m) = check(name, present) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        "fullpost" => {
+            let r = [
+                ("publisher_id", lead.publisher_id.is_some()),
+                ("request_type", lead.request_type.is_some()),
+                ("first_name", lead.first_name.is_some()),
+                ("last_name", lead.last_name.is_some()),
+                ("email", lead.email.is_some()),
+                ("cell_phone", lead.cell_phone.is_some()),
+                ("street_address", lead.street_address.is_some()),
+                ("city", lead.city.is_some()),
+                ("state", lead.state.is_some()),
+                ("zip", lead.zip.is_some()),
+                ("ip_address", lead.ip_address.is_some()),
+                ("monthly_bill", lead.monthly_bill.is_some()),
+                ("own_home", lead.own_home.is_some()),
+                ("roof_shade", lead.roof_shade.is_some()),
+                ("utility_provider", lead.utility_provider.is_some()),
+                ("credit_rating", lead.credit_rating.is_some()),
+                ("tcpa_consent", lead.tcpa_consent.is_some()),
+                ("tcpa_language", lead.tcpa_language.is_some()),
+                ("jornaya_lead_id", lead.jornaya_lead_id.is_some()),
+                ("trusted_form_url", lead.trusted_form_url.is_some()),
+            ];
+            for (name, present) in r {
+                if let Some(m) = check(name, present) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        _ => {
+            // ping (order: check each required field)
+            let r = [
+                ("publisher_id", lead.publisher_id.is_some()),
+                ("request_type", lead.request_type.is_some()),
+                ("zip", lead.zip.is_some()),
+                ("ip_address", lead.ip_address.is_some()),
+                ("monthly_bill", lead.monthly_bill.is_some()),
+                ("own_home", lead.own_home.is_some()),
+                ("roof_shade", lead.roof_shade.is_some()),
+                ("credit_rating", lead.credit_rating.is_some()),
+                ("tcpa_consent", lead.tcpa_consent.is_some()),
+                ("tcpa_language", lead.tcpa_language.is_some()),
+                ("jornaya_lead_id", lead.jornaya_lead_id.is_some()),
+                ("trusted_form_url", lead.trusted_form_url.is_some()),
+            ];
+            for (name, present) in r {
+                if !present {
+                    return Some(name);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Transform per_buyer_timings for verbose response: align status with main outcome, strip bid for fullpost.
+/// Ensures verbose is consistent (e.g. "sold" not "accepted") and fullpost never exposes bid.
+pub(crate) fn transform_per_buyer_timings_for_verbose(
+    timings: &[serde_json::Value],
+    main_status: &str,
+    is_fullpost: bool,
+) -> Vec<serde_json::Value> {
+    timings
+        .iter()
+        .map(|t| {
+            let mut obj = t.clone();
+            if let Some(o) = obj.as_object_mut() {
+                if is_fullpost {
+                    o.remove("bid");
+                }
+                o.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(main_status.to_string()),
+                );
+            }
+            obj
+        })
+        .collect()
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct LeadRequest {
     pub verbose: Option<bool>,
@@ -97,7 +240,6 @@ pub struct LeadData {
     pub last_name: Option<String>,
     pub email: Option<String>,
     pub cell_phone: Option<String>,
-    pub mobile_phone: Option<String>,
     pub street_address: Option<String>,
     pub city: Option<String>,
     pub state: Option<String>,
@@ -159,7 +301,65 @@ pub struct LeadResponse {
 }
 
 pub fn leads_routes() -> Router<AppState> {
-    Router::new().route("/api/v1/leads", post(create_lead))
+    Router::new()
+        .route("/api/v1/leads", post(create_lead))
+        .route("/api/v1/leads/ping", post(create_lead_ping))
+        .route("/api/v1/leads/post", post(create_lead_post))
+        .route("/api/v1/leads/fullpost", post(create_lead_fullpost))
+}
+
+async fn create_lead_ping(
+    State(state): State<AppState>,
+    Extension(publisher): Extension<Publisher>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Json(mut payload): Json<LeadRequest>,
+) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
+    payload.lead.request_type = Some("ping".to_string());
+    create_lead(
+        State(state),
+        Extension(publisher),
+        Query(params),
+        headers,
+        Json(payload),
+    )
+    .await
+}
+
+async fn create_lead_post(
+    State(state): State<AppState>,
+    Extension(publisher): Extension<Publisher>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Json(mut payload): Json<LeadRequest>,
+) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
+    payload.lead.request_type = Some("post".to_string());
+    create_lead(
+        State(state),
+        Extension(publisher),
+        Query(params),
+        headers,
+        Json(payload),
+    )
+    .await
+}
+
+async fn create_lead_fullpost(
+    State(state): State<AppState>,
+    Extension(publisher): Extension<Publisher>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Json(mut payload): Json<LeadRequest>,
+) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
+    payload.lead.request_type = Some("fullpost".to_string());
+    create_lead(
+        State(state),
+        Extension(publisher),
+        Query(params),
+        headers,
+        Json(payload),
+    )
+    .await
 }
 
 /// Extract request context for compliance/verbose (ISO 27001, SOC 2, NIST).
@@ -247,6 +447,58 @@ async fn create_lead(
     headers: HeaderMap,
     Json(payload): Json<LeadRequest>,
 ) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
+    // Enforce per-publisher lead rate limit (360 requests/hour).
+    let rate_key = format!("publisher:{}", publisher.id);
+    let now = Instant::now();
+    if let Ok(mut map) = rate_buckets().lock() {
+        let bucket = map.entry(rate_key).or_insert(RateBucket {
+            window_start: now,
+            count: 0,
+        });
+
+        if now.duration_since(bucket.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECONDS {
+            bucket.window_start = now;
+            bucket.count = 0;
+        }
+
+        if bucket.count >= RATE_LIMIT_PER_HOUR {
+            let elapsed = now.duration_since(bucket.window_start).as_secs();
+            let retry_after = RATE_LIMIT_WINDOW_SECONDS.saturating_sub(elapsed);
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(LeadResponse {
+                    status: StatusNode {
+                        success: false,
+                        status: "error".to_string(),
+                        message: Some(format!(
+                            "Rate limit exceeded: max {} requests per hour",
+                            RATE_LIMIT_PER_HOUR
+                        )),
+                        error: Some("Too many requests".to_string()),
+                    },
+                    lead: LeadNode {
+                        promise_id: Some(String::new()),
+                        lead_id: Some(String::new()),
+                        lead_uuid: Some(String::new()),
+                        ping_id: Some(String::new()),
+                        bid: Some(0.0),
+                        post_id: Some(String::new()),
+                        price: Some(0.0),
+                    },
+                    verbose: Some(serde_json::json!({
+                        "status_code": 429,
+                        "rate_limit_per_hour": RATE_LIMIT_PER_HOUR,
+                        "remaining": 0,
+                        "retry_after_seconds": retry_after
+                    })),
+                    http_status: Some(429),
+                }),
+            ));
+        }
+
+        bucket.count += 1;
+    }
+
     // BLAME-SHIFTING: Track total wall-clock time from request start
     let request_start = std::time::Instant::now();
 
@@ -270,12 +522,11 @@ async fn create_lead(
         .unwrap_or("ping")
         .to_lowercase();
 
-    // Log at warn so it appears with default RUST_LOG=warn (helps debug "leads not selling" / no logs)
     tracing::warn!(
         vertical = %lead_data.vertical,
         request_type = %request_type,
         publisher_id = %publisher.id,
-        "Carina /api/v1/leads request received"
+        "POST /api/v1/leads request received"
     );
 
     // Top-level verbose takes precedence; only use lead-level verbose if top-level is not set
@@ -500,19 +751,159 @@ async fn create_lead(
         }
     }
 
+    // Validate required fields for this request type (API is source of truth)
+    if let Some(field) = missing_required_lead_field(&lead_data, &request_type) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(LeadResponse {
+                status: StatusNode {
+                    success: false,
+                    status: "error".to_string(),
+                    message: Some(format!("Missing required field: {}", field)),
+                    error: Some(format!("Missing required field: {}", field)),
+                },
+                lead: LeadNode {
+                    promise_id: None,
+                    lead_id: None,
+                    lead_uuid: None,
+                    ping_id: None,
+                    bid: None,
+                    post_id: None,
+                    price: None,
+                },
+                verbose: if verbose_requested {
+                    Some(serde_json::json!({
+                        "error_code": "ERR_400",
+                        "timestamp": Utc::now().to_rfc3339(),
+                        "endpoint": "POST /api/v1/leads",
+                        "status_code": 400
+                    }))
+                } else {
+                    None
+                },
+                http_status: Some(400),
+            }),
+        ));
+    }
+
     // Handle post request (update existing lead)
     if request_type == "post" {
-        let promise_id = match lead_data.promise_id {
-            Some(ref p) => p.clone(),
-            None => {
+        let promise_id = lead_data
+            .promise_id
+            .as_ref()
+            .expect("promise_id validated above")
+            .clone();
+        let lead_id_str = lead_data.lead_id.as_deref().filter(|s| !s.is_empty());
+        // CACHE: Lead lookup by promise_id (5m TTL). Use skip_none so we do NOT cache None.
+        let lead_cache_key = format!("lead:promise_id:{}", promise_id);
+        let by_promise: anyhow::Result<Option<leadsnebula_core::models::lead::Lead>> =
+            if let Some(cache) = &state.cache {
+                cache
+                    .get_or_insert_with_skip_none(&lead_cache_key, 300, || async {
+                        leadsnebula_core::models::lead::Lead::find_by_promise_id(
+                            &state.db_pool,
+                            &promise_id,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                    })
+                    .await
+            } else {
+                leadsnebula_core::models::lead::Lead::find_by_promise_id(
+                    &state.db_pool,
+                    &promise_id,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+            };
+        let lead = match by_promise {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                if let Some(lid) = lead_id_str {
+                    // Fallback: find by lead_id (row is keyed by lead_id; ON CONFLICT keeps same row)
+                    match leadsnebula_core::models::lead::Lead::find_by_lead_id(&state.db_pool, lid)
+                        .await
+                    {
+                        Ok(Some(l)) => l,
+                        _ => {
+                            return Ok((
+                                StatusCode::NOT_FOUND,
+                                Json(LeadResponse {
+                                    status: StatusNode {
+                                        success: false,
+                                        status: "error".to_string(),
+                                        message: None,
+                                        error: Some("Lead not found".to_string()),
+                                    },
+                                    lead: LeadNode {
+                                        promise_id: None,
+                                        lead_id: None,
+                                        lead_uuid: None,
+                                        ping_id: None,
+                                        bid: None,
+                                        post_id: None,
+                                        price: None,
+                                    },
+                                    verbose: if verbose_requested {
+                                        Some(serde_json::json!({
+                                            "error_code": format!("ERR_{}", 404),
+                                            "timestamp": Utc::now().to_rfc3339(),
+                                            "endpoint": "POST /api/v1/leads",
+                                            "status_code": 404
+                                        }))
+                                    } else {
+                                        None
+                                    },
+                                    http_status: Some(404),
+                                }),
+                            ));
+                        }
+                    }
+                } else {
+                    return Ok((
+                        StatusCode::NOT_FOUND,
+                        Json(LeadResponse {
+                            status: StatusNode {
+                                success: false,
+                                status: "error".to_string(),
+                                message: None,
+                                error: Some("Lead not found".to_string()),
+                            },
+                            lead: LeadNode {
+                                promise_id: None,
+                                lead_id: None,
+                                lead_uuid: None,
+                                ping_id: None,
+                                bid: None,
+                                post_id: None,
+                                price: None,
+                            },
+                            verbose: if verbose_requested {
+                                Some(serde_json::json!({
+                                    "error_code": format!("ERR_{}", 404),
+                                    "timestamp": Utc::now().to_rfc3339(),
+                                    "endpoint": "POST /api/v1/leads",
+                                    "status_code": 404
+                                }))
+                            } else {
+                                None
+                            },
+                            http_status: Some(404),
+                        }),
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::error!("Database error finding lead: {}", e);
+                let (message, technical) = map_error_to_user(&e.to_string());
                 return Ok((
                     StatusCode::BAD_REQUEST,
                     Json(LeadResponse {
                         status: StatusNode {
                             success: false,
                             status: "error".to_string(),
-                            message: None,
-                            error: Some("Missing promise_id for post request".to_string()),
+                            message: Some(message),
+                            error: Some(technical),
                         },
                         lead: LeadNode {
                             promise_id: None,
@@ -525,181 +916,17 @@ async fn create_lead(
                         },
                         verbose: if verbose_requested {
                             Some(serde_json::json!({
-                                "error_code": "ERR_400",
+                                "error_code": "ERR_500",
                                 "timestamp": Utc::now().to_rfc3339(),
                                 "endpoint": "POST /api/v1/leads",
-                                "status_code": 400,
-                                "note": "Post requests must include a promise_id"
+                                "status_code": 500
                             }))
                         } else {
                             None
                         },
-                        http_status: Some(400),
+                        http_status: Some(500),
                     }),
                 ));
-            }
-        };
-        // CACHE: Lead lookup by promise_id (5m TTL - leads don't change after creation)
-        let lead_cache_key = format!("lead:promise_id:{}", promise_id);
-        let lead = if let Some(cache) = &state.cache {
-            match cache
-                .get_or_insert_with(&lead_cache_key, 300, || async {
-                    leadsnebula_core::models::lead::Lead::find_by_promise_id(
-                        &state.db_pool,
-                        &promise_id,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Database error: {}", e))
-                })
-                .await
-            {
-                Ok(Some(l)) => l,
-                Ok(None) => {
-                    return Ok((
-                        StatusCode::NOT_FOUND,
-                        Json(LeadResponse {
-                            status: StatusNode {
-                                success: false,
-                                status: "error".to_string(),
-                                message: None,
-                                error: Some("Lead not found".to_string()),
-                            },
-                            lead: LeadNode {
-                                promise_id: None,
-                                lead_id: None,
-                                lead_uuid: None,
-                                ping_id: None,
-                                bid: None,
-                                post_id: None,
-                                price: None,
-                            },
-                            verbose: if verbose_requested {
-                                Some(serde_json::json!({
-                                    "error_code": format!("ERR_{}", 404),
-                                    "timestamp": Utc::now().to_rfc3339(),
-                                    "endpoint": "POST /api/v1/leads",
-                                    "status_code": 404
-                                }))
-                            } else {
-                                None
-                            },
-                            http_status: Some(404),
-                        }),
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!("Database error finding lead: {}", e);
-                    let (message, technical) = map_error_to_user(&e.to_string());
-                    return Ok((
-                        StatusCode::BAD_REQUEST,
-                        Json(LeadResponse {
-                            status: StatusNode {
-                                success: false,
-                                status: "error".to_string(),
-                                message: Some(message),
-                                error: Some(technical),
-                            },
-                            lead: LeadNode {
-                                promise_id: None,
-                                lead_id: None,
-                                lead_uuid: None,
-                                ping_id: None,
-                                bid: None,
-                                post_id: None,
-                                price: None,
-                            },
-                            verbose: if verbose_requested {
-                                Some(serde_json::json!({
-                                    "error_code": "ERR_500",
-                                    "timestamp": Utc::now().to_rfc3339(),
-                                    "endpoint": "POST /api/v1/leads",
-                                    "status_code": 500
-                                }))
-                            } else {
-                                None
-                            },
-                            http_status: Some(500),
-                        }),
-                    ));
-                }
-            }
-        } else {
-            // Fallback if cache not available
-            match leadsnebula_core::models::lead::Lead::find_by_promise_id(
-                &state.db_pool,
-                &promise_id,
-            )
-            .await
-            {
-                Ok(Some(l)) => l,
-                Ok(None) => {
-                    return Ok((
-                        StatusCode::NOT_FOUND,
-                        Json(LeadResponse {
-                            status: StatusNode {
-                                success: false,
-                                status: "error".to_string(),
-                                message: None,
-                                error: Some("Lead not found".to_string()),
-                            },
-                            lead: LeadNode {
-                                promise_id: None,
-                                lead_id: None,
-                                lead_uuid: None,
-                                ping_id: None,
-                                bid: None,
-                                post_id: None,
-                                price: None,
-                            },
-                            verbose: if verbose_requested {
-                                Some(serde_json::json!({
-                                    "error_code": format!("ERR_{}", 404),
-                                    "timestamp": Utc::now().to_rfc3339(),
-                                    "endpoint": "POST /api/v1/leads",
-                                    "status_code": 404
-                                }))
-                            } else {
-                                None
-                            },
-                            http_status: Some(404),
-                        }),
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!("Database error finding lead: {}", e);
-                    let (message, technical) = map_error_to_user(&e.to_string());
-                    return Ok((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(LeadResponse {
-                            status: StatusNode {
-                                success: false,
-                                status: "error".to_string(),
-                                message: Some(message),
-                                error: Some(technical),
-                            },
-                            lead: LeadNode {
-                                promise_id: None,
-                                lead_id: None,
-                                lead_uuid: None,
-                                ping_id: None,
-                                bid: None,
-                                post_id: None,
-                                price: None,
-                            },
-                            verbose: if verbose_requested {
-                                Some(serde_json::json!({
-                                    "error_code": "ERR_500",
-                                    "timestamp": Utc::now().to_rfc3339(),
-                                    "endpoint": "POST /api/v1/leads",
-                                    "status_code": 500
-                                }))
-                            } else {
-                                None
-                            },
-                            http_status: Some(500),
-                        }),
-                    ));
-                }
             }
         };
 
@@ -1602,7 +1829,18 @@ async fn create_lead(
                 );
             }
 
-            // Validate results and add problems if needed
+            // Ronin campaign: campaign is active but not in any ping tree; campaign_token is required so we know which campaign to attribute the lead to
+            if !has_ping_tree
+                && campaign_id_opt.is_some()
+                && lead_data
+                    .campaign_token
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+            {
+                preproblems.push(
+                    "This campaign is not in a ping tree (ronin). campaign_token is required when submitting leads to a ronin campaign.".to_string(),
+                );
+            }
             if campaign_id_opt.is_none() && lead_data.campaign_token.is_some() {
                 preproblems.push("No campaign configured for this publisher/vertical".to_string());
             }
@@ -1692,16 +1930,6 @@ async fn create_lead(
     // Always available (not feature-gated) for production performance monitoring
     let critical_path_start = std::time::Instant::now();
 
-    // Generate temporary UUID for lead (will be used in DB insert)
-    let lead_uuid = uuid::Uuid::new_v4();
-
-    // DEBUG: Detailed timing (only in debug mode, not in production)
-    tracing::debug!(
-        lead_uuid = %lead_uuid,
-        stage = "critical_path_start",
-        "Starting critical path timing"
-    );
-
     // Generate identifiers only after pre-checks pass
     let id_generation_start = std::time::Instant::now();
     // OPTIMIZED: Use String::with_capacity + push_str instead of format! for better performance
@@ -1719,6 +1947,23 @@ async fn create_lead(
         }
         result
     });
+
+    // When client sends lead_id, use deterministic UUID so duplicate lead_id is idempotent (post can find lead)
+    let lead_uuid = if let Some(ref lid) = lead_data.lead_id {
+        if !lid.is_empty() {
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, lid.as_bytes())
+        } else {
+            uuid::Uuid::new_v4()
+        }
+    } else {
+        uuid::Uuid::new_v4()
+    };
+
+    tracing::debug!(
+        lead_uuid = %lead_uuid,
+        stage = "critical_path_start",
+        "Starting critical path timing"
+    );
 
     // OPTIMIZED: Use String::with_capacity instead of format!
     let event_uuid = uuid::Uuid::new_v4();
@@ -1841,10 +2086,7 @@ async fn create_lead(
             first_name: lead_data.first_name.clone(),
             last_name: lead_data.last_name.clone(),
             email: lead_data.email.clone(),
-            cell_phone: lead_data
-                .cell_phone
-                .clone()
-                .or_else(|| lead_data.mobile_phone.clone()),
+            cell_phone: lead_data.cell_phone.clone(),
             street_address: lead_data.street_address.clone(),
             city: lead_data.city.clone(),
             state: lead_data.state.clone(),
@@ -1962,6 +2204,7 @@ async fn create_lead(
 
         // Return 202 Accepted immediately with lead_uuid
         // Client can poll for status using lead_uuid if needed
+        // promise_id only for ping (client uses it for post); fullpost does not expose it
         return Ok((
             StatusCode::ACCEPTED,
             Json(LeadResponse {
@@ -1972,7 +2215,11 @@ async fn create_lead(
                     error: None,
                 },
                 lead: LeadNode {
-                    promise_id: promise_id.clone(),
+                    promise_id: if request_type == "fullpost" {
+                        None
+                    } else {
+                        promise_id.clone()
+                    },
                     lead_id: if lead_id.is_empty() {
                         None
                     } else {
@@ -2152,12 +2399,73 @@ async fn create_lead(
                 None
             };
 
-            // DECOUPLED: Buyer and campaign names removed from critical path
-            // Names are only cosmetic and not needed for core response
-            // If needed, they can be fetched asynchronously or included in verbose response
-            // This saves 10-50ms per request (even with cache hits, there's still overhead)
-            let buyer_name: Option<String> = None;
-            let campaign_name: Option<String> = None;
+            // Fetch buyer and campaign names when verbose requested (for routing display)
+            let (buyer_name, campaign_name) = if minimal_mode || !verbose_requested {
+                (None, None)
+            } else {
+                tokio::join!(
+                    async {
+                        if let Some(bid) = routing_result.buyer_id {
+                            let cache_key = format!("buyer:name:{}", bid);
+                            if let Some(cache) = &state.cache {
+                                cache
+                                    .get_or_insert_with(&cache_key, 3600, || async {
+                                        sqlx::query_scalar::<_, String>(
+                                            "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                                        )
+                                        .bind(bid)
+                                        .fetch_optional(&*state.db_pool)
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                sqlx::query_scalar::<_, String>(
+                                    "SELECT name FROM buyers WHERE id = $1 AND deleted_at IS NULL",
+                                )
+                                .bind(bid)
+                                .fetch_optional(&*state.db_pool)
+                                .await
+                                .unwrap_or_default()
+                            }
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if let Some(cid) = routing_result.campaign_id {
+                            let cache_key = format!("campaign:name:{}", cid);
+                            if let Some(cache) = &state.cache {
+                                cache
+                                    .get_or_insert_with(&cache_key, 3600, || async {
+                                        sqlx::query_scalar::<_, String>(
+                                            "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                                        )
+                                        .bind(cid)
+                                        .fetch_optional(&*state.db_pool)
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("Database error: {}", e))
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                sqlx::query_scalar::<_, String>(
+                                    "SELECT name FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+                                )
+                                .bind(cid)
+                                .fetch_optional(&*state.db_pool)
+                                .await
+                                .unwrap_or_default()
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                )
+            };
 
             // OPTIMIZED: Only build verbose JSON if explicitly requested
             // Skip in minimal mode or when verbose is false to avoid unnecessary overhead
@@ -2227,11 +2535,16 @@ async fn create_lead(
                     serde_json::Value::Object(routing_map),
                 );
 
-                // Add per_buyer_timings if available
+                // Add per_buyer_timings if available (align status with main outcome; fullpost: no bid)
                 if let Some(ref timings) = routing_result.per_buyer_timings {
+                    let transformed = transform_per_buyer_timings_for_verbose(
+                        timings,
+                        &routing_result.status,
+                        request_type == "fullpost",
+                    );
                     json_obj_map.insert(
                         "per_buyer_timings".to_string(),
-                        serde_json::Value::Array(timings.clone()),
+                        serde_json::Value::Array(transformed),
                     );
                 }
 
@@ -2880,6 +3193,7 @@ async fn create_lead(
             }
 
             // Build response first (don't wait for logging)
+            // promise_id is only for ping/post; fullpost does not expose it (single-step flow, no post follow-up)
             let response = LeadResponse {
                 status: StatusNode {
                     success: routing_result.success,
@@ -2888,11 +3202,19 @@ async fn create_lead(
                     error: routing_result.error.clone(),
                 },
                 lead: LeadNode {
-                    promise_id: routing_result.promise_id.clone(),
+                    promise_id: if request_type == "fullpost" {
+                        None
+                    } else {
+                        routing_result.promise_id.clone()
+                    },
                     lead_id: Some(lead_id),
                     lead_uuid: Some(lead_uuid.to_string()),
                     ping_id: None,
-                    bid,
+                    bid: if request_type == "fullpost" {
+                        None
+                    } else {
+                        bid
+                    },
                     post_id: routing_result.post_id.clone(),
                     price,
                 },
@@ -2954,5 +3276,483 @@ async fn create_lead(
                 }),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        missing_required_lead_field, transform_per_buyer_timings_for_verbose, LeadData, LeadNode,
+        LeadResponse, StatusNode,
+    };
+    use serde_json::json;
+
+    fn full_ping_lead() -> LeadData {
+        LeadData {
+            publisher_id: Some("a1b2c3d4-e5f6-4780-a123-456789abcdef".into()),
+            vertical: "solar".into(),
+            request_type: Some("ping".into()),
+            campaign_token: None,
+            promise_id: None,
+            lead_id: None,
+            first_name: None,
+            last_name: None,
+            email: None,
+            cell_phone: None,
+            street_address: None,
+            city: None,
+            state: None,
+            zip: Some("90210".into()),
+            monthly_bill: Some(100.0),
+            credit_rating: Some("good".into()),
+            own_home: Some(true),
+            property_type: None,
+            roof_shade: Some("partial".into()),
+            roof_type: None,
+            utility_provider: None,
+            purchase_timeframe: None,
+            ip_address: Some("192.168.1.1".into()),
+            tcpa_consent: Some(true),
+            tcpa_language: Some("I agree".into()),
+            jornaya_lead_id: Some("j".into()),
+            trusted_form_url: Some("https://x".into()),
+            is_test: None,
+            verbose: None,
+        }
+    }
+
+    fn full_post_lead() -> LeadData {
+        LeadData {
+            publisher_id: Some("a1b2c3d4-e5f6-4780-a123-456789abcdef".into()),
+            vertical: "solar".into(),
+            request_type: Some("post".into()),
+            campaign_token: None,
+            promise_id: Some("prom_123".into()),
+            lead_id: None,
+            first_name: Some("John".into()),
+            last_name: Some("Doe".into()),
+            email: Some("j@example.com".into()),
+            cell_phone: Some("5551234567".into()),
+            street_address: Some("123 Main St".into()),
+            city: Some("Anytown".into()),
+            state: Some("CA".into()),
+            zip: Some("90210".into()),
+            monthly_bill: Some(100.0),
+            credit_rating: Some("good".into()),
+            own_home: Some(true),
+            property_type: Some("single_family".into()),
+            roof_shade: Some("partial".into()),
+            roof_type: None,
+            utility_provider: Some("Acme".into()),
+            purchase_timeframe: None,
+            ip_address: Some("192.168.1.1".into()),
+            tcpa_consent: Some(true),
+            tcpa_language: Some("I agree".into()),
+            jornaya_lead_id: Some("j".into()),
+            trusted_form_url: Some("https://x".into()),
+            is_test: None,
+            verbose: None,
+        }
+    }
+
+    fn full_fullpost_lead() -> LeadData {
+        LeadData {
+            publisher_id: Some("a1b2c3d4-e5f6-4780-a123-456789abcdef".into()),
+            vertical: "solar".into(),
+            request_type: Some("fullpost".into()),
+            campaign_token: None,
+            promise_id: None,
+            lead_id: None,
+            first_name: Some("John".into()),
+            last_name: Some("Doe".into()),
+            email: Some("j@example.com".into()),
+            cell_phone: Some("5551234567".into()),
+            street_address: Some("123 Main St".into()),
+            city: Some("Anytown".into()),
+            state: Some("CA".into()),
+            zip: Some("90210".into()),
+            monthly_bill: Some(100.0),
+            credit_rating: Some("good".into()),
+            own_home: Some(true),
+            property_type: None,
+            roof_shade: Some("partial".into()),
+            roof_type: None,
+            utility_provider: Some("Acme".into()),
+            purchase_timeframe: None,
+            ip_address: Some("192.168.1.1".into()),
+            tcpa_consent: Some(true),
+            tcpa_language: Some("I agree".into()),
+            jornaya_lead_id: Some("j".into()),
+            trusted_form_url: Some("https://x".into()),
+            is_test: None,
+            verbose: None,
+        }
+    }
+
+    #[test]
+    fn ping_all_required_present_returns_none() {
+        assert!(missing_required_lead_field(&full_ping_lead(), "ping").is_none());
+    }
+
+    #[test]
+    fn ping_missing_publisher_id() {
+        let mut lead = full_ping_lead();
+        lead.publisher_id = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "ping"),
+            Some("publisher_id")
+        );
+    }
+
+    #[test]
+    fn ping_missing_roof_shade() {
+        let mut lead = full_ping_lead();
+        lead.roof_shade = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "ping"),
+            Some("roof_shade")
+        );
+    }
+
+    #[test]
+    fn ping_missing_zip() {
+        let mut lead = full_ping_lead();
+        lead.zip = None;
+        assert_eq!(missing_required_lead_field(&lead, "ping"), Some("zip"));
+    }
+
+    #[test]
+    fn ping_missing_credit_rating() {
+        let mut lead = full_ping_lead();
+        lead.credit_rating = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "ping"),
+            Some("credit_rating")
+        );
+    }
+
+    #[test]
+    fn ping_campaign_token_optional() {
+        let mut lead = full_ping_lead();
+        lead.campaign_token = None;
+        assert!(missing_required_lead_field(&lead, "ping").is_none());
+    }
+
+    #[test]
+    fn ping_purchase_timeframe_optional() {
+        let mut lead = full_ping_lead();
+        lead.purchase_timeframe = None;
+        assert!(missing_required_lead_field(&lead, "ping").is_none());
+    }
+
+    #[test]
+    fn post_all_required_present_returns_none() {
+        assert!(missing_required_lead_field(&full_post_lead(), "post").is_none());
+    }
+
+    #[test]
+    fn post_missing_promise_id() {
+        let mut lead = full_post_lead();
+        lead.promise_id = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "post"),
+            Some("promise_id")
+        );
+    }
+
+    #[test]
+    fn post_missing_roof_shade() {
+        let mut lead = full_post_lead();
+        lead.roof_shade = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "post"),
+            Some("roof_shade")
+        );
+    }
+
+    #[test]
+    fn post_missing_cell_phone() {
+        let mut lead = full_post_lead();
+        lead.cell_phone = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "post"),
+            Some("cell_phone")
+        );
+    }
+
+    #[test]
+    fn post_campaign_token_and_purchase_timeframe_optional() {
+        let mut lead = full_post_lead();
+        lead.campaign_token = None;
+        lead.purchase_timeframe = None;
+        assert!(missing_required_lead_field(&lead, "post").is_none());
+    }
+
+    #[test]
+    fn fullpost_all_required_present_returns_none() {
+        assert!(missing_required_lead_field(&full_fullpost_lead(), "fullpost").is_none());
+    }
+
+    #[test]
+    fn fullpost_missing_roof_shade() {
+        let mut lead = full_fullpost_lead();
+        lead.roof_shade = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "fullpost"),
+            Some("roof_shade")
+        );
+    }
+
+    #[test]
+    fn fullpost_missing_ip_address() {
+        let mut lead = full_fullpost_lead();
+        lead.ip_address = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "fullpost"),
+            Some("ip_address")
+        );
+    }
+
+    #[test]
+    fn fullpost_missing_cell_phone() {
+        let mut lead = full_fullpost_lead();
+        lead.cell_phone = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "fullpost"),
+            Some("cell_phone")
+        );
+    }
+
+    #[test]
+    fn fullpost_purchase_timeframe_optional() {
+        let mut lead = full_fullpost_lead();
+        lead.purchase_timeframe = None;
+        assert!(missing_required_lead_field(&lead, "fullpost").is_none());
+    }
+
+    #[test]
+    fn fullpost_campaign_token_optional() {
+        let mut lead = full_fullpost_lead();
+        lead.campaign_token = None;
+        assert!(missing_required_lead_field(&lead, "fullpost").is_none());
+    }
+
+    // --- Post: additional required fields (prevent regressions) ---
+    #[test]
+    fn post_missing_first_name() {
+        let mut lead = full_post_lead();
+        lead.first_name = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "post"),
+            Some("first_name")
+        );
+    }
+
+    #[test]
+    fn post_missing_email() {
+        let mut lead = full_post_lead();
+        lead.email = None;
+        assert_eq!(missing_required_lead_field(&lead, "post"), Some("email"));
+    }
+
+    #[test]
+    fn post_missing_ip_address() {
+        let mut lead = full_post_lead();
+        lead.ip_address = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "post"),
+            Some("ip_address")
+        );
+    }
+
+    #[test]
+    fn post_missing_utility_provider() {
+        let mut lead = full_post_lead();
+        lead.utility_provider = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "post"),
+            Some("utility_provider")
+        );
+    }
+
+    // --- Ping: additional required fields ---
+    #[test]
+    fn ping_missing_ip_address() {
+        let mut lead = full_ping_lead();
+        lead.ip_address = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "ping"),
+            Some("ip_address")
+        );
+    }
+
+    #[test]
+    fn ping_missing_monthly_bill() {
+        let mut lead = full_ping_lead();
+        lead.monthly_bill = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "ping"),
+            Some("monthly_bill")
+        );
+    }
+
+    #[test]
+    fn ping_missing_tcpa_consent() {
+        let mut lead = full_ping_lead();
+        lead.tcpa_consent = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "ping"),
+            Some("tcpa_consent")
+        );
+    }
+
+    // --- Fullpost: additional required fields ---
+    #[test]
+    fn fullpost_missing_first_name() {
+        let mut lead = full_fullpost_lead();
+        lead.first_name = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "fullpost"),
+            Some("first_name")
+        );
+    }
+
+    #[test]
+    fn fullpost_missing_email() {
+        let mut lead = full_fullpost_lead();
+        lead.email = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "fullpost"),
+            Some("email")
+        );
+    }
+
+    #[test]
+    fn fullpost_missing_zip() {
+        let mut lead = full_fullpost_lead();
+        lead.zip = None;
+        assert_eq!(missing_required_lead_field(&lead, "fullpost"), Some("zip"));
+    }
+
+    #[test]
+    fn fullpost_missing_utility_provider() {
+        let mut lead = full_fullpost_lead();
+        lead.utility_provider = None;
+        assert_eq!(
+            missing_required_lead_field(&lead, "fullpost"),
+            Some("utility_provider")
+        );
+    }
+
+    // --- Per-buyer timings transformation (verbose consistency + fullpost no bid) ---
+    #[test]
+    fn transform_per_buyer_timings_aligns_status_to_main_sold() {
+        let timings = vec![json!({
+            "bid": 121,
+            "buyer_id": "8f5ac648-7e16-41e1-8343-4f2f03e4669a",
+            "campaign_id": "e2d5de3b-1cb1-435c-91c9-f33acf775ba8",
+            "processing_time_ms": 0,
+            "status": "accepted",
+            "success": true
+        })];
+        let out = transform_per_buyer_timings_for_verbose(&timings, "sold", false);
+        assert_eq!(out.len(), 1);
+        let obj = out[0].as_object().expect("entry is object");
+        assert_eq!(obj.get("status").and_then(|v| v.as_str()), Some("sold"));
+        assert!(obj.get("bid").is_some(), "ping/post keeps bid in verbose");
+    }
+
+    #[test]
+    fn transform_per_buyer_timings_fullpost_strips_bid() {
+        let timings = vec![json!({
+            "bid": 121,
+            "buyer_id": "8f5ac648-7e16-41e1-8343-4f2f03e4669a",
+            "campaign_id": "e2d5de3b-1cb1-435c-91c9-f33acf775ba8",
+            "processing_time_ms": 0,
+            "status": "accepted",
+            "success": true
+        })];
+        let out = transform_per_buyer_timings_for_verbose(&timings, "sold", true);
+        assert_eq!(out.len(), 1);
+        let obj = out[0].as_object().expect("entry is object");
+        assert_eq!(obj.get("status").and_then(|v| v.as_str()), Some("sold"));
+        assert!(
+            obj.get("bid").is_none(),
+            "fullpost must not expose bid in per_buyer_timings"
+        );
+    }
+
+    // --- LeadNode serialization: fullpost has no bid, ping has bid ---
+    #[test]
+    fn lead_node_fullpost_serializes_without_bid() {
+        let node = LeadNode {
+            promise_id: None,
+            lead_id: Some("lead_john_doe_001".into()),
+            lead_uuid: Some("d946682e-a5d8-5da2-b333-02bbad78a088".into()),
+            ping_id: None,
+            bid: None,
+            post_id: Some("RP_xxx".into()),
+            price: Some(167.0),
+        };
+        let json = serde_json::to_value(&node).expect("serialize");
+        let obj = json.as_object().expect("lead is object");
+        assert!(
+            !obj.contains_key("bid"),
+            "fullpost response lead must not contain bid"
+        );
+        assert_eq!(obj.get("price").and_then(|v| v.as_f64()), Some(167.0));
+    }
+
+    #[test]
+    fn lead_node_ping_serializes_with_bid() {
+        let node = LeadNode {
+            promise_id: Some("prom_123".into()),
+            lead_id: Some("lead_001".into()),
+            lead_uuid: Some("uuid-here".into()),
+            ping_id: Some("ping_1".into()),
+            bid: Some(150.0),
+            post_id: None,
+            price: None,
+        };
+        let json = serde_json::to_value(&node).expect("serialize");
+        let obj = json.as_object().expect("lead is object");
+        assert_eq!(
+            obj.get("bid").and_then(|v| v.as_f64()),
+            Some(150.0),
+            "ping response lead must include bid"
+        );
+    }
+
+    #[test]
+    fn lead_response_fullpost_contract_no_bid_in_lead() {
+        let response = LeadResponse {
+            status: StatusNode {
+                success: true,
+                status: "sold".to_string(),
+                message: Some("Lead Sold for $167".to_string()),
+                error: None,
+            },
+            lead: LeadNode {
+                promise_id: None,
+                lead_id: Some("lead_john_doe_001".into()),
+                lead_uuid: Some("uuid".into()),
+                ping_id: None,
+                bid: None,
+                post_id: Some("RP_xxx".into()),
+                price: Some(167.0),
+            },
+            verbose: None,
+            http_status: Some(200),
+        };
+        let json = serde_json::to_value(&response).expect("serialize");
+        let lead = json
+            .get("lead")
+            .and_then(|v| v.as_object())
+            .expect("lead object");
+        assert!(
+            !lead.contains_key("bid"),
+            "fullpost success response lead must never contain bid"
+        );
+        assert!(lead.contains_key("price"));
     }
 }

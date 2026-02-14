@@ -24,7 +24,7 @@ pub struct AppConfig {
     pub environment: String,
     #[allow(dead_code)] // Used by EmailService
     pub from_email: String,
-    /// Base URL for password reset links (e.g. https://app.leadsnebula.com). No trailing slash.
+    /// Base URL for password reset links (dashboard host, e.g. https://dashboard.leadsnebula.com). No trailing slash.
     pub password_reset_base_url: String,
 }
 
@@ -364,7 +364,7 @@ impl AppConfig {
             ))
             .cloned()
             .or_else(|| std::env::var("PASSWORD_RESET_BASE_URL").ok())
-            .unwrap_or_else(|| "https://app.leadsnebula.com".to_string());
+            .unwrap_or_else(|| "https://dashboard.leadsnebula.com".to_string());
 
         // Redis pool size (default: 15, configurable via SSM)
         let redis_pool_size = params

@@ -24,6 +24,24 @@ WHERE vertical_id NOT IN (SELECT id FROM verticals WHERE slug = 'solar');
 DELETE FROM leads
 WHERE vertical_id NOT IN (SELECT id FROM verticals WHERE slug = 'solar');
 
+-- Point buyers that reference non-solar verticals to solar (avoid orphans / FK blocks)
+UPDATE buyers
+SET vertical_id = (SELECT id FROM verticals WHERE slug = 'solar' LIMIT 1)
+WHERE vertical_id IS NOT NULL
+  AND vertical_id NOT IN (SELECT id FROM verticals WHERE slug = 'solar');
+
+-- Delete leads that reference campaigns we are about to remove (leads.campaign_id is NOT NULL; campaign delete would otherwise set it NULL)
+DELETE FROM leads
+WHERE campaign_id IN (
+    SELECT c.id FROM campaigns c
+    LEFT JOIN publishers p ON c.publisher_id = p.id
+    LEFT JOIN buyers b ON c.buyer_id = b.id
+    WHERE (p.id IS NULL OR p.deleted_at IS NOT NULL)
+       OR (b.id IS NULL)
+       OR c.name LIKE 'Test%'
+       OR c.name LIKE 'test%'
+);
+
 -- Delete campaigns that reference non-solar verticals (via buyer_id or publisher_id)
 -- Note: campaigns don't directly reference verticals, but we can identify test campaigns
 -- by their association with test publishers/buyers

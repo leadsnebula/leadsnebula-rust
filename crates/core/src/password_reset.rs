@@ -10,7 +10,7 @@ pub struct PasswordResetService {
 }
 
 impl PasswordResetService {
-    /// * `reset_url_base`: base URL for the reset link (e.g. https://app.leadsnebula.com or https://dev.dashboard.leadsnebula.com). No trailing slash.
+    /// * `reset_url_base`: base URL for the reset link (dashboard host, e.g. https://dashboard.leadsnebula.com or https://dev.dashboard.leadsnebula.com). No trailing slash.
     pub fn new(email_service: Arc<EmailService>, reset_url_base: String) -> Self {
         Self {
             email_service,

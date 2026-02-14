@@ -142,6 +142,7 @@ async fn test_jwt_token_encoding_and_decoding() {
     assert!(claims.exp - claims.iat >= 24 * 3600 - 1);
 }
 
+/// Lightweight: no DB, no heavy crypto. Encode with one secret, decode with another; asserts isolation.
 #[tokio::test]
 async fn test_jwt_token_with_different_secrets() {
     load_test_env();
@@ -154,14 +155,11 @@ async fn test_jwt_token_with_different_secrets() {
     let user_id = "123e4567-e89b-12d3-a456-426614174000".to_string();
     let email = "test@example.com".to_string();
 
-    // Encode with service1
     let token = service1.encode(user_id.clone(), email.clone()).unwrap();
 
-    // Should decode with service1
     let claims1 = service1.decode(&token).unwrap();
     assert_eq!(claims1.user_id, user_id);
 
-    // Should NOT decode with service2 (different secret)
     assert!(service2.decode(&token).is_err());
 }
 

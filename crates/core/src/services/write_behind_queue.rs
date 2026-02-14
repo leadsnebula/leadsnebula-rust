@@ -1,5 +1,15 @@
-// Write-behind queue for batching background database writes
-// Reduces spawn overhead and batches writes for better performance
+//! Write-behind queue: batches background DB writes so the request path stays fast.
+//!
+//! **Purpose:** Lead submission (ping/post) does routing and returns quickly. Persistence (lead
+//! row, pings, ping_payloads, buyer_responses, lead/status updates) is done in a background
+//! task that flushes every 100ms or when the batch hits 10 items. That keeps latency low and
+//! batches small writes into fewer round-trips.
+//!
+//! **Tasks:** LeadCreation, BuyerResponse, LeadUpdate, PayloadUpdate, PulsarLog. The API
+//! enqueues tasks (non-blocking); the batcher drains and runs batch_create_leads, then
+//! batch_insert_buyer_responses, etc. Buyer_responses reference leads by uuid; when
+//! LeadCreation and BuyerResponse are in different flushes we resolve the actual lead uuid
+//! from the DB (by request uuid, ping_id, or lead_id string).
 
 use crate::models::enums::LeadStatus;
 use anyhow::Result;
@@ -157,6 +167,7 @@ type BuyerResponseTuple = (
     Option<String>,
     Option<Uuid>,
     Value,
+    Option<String>, // lead_id_str for resolve when ON CONFLICT used different uuid
 );
 type LeadUpdateTuple = (
     Uuid,
@@ -214,6 +225,7 @@ pub enum BackgroundTask {
         post_id: Option<String>,
         buyer_id: Option<Uuid>,
         payload: Value,
+        lead_id_str: Option<String>, // external lead_id (e.g. "lead_john_doe_001") for resolve when DB row has different uuid
     },
     /// Payload update (ping_payloads or post_payloads)
     PayloadUpdate {
@@ -374,6 +386,7 @@ impl WriteBehindQueue {
                     post_id,
                     buyer_id,
                     payload,
+                    lead_id_str,
                 } => buyer_responses.push((
                     lead_id,
                     campaign_id,
@@ -381,6 +394,7 @@ impl WriteBehindQueue {
                     post_id,
                     buyer_id,
                     payload,
+                    lead_id_str,
                 )),
                 BackgroundTask::LeadUpdate {
                     lead_id,
@@ -435,11 +449,13 @@ impl WriteBehindQueue {
             + lead_creations.len();
 
         // Run lead creation first so leads exist before buyer_responses (FK buyer_responses_lead_id_fkey)
-        let creation_result = Self::batch_create_leads(&lead_creations, pool).await;
-        // Then run the rest in parallel
+        let uuid_map = Self::batch_create_leads(&lead_creations, pool)
+            .await
+            .unwrap_or_default();
+        // Then run the rest in parallel (pass uuid_map so buyer_responses use actual DB lead uuid when different due to ON CONFLICT)
         let (pulsar_result, buyer_result, lead_result, payload_result) = tokio::join!(
             Self::batch_insert_pulsar_logs(&pulsar_logs, pool),
-            Self::batch_insert_buyer_responses(&buyer_responses, pool),
+            Self::batch_insert_buyer_responses(&buyer_responses, &uuid_map, pool),
             Self::batch_update_leads(&lead_updates, pool),
             Self::batch_update_payloads(&payload_updates, pool),
         );
@@ -457,10 +473,7 @@ impl WriteBehindQueue {
             lead_creations.len(),
         );
 
-        // Log errors (non-blocking)
-        if let Err(e) = creation_result {
-            tracing::warn!("Failed to batch create leads: {}", e);
-        }
+        // creation_result (uuid_map) already unwrapped above; lead creation errors are logged inside batch_create_leads
         if let Err(e) = pulsar_result {
             tracing::warn!("Failed to batch insert pulsar logs: {}", e);
         }
@@ -511,11 +524,63 @@ impl WriteBehindQueue {
         Ok(())
     }
 
+    /// Resolve actual lead uuid when not in uuid_map (e.g. LeadCreation was in a previous batch).
+    /// Tries: (1) leads.uuid = request_uuid, (2) pings.lead_id by ping_id, (3) leads.uuid by lead_id string (ON CONFLICT row).
+    async fn resolve_lead_uuid_for_buyer_response(
+        pool: &PgPool,
+        request_uuid: Uuid,
+        ping_id: Option<&str>,
+        lead_id_str: Option<&str>,
+    ) -> Option<Uuid> {
+        // (1) Lead may have been created with this uuid in a previous flush
+        if let Ok(Some(u)) = sqlx::query_scalar::<_, Uuid>("SELECT uuid FROM leads WHERE uuid = $1")
+            .bind(request_uuid)
+            .fetch_optional(pool)
+            .await
+        {
+            tracing::debug!(request_uuid = %request_uuid, resolved = %u, "Resolved lead from leads.uuid");
+            return Some(u);
+        }
+        // (2) Lead may exist with different uuid (ON CONFLICT lead_id); resolve via ping
+        if let Some(pid) = ping_id {
+            if let Ok(Some(lead_uuid)) =
+                sqlx::query_scalar::<_, Uuid>("SELECT lead_id FROM pings WHERE ping_id = $1")
+                    .bind(pid)
+                    .fetch_optional(pool)
+                    .await
+            {
+                tracing::debug!(request_uuid = %request_uuid, resolved = %lead_uuid, "Resolved lead from pings.ping_id");
+                return Some(lead_uuid);
+            }
+        }
+        // (3) ON CONFLICT (lead_id) row: DB has different uuid; look up by string lead_id
+        if let Some(lid) = lead_id_str.filter(|s| !s.is_empty()) {
+            if let Ok(Some(u)) =
+                sqlx::query_scalar::<_, Uuid>("SELECT uuid FROM leads WHERE lead_id = $1")
+                    .bind(lid)
+                    .fetch_optional(pool)
+                    .await
+            {
+                tracing::debug!(request_uuid = %request_uuid, resolved = %u, lead_id = %lid, "Resolved lead from leads.lead_id");
+                return Some(u);
+            }
+        }
+        tracing::warn!(
+            request_uuid = %request_uuid,
+            ping_id = ?ping_id,
+            lead_id_str = ?lead_id_str,
+            "Resolve lead failed: no row in leads or pings"
+        );
+        None
+    }
+
     /// Batch insert buyer responses
-    /// CRITICAL: Buyer responses may be inserted before the lead exists (race condition).
-    /// We retry with exponential backoff to handle this case.
+    /// CRITICAL: LeadCreation and BuyerResponse are often in different batches (flush 100ms vs routing ~450ms).
+    /// Use uuid_map when same batch; otherwise resolve via DB (leads.uuid or pings.lead_id by ping_id).
+    /// uuid_map: request uuid -> actual DB lead uuid (from batch_create_leads); use when ON CONFLICT used a different row.
     async fn batch_insert_buyer_responses(
         responses: &[BuyerResponseTuple],
+        uuid_map: &std::collections::HashMap<uuid::Uuid, uuid::Uuid>,
         pool: &PgPool,
     ) -> Result<()> {
         if responses.is_empty() {
@@ -527,8 +592,44 @@ impl WriteBehindQueue {
         let mut error_count = 0;
         let mut retry_needed = Vec::new();
 
-        // First attempt: try to insert all responses
-        for (lead_id, campaign_id, ping_id, post_id, buyer_id, payload) in responses {
+        // First attempt: resolve actual lead uuid (same-batch map or cross-batch DB lookup by ping_id)
+        let using_cross_batch_resolve = uuid_map.is_empty() && !responses.is_empty();
+        if using_cross_batch_resolve {
+            tracing::warn!(
+                response_count = responses.len(),
+                "Buyer response batch: uuid_map empty (LeadCreation in earlier flush), resolving lead uuid from DB"
+            );
+            // Give the lead-creation flush time to commit (it runs in a different batch; avoid race).
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        for (lead_id, campaign_id, ping_id, post_id, buyer_id, payload, lead_id_str) in responses {
+            let actual_lead_id = match uuid_map.get(lead_id) {
+                Some(&u) => u,
+                None => {
+                    match Self::resolve_lead_uuid_for_buyer_response(
+                        pool,
+                        *lead_id,
+                        ping_id.as_deref(),
+                        lead_id_str.as_deref(),
+                    )
+                    .await
+                    {
+                        Some(u) => u,
+                        None => {
+                            retry_needed.push((
+                                *lead_id,
+                                campaign_id,
+                                ping_id.clone(),
+                                post_id.clone(),
+                                buyer_id,
+                                payload.clone(),
+                                lead_id_str.clone(),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            };
             match sqlx::query(
                 r#"
                 INSERT INTO buyer_responses (lead_id, campaign_id, ping_id, post_id, buyer_id, payload, created_at)
@@ -536,7 +637,7 @@ impl WriteBehindQueue {
                 ON CONFLICT DO NOTHING
                 "#,
             )
-            .bind(lead_id)
+            .bind(actual_lead_id)
             .bind(campaign_id)
             .bind(ping_id)
             .bind(post_id)
@@ -552,8 +653,15 @@ impl WriteBehindQueue {
                     // Check if error is foreign key constraint (lead doesn't exist yet)
                     let error_str = e.to_string();
                     if error_str.contains("buyer_responses_lead_id_fkey") {
-                        // Lead doesn't exist yet - retry after delay
-                        retry_needed.push((lead_id, campaign_id, ping_id.clone(), post_id.clone(), buyer_id, payload.clone()));
+                        retry_needed.push((
+                            *lead_id,
+                            campaign_id,
+                            ping_id.clone(),
+                            post_id.clone(),
+                            buyer_id,
+                            payload.clone(),
+                            lead_id_str.clone(),
+                        ));
                     } else {
                         error_count += 1;
                         tracing::error!(
@@ -569,12 +677,34 @@ impl WriteBehindQueue {
             }
         }
 
-        // Retry failed inserts (lead may have been created by now)
+        // Retry failed inserts (lead may have been created in another batch; resolve via DB if needed)
         if !retry_needed.is_empty() {
-            // Wait a bit for lead creation to complete
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            for (lead_id, campaign_id, ping_id, post_id, buyer_id, payload) in retry_needed {
+            for (lead_id, campaign_id, ping_id, post_id, buyer_id, payload, lead_id_str) in
+                retry_needed
+            {
+                let actual_lead_id = match uuid_map.get(&lead_id) {
+                    Some(&u) => u,
+                    None => match Self::resolve_lead_uuid_for_buyer_response(
+                        pool,
+                        lead_id,
+                        ping_id.as_deref(),
+                        lead_id_str.as_deref(),
+                    )
+                    .await
+                    {
+                        Some(u) => u,
+                        None => {
+                            error_count += 1;
+                            tracing::warn!(
+                                lead_id = %lead_id,
+                                "Skipping buyer_response: lead not in DB (would violate buyer_responses_lead_id_fkey)"
+                            );
+                            continue;
+                        }
+                    },
+                };
                 // Retry up to 3 times with exponential backoff
                 let mut retry_count = 0;
                 let mut inserted = false;
@@ -586,7 +716,7 @@ impl WriteBehindQueue {
                         ON CONFLICT DO NOTHING
                         "#,
                     )
-                    .bind(lead_id)
+                    .bind(actual_lead_id)
                     .bind(campaign_id)
                     .bind(ping_id.as_ref())
                     .bind(post_id.as_ref())
@@ -848,7 +978,7 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await
                     {
-                        Ok(_) => {
+                        Ok(_result) => {
                             let update_duration_ms = update_start.elapsed().as_millis() as u64;
                             // Log lead update (async, non-blocking - 0ms impact)
                             async_log::log_lead_update(
@@ -1041,11 +1171,20 @@ impl WriteBehindQueue {
         Ok(())
     }
 
-    /// Batch create leads with encryption
-    async fn batch_create_leads(creations: &[BackgroundTask], pool: &PgPool) -> Result<()> {
+    /// Batch create leads with encryption.
+    /// Returns a map from request uuid to actual DB lead uuid (so buyer_responses can use the correct FK when ON CONFLICT used a different row).
+    async fn batch_create_leads(
+        creations: &[BackgroundTask],
+        pool: &PgPool,
+    ) -> Result<std::collections::HashMap<uuid::Uuid, uuid::Uuid>> {
+        let mut uuid_map = std::collections::HashMap::new();
         if creations.is_empty() {
-            return Ok(());
+            return Ok(uuid_map);
         }
+        tracing::warn!(
+            count = creations.len(),
+            "batch_create_leads: processing lead creation(s) (lead will be committed before pings)"
+        );
 
         // Process each lead creation individually (encryption happens here)
         for task in creations {
@@ -1145,7 +1284,8 @@ impl WriteBehindQueue {
                     }
                 };
 
-                // Insert lead with explicit UUID (must match UUID returned to client)
+                // Insert lead with explicit UUID (must match UUID returned to client).
+                // ON CONFLICT (lead_id): same lead_id is idempotent — update promise_id so post can find the lead.
                 let lead_uuid_result = sqlx::query(
                     r#"
                     INSERT INTO leads (
@@ -1158,7 +1298,11 @@ impl WriteBehindQueue {
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                         $15, $16, $17, NOW(), NOW(),
                         $18, $19, $20, $21, $22, $23, $24, $25, $26
-                    ) RETURNING uuid
+                    )
+                    ON CONFLICT (lead_id) DO UPDATE SET
+                        promise_id = EXCLUDED.promise_id,
+                        updated_at = NOW()
+                    RETURNING uuid
                     "#,
                 )
                 .bind(*uuid) // CRITICAL: Use the UUID that was returned to the client
@@ -1190,31 +1334,57 @@ impl WriteBehindQueue {
                 .fetch_one(&mut *tx)
                 .await;
 
-                // Verify the returned UUID matches the one we inserted
-                let returned_uuid = match lead_uuid_result {
+                // Use the UUID returned by the DB: on INSERT it matches our uuid; on CONFLICT (lead_id) DO UPDATE
+                // it is the existing row's uuid (so we use it for pings/buyer_responses and promise_id was already updated)
+                let lead_uuid = match lead_uuid_result {
                     Ok(row) => {
                         use sqlx::Row;
                         row.get::<uuid::Uuid, _>(0)
                     }
                     Err(e) => {
-                        tracing::error!("Database error creating lead: {}", e);
+                        tracing::error!(
+                            uuid = %uuid,
+                            lead_id = ?lead_id,
+                            error = %e,
+                            "Database error creating lead (INSERT failed)"
+                        );
                         let _ = tx.rollback().await;
                         continue;
                     }
                 };
 
-                if returned_uuid != *uuid {
+                // Commit lead immediately so it exists for buyer_responses even if pings/ping_payloads fail.
+                // (A failed pings INSERT would abort the transaction and roll back the lead otherwise.)
+                if let Err(e) = tx.commit().await {
                     tracing::error!(
-                        "UUID mismatch: expected {}, got {} - rolling back transaction",
-                        uuid,
-                        returned_uuid
+                        lead_uuid = %lead_uuid,
+                        error = %e,
+                        "Failed to commit lead (lead row will not exist for buyer_responses)"
                     );
-                    let _ = tx.rollback().await;
-                    continue; // Skip commit if UUID doesn't match
+                    continue;
                 }
-                let lead_uuid = *uuid; // Use the UUID we passed in (not the returned one, which should match)
+                uuid_map.insert(*uuid, lead_uuid);
+                tracing::warn!(
+                    lead_uuid = %lead_uuid,
+                    request_uuid = %uuid,
+                    "Lead committed (persisted for buyer_responses resolve)"
+                );
 
-                // Generate ping_id
+                // Pings and ping_payloads in a separate transaction (best-effort; lead is already persisted).
+                let mut tx2 = match pool.begin().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to start transaction for pings (lead {} already saved): {}",
+                            lead_uuid,
+                            e
+                        );
+                        let creation_duration_ms = creation_start.elapsed().as_millis() as u64;
+                        async_log::log_lead_creation(lead_uuid, creation_duration_ms);
+                        continue;
+                    }
+                };
+
                 let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
                 let lead_id_str = lead_uuid.to_string();
                 let payload_str = format!("{}|{}|pending", lead_id_str, timestamp);
@@ -1222,7 +1392,6 @@ impl WriteBehindQueue {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(payload_str);
                 let ping_id_text = format!("FP_{}", encoded);
 
-                // Insert ping record
                 let ping_id_result = sqlx::query(
                     "INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, $3, $4, now(), now()) RETURNING id"
                 )
@@ -1230,7 +1399,7 @@ impl WriteBehindQueue {
                 .bind(lead_uuid)
                 .bind(promise_id.as_ref())
                 .bind("processing")
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *tx2)
                 .await;
 
                 let ping_id_val = match ping_id_result {
@@ -1244,7 +1413,10 @@ impl WriteBehindQueue {
                             lead_uuid,
                             e
                         );
-                        0i64
+                        let _ = tx2.rollback().await;
+                        let creation_duration_ms = creation_start.elapsed().as_millis() as u64;
+                        async_log::log_lead_creation(lead_uuid, creation_duration_ms);
+                        continue;
                     }
                 };
 
@@ -1367,7 +1539,7 @@ impl WriteBehindQueue {
                     .bind(lead_uuid)
                     .bind(sqlx::types::Json(&ping_only_payload))
                     .bind(request_payload_encrypted_value)
-                    .execute(&mut *tx)
+                    .execute(&mut *tx2)
                     .await;
 
                     if let Err(e) = ping_payload_result {
@@ -1379,19 +1551,19 @@ impl WriteBehindQueue {
                     }
                 }
 
-                // Commit transaction
-                let commit_result = tx.commit().await;
-                if let Err(e) = commit_result {
-                    tracing::error!("Failed to commit transaction for lead {}: {}", lead_uuid, e);
-                } else {
-                    let creation_duration_ms = creation_start.elapsed().as_millis() as u64;
-                    // Log lead creation (async, non-blocking - 0ms impact)
-                    async_log::log_lead_creation(lead_uuid, creation_duration_ms);
+                if let Err(e) = tx2.commit().await {
+                    tracing::warn!(
+                        "Failed to commit pings/ping_payloads for lead {} (lead already saved): {}",
+                        lead_uuid,
+                        e
+                    );
                 }
+                let creation_duration_ms = creation_start.elapsed().as_millis() as u64;
+                async_log::log_lead_creation(lead_uuid, creation_duration_ms);
             }
         }
 
-        Ok(())
+        Ok(uuid_map)
     }
 
     /// Flush remaining batch (for shutdown)

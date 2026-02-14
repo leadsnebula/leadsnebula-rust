@@ -173,6 +173,20 @@ fn get_user_from_request(request: &Request) -> Option<leadsnebula_core::models::
         .cloned()
 }
 
+/// Returns the instance ID for the current user (instance they own). Used to scope all
+/// dashboard list/create to that instance so records are never shared across instances.
+async fn get_instance_id_for_user(
+    pool: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM instances WHERE instance_user_id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
 // Publishers API
 #[derive(Serialize)]
 pub struct PublisherResponse {
@@ -1699,16 +1713,27 @@ async fn _setup_otp_with_user(
 
 async fn list_publishers(
     State(state): State<AppState>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
     use tracing::{error, info};
-    // TODO: Get instance_ids from user's JWT token
-    // For now, get all publishers
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let instance_id = get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+        .await
+        .map_err(|e| {
+            error!("Database error getting instance for user: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or_else(|| {
+            tracing::error!("User has no instance");
+            StatusCode::BAD_REQUEST
+        })?;
     let start = std::time::Instant::now();
 
     let publishers = sqlx::query_as::<_, leadsnebula_core::models::publisher::Publisher>(
-        "SELECT * FROM publishers ORDER BY created_at DESC",
+        "SELECT * FROM publishers WHERE instance_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
     )
+    .bind(instance_id)
     .fetch_all(state.db_pool.as_ref())
     .await
     .map_err(|e| {
@@ -1792,17 +1817,16 @@ async fn create_publisher(
     use rand::Rng;
     use sha2::{Digest, Sha256};
 
-    // Get instance_id (from user's JWT or use first available)
+    // Scope to current user's instance only (never attach to another instance)
     let instance_id = if let Some(id) = payload.instance_id {
         id
     } else {
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
-            .fetch_optional(state.db_pool.as_ref())
+        get_instance_id_for_user(state.db_pool.as_ref(), user.id)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or_else(|| {
                 tracing::error!(
-                    "No instances found in database. Cannot create publisher without an instance."
+                    "User has no instance. Cannot create publisher without an instance."
                 );
                 StatusCode::BAD_REQUEST
             })?
@@ -2680,11 +2704,23 @@ async fn generate_publisher_hmac_secret_encrypted(
 }
 
 // Buyers API
-async fn list_buyers(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn list_buyers(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let instance_id = get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+        .await
+        .map_err(|e| {
+            error!("Database error getting instance for user: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let active_buyers = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
-        "SELECT * FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC",
+        "SELECT * FROM buyers WHERE instance_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
     )
+    .bind(instance_id)
     .fetch_all(state.db_pool.as_ref())
     .await
     .map_err(|e| {
@@ -2693,8 +2729,9 @@ async fn list_buyers(State(state): State<AppState>) -> Result<Json<serde_json::V
     })?;
 
     let deleted_buyers = sqlx::query_as::<_, leadsnebula_core::models::buyer::Buyer>(
-        "SELECT * FROM buyers WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+        "SELECT * FROM buyers WHERE instance_id = $1 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC",
     )
+    .bind(instance_id)
     .fetch_all(state.db_pool.as_ref())
     .await
     .map_err(|e| {
@@ -2852,16 +2889,14 @@ pub struct CreateBuyerRequest {
 
 async fn create_buyer(
     State(state): State<AppState>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
     Json(payload): Json<CreateBuyerRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let instance_id = if let Some(id) = payload.instance_id {
         id
     } else {
-        let result = sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
-            .fetch_optional(state.db_pool.as_ref())
-            .await;
-
-        result
+        get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+            .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::BAD_REQUEST)?
     };
@@ -3834,12 +3869,22 @@ async fn delete_buyer(
 // Campaigns API
 async fn list_campaigns(
     State(state): State<AppState>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let instance_id = get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+        .await
+        .map_err(|e| {
+            error!("Database error getting instance for user: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     let campaigns = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
-        "SELECT * FROM campaigns ORDER BY created_at DESC",
+        "SELECT * FROM campaigns WHERE instance_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
     )
+    .bind(instance_id)
     .fetch_all(state.db_pool.as_ref())
     .await
     .map_err(|e| {
@@ -3908,13 +3953,13 @@ pub struct CreateCampaignRequest {
 #[axum::debug_handler]
 async fn create_campaign(
     State(state): State<AppState>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
     Json(payload): Json<CreateCampaignRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let instance_id = if let Some(id) = payload.instance_id {
         id
     } else {
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
-            .fetch_optional(state.db_pool.as_ref())
+        get_instance_id_for_user(state.db_pool.as_ref(), user.id)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::BAD_REQUEST)?
@@ -3984,13 +4029,19 @@ async fn create_campaign(
 async fn get_campaign(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sqlx::Row;
-
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let user_instance_id = get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let campaign = sqlx::query_as::<_, leadsnebula_core::models::campaign::Campaign>(
-        "SELECT * FROM campaigns WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT * FROM campaigns WHERE id = $1 AND instance_id = $2 AND deleted_at IS NULL",
     )
     .bind(id)
+    .bind(user_instance_id)
     .fetch_optional(state.db_pool.as_ref())
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -4284,11 +4335,21 @@ async fn delete_campaign(
 // Ping Trees API
 async fn list_ping_trees(
     State(state): State<AppState>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use tracing::{error, info};
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let instance_id = get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+        .await
+        .map_err(|e| {
+            error!("Database error getting instance for user: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let ping_trees = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees ORDER BY created_at DESC",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE instance_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
     )
+    .bind(instance_id)
     .fetch_all(state.db_pool.as_ref())
     .await
     .map_err(|e| {
@@ -4338,6 +4399,7 @@ pub struct CreatePingTreeRequest {
 
 async fn create_ping_tree(
     State(state): State<AppState>,
+    Extension(user): Extension<leadsnebula_core::models::user::User>,
     Json(payload): Json<CreatePingTreeRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Validate strategy
@@ -4348,8 +4410,7 @@ async fn create_ping_tree(
     let instance_id = if let Some(id) = payload.instance_id {
         id
     } else {
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM instances LIMIT 1")
-            .fetch_optional(state.db_pool.as_ref())
+        get_instance_id_for_user(state.db_pool.as_ref(), user.id)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::BAD_REQUEST)?
@@ -4395,11 +4456,18 @@ async fn create_ping_tree(
 async fn get_ping_tree(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let user = get_user_from_request(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let user_instance_id = get_instance_id_for_user(state.db_pool.as_ref(), user.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let ping_tree = sqlx::query_as::<_, leadsnebula_core::models::ping_tree::PingTree>(
-        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT id, instance_id, name, vertical, strategy, status, priority, deleted_at, created_at, updated_at FROM ping_trees WHERE id = $1 AND instance_id = $2 AND deleted_at IS NULL",
     )
     .bind(id)
+    .bind(user_instance_id)
     .fetch_optional(state.db_pool.as_ref())
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -6811,7 +6879,7 @@ async fn list_leads(
                 v.name as vertical_name,
                 p.name as publisher_name,
                 b.name as buyer_name,
-                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms,
+                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - COALESCE(l.submitted_at, l.created_at))) * 1000 as processing_time_ms,
                 (SELECT 
                     CASE 
                         WHEN pp.payload::jsonb ? 'routing_result' THEN (pp.payload::jsonb->'routing_result'->>'price')::float
@@ -6867,7 +6935,7 @@ async fn list_leads(
                 v.name as vertical_name,
                 p.name as publisher_name,
                 b.name as buyer_name,
-                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms,
+                EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - COALESCE(l.submitted_at, l.created_at))) * 1000 as processing_time_ms,
                 (SELECT 
                     CASE 
                         WHEN pp.payload::jsonb ? 'routing_result' THEN (pp.payload::jsonb->'routing_result'->>'price')::float
@@ -7164,7 +7232,7 @@ async fn get_lead_details(
             l.vertical_id,
             p.name as publisher_name,
             b.name as buyer_name,
-            EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - l.created_at)) * 1000 as processing_time_ms
+            EXTRACT(EPOCH FROM (COALESCE(l.sold_at, l.updated_at) - COALESCE(l.submitted_at, l.created_at))) * 1000 as processing_time_ms
         FROM leads l
         LEFT JOIN publishers p ON l.publisher_id = p.id AND p.deleted_at IS NULL
         LEFT JOIN buyers b ON l.buyer_id = b.id AND b.deleted_at IS NULL
@@ -7729,14 +7797,16 @@ async fn get_lead_details(
     let auction_timing: Option<serde_json::Value> = vertical_data
         .as_ref()
         .and_then(|j| j.0.get("auction_timing").cloned());
-    let post_ms: Option<f64> = auction_timing
+    let _post_ms: Option<f64> = auction_timing
         .as_ref()
         .and_then(|at| at.get("post_ms"))
         .and_then(|v| v.as_f64());
-    let total_ms: Option<f64> = auction_timing
+    let _total_ms: Option<f64> = auction_timing
         .as_ref()
         .and_then(|at| at.get("total_ms"))
         .and_then(|v| v.as_f64());
+    // Expose full timing breakdown (pre_checks_ms, ping_auction_ms, qualification_ms, post_ms, total_ms, db_operations_ms) for UI/debugging
+    let auction_timing_full = auction_timing.clone().unwrap_or(serde_json::json!({}));
 
     let response_json = serde_json::json!({
         "success": true,
@@ -7762,10 +7832,7 @@ async fn get_lead_details(
             },
             "ping_payloads": ping_payloads,
             "post_payload": post_payload,
-            "auction_timing": serde_json::json!({
-                "post_ms": post_ms,
-                "total_ms": total_ms,
-            }),
+            "auction_timing": auction_timing_full,
             "vertical_data": vertical_data_value,
         },
     });

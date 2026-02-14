@@ -45,6 +45,10 @@ jsonwebtoken = { workspace = true }
 webauthn-rs = { version = "0.4", optional = true, features = ["danger-allow-state-serialisation"] }
 url = { version = "2", optional = true }
 
+# OpenAPI + Scalar documentation
+utoipa = { version = "5", features = ["uuid", "chrono"] }
+utoipa-scalar = "0.3"
+
 # Optional features
 sentry = { version = "0.32", optional = true }
 sentry-tower = { version = "0.32", optional = true }

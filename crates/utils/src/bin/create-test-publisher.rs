@@ -44,6 +44,10 @@ async fn main() -> Result<()> {
             Some(id) => id,
             None => {
                 println!("⚠️  No instances found. Creating a default instance...");
+                // Test instances must only be created in ephemeral DB
+                leadsnebula_core::services::database::require_ephemeral_db_for_test_data(
+                    &database_url,
+                )?;
                 // Check if instance_users table exists for foreign key
                 let users_exist: bool = sqlx::query_scalar(
                     "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'instance_users')"

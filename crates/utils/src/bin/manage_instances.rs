@@ -125,7 +125,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Create test instance_user and instance
+    // Create test instance_user and instance — only on ephemeral DB
+    leadsnebula_core::services::database::require_ephemeral_db_for_test_data(&database_url)?;
+
     let test_user_id = Uuid::new_v4();
     let test_instance_id = Uuid::new_v4();
 

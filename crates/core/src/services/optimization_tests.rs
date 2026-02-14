@@ -222,6 +222,7 @@ mod optimization_tests {
                 post_id: None,
                 buyer_id: Some(uuid::Uuid::new_v4()),
                 payload: serde_json::json!({"test": i}),
+                lead_id_str: None,
             });
         }
 
@@ -261,6 +262,7 @@ mod optimization_tests {
             post_id: None,
             buyer_id: Some(uuid::Uuid::new_v4()),
             payload: serde_json::json!({"test": "flush"}),
+            lead_id_str: None,
         });
 
         // Flush should wait for task to complete
@@ -381,6 +383,7 @@ mod optimization_tests {
             post_id: None,
             buyer_id: Some(uuid::Uuid::new_v4()),
             payload: serde_json::json!({"invalid": "data"}),
+            lead_id_str: None,
         });
 
         // Wait for processing
@@ -419,6 +422,7 @@ mod optimization_tests {
                 post_id: None,
                 buyer_id: Some(uuid::Uuid::new_v4()),
                 payload: serde_json::json!({"batch_test": i}),
+                lead_id_str: None,
             });
         }
 

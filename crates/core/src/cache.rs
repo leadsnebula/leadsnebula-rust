@@ -336,6 +336,71 @@ impl CacheService {
         Ok(value)
     }
 
+    /// Like get_or_insert_with but for Result<Option<T>>: only caches when the closure returns Ok(Some(_)).
+    /// When it returns Ok(None), the result is not cached so the next request will hit the source again.
+    /// Use this for lookups that can "become valid" later (e.g. publisher assigned to ping tree).
+    pub async fn get_or_insert_with_skip_none<T, F, Fut>(
+        &self,
+        key: &str,
+        ttl_seconds: u64,
+        f: F,
+    ) -> anyhow::Result<Option<T>>
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<T>>>,
+    {
+        if let Some(cached) = self.l1_cache.get(key).await {
+            let mut bytes = cached.clone().into_bytes();
+            match simd_json::from_slice::<T>(&mut bytes) {
+                Ok(value) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(value));
+                }
+                Err(_) => {
+                    let bytes = cached.into_bytes();
+                    if let Ok(value) = serde_json::from_slice::<T>(&bytes) {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Some(value));
+                    }
+                }
+            }
+        }
+        if let Some(cached) = self.get(key).await? {
+            let mut bytes = cached.clone().into_bytes();
+            match simd_json::from_slice::<T>(&mut bytes) {
+                Ok(value) => {
+                    self.l1_cache.insert(key.to_string(), cached.clone()).await;
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(value));
+                }
+                Err(_) => {
+                    let bytes = cached.clone().into_bytes();
+                    if let Ok(value) = serde_json::from_slice::<T>(&bytes) {
+                        self.l1_cache.insert(key.to_string(), cached).await;
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Some(value));
+                    }
+                }
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let value = f().await?;
+        if let Some(ref v) = value {
+            let serialized = match simd_json::to_vec(v) {
+                Ok(bytes) => {
+                    String::from_utf8(bytes).unwrap_or_else(|_| serde_json::to_string(v).unwrap())
+                }
+                Err(_) => serde_json::to_string(v)?,
+            };
+            self.l1_cache
+                .insert(key.to_string(), serialized.clone())
+                .await;
+            self.set_with_ttl(key, &serialized, ttl_seconds).await?;
+        }
+        Ok(value)
+    }
+
     /// Delete all keys matching a prefix pattern
     /// Uses SCAN to find matching keys, then deletes them in batches
     pub async fn delete_by_prefix(&self, prefix: &str) -> anyhow::Result<usize> {

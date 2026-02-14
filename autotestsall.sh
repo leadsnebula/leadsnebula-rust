@@ -11,6 +11,13 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# Auto-detect WSL: use conservative build/test parallelism to avoid OOM and crashes
+if [ -f /proc/version ] && grep -qi microsoft /proc/version; then
+    IS_WSL=true
+else
+    IS_WSL=false
+fi
+
 # Simple log file
 LOG_FILE="/tmp/autotestsall_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE")
@@ -116,11 +123,15 @@ echo "🔨 Compiling workspace (single build)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Use all available CPU cores for compilation
-# Unset any restrictive CARGO_BUILD_JOBS from environment
-unset CARGO_BUILD_JOBS
-export CARGO_BUILD_JOBS=$(nproc)
-
+# WSL: limit parallel jobs to prevent OOM (no user action required)
+# Non-WSL: use all cores
+if [ "$IS_WSL" = "true" ]; then
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+    echo "🔧 WSL detected: Using CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS (avoids crashes)"
+else
+    unset CARGO_BUILD_JOBS
+    export CARGO_BUILD_JOBS=$(nproc)
+fi
 echo "Using $CARGO_BUILD_JOBS parallel build jobs"
 echo ""
 
@@ -194,9 +205,13 @@ echo ""
 # Give write-behind queue flush more time when DB is under parallel load (CI/heavy tests)
 export WRITE_BEHIND_FLUSH_TIMEOUT_SECS="${WRITE_BEHIND_FLUSH_TIMEOUT_SECS:-60}"
 
-# Use ci profile when EPHEMERAL_DB=1 (Neon) for longer slow-timeout (180s)
+# WSL: use wsl profile (longer timeouts, single slow period) to avoid flaky kills
+# Non-WSL with Neon: use ci profile
 NEXTEST_PROFILE=""
-if [ "${EPHEMERAL_DB:-}" = "1" ]; then
+if [ "$IS_WSL" = "true" ]; then
+    NEXTEST_PROFILE="--profile wsl"
+    echo "🔧 WSL detected: Using nextest profile 'wsl' (stable timeouts)"
+elif [ "${EPHEMERAL_DB:-}" = "1" ]; then
     NEXTEST_PROFILE="--profile ci"
 fi
 
@@ -210,9 +225,15 @@ fi
 
 # Phase 2: All other tests (parallel)
 if [ $TEST_EXIT -eq 0 ]; then
-    TEST_THREADS="${TEST_THREADS:-8}"
-    echo ""
-    echo "Phase 2: Unit + lib + other tests ($TEST_THREADS threads)..."
+    if [ "$IS_WSL" = "true" ]; then
+        TEST_THREADS="${TEST_THREADS:-2}"
+        echo ""
+        echo "Phase 2: Unit + lib + other tests ($TEST_THREADS threads, WSL-safe)..."
+    else
+        TEST_THREADS="${TEST_THREADS:-8}"
+        echo ""
+        echo "Phase 2: Unit + lib + other tests ($TEST_THREADS threads)..."
+    fi
     if ! cargo nextest run --all-targets --locked --all-features --run-ignored all --test-threads "$TEST_THREADS" \
         -E 'not test(optimization_tests) and not test(integration_auth) and not test(integration_publisher_crud) and not test(integration_leads_endpoint) and not test(integration_carina_e2e)' \
         $NEXTEST_PROFILE; then

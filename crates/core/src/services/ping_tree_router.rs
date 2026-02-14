@@ -141,9 +141,10 @@ impl PingTreeRouter {
         let ping_tree_start = std::time::Instant::now();
         let cache_key = format!("pingtree:pub:{}:vert:{}", self.publisher_id, self.vertical);
         let cache_stats_before = self.cache.as_ref().map(|cache| cache.get_stats());
+        // Do not cache None so that when a publisher is newly assigned to a ping tree, the next request sees it without restart
         let ping_tree_result = if let Some(cache) = &self.cache {
             cache
-                .get_or_insert_with(&cache_key, 21600, || async {
+                .get_or_insert_with_skip_none(&cache_key, 21600, || async {
                     PingTree::find_for_routing(pool.as_ref(), &self.publisher_id, &self.vertical)
                         .await
                         .map_err(|e| anyhow::anyhow!("Database error: {}", e))
@@ -1008,6 +1009,7 @@ impl PingTreeRouter {
                 buyer_id_opt,
                 *campaign_id,
                 resp_json,
+                self.lead.lead_id.clone(),
             ));
         }
 
@@ -1027,7 +1029,9 @@ impl PingTreeRouter {
                     "Enqueueing {} buyer responses to write-behind queue",
                     batch_responses.len()
                 );
-                for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload) in batch_responses {
+                for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload, lead_id_str) in
+                    batch_responses
+                {
                     queue.enqueue(
                         crate::services::write_behind_queue::BackgroundTask::BuyerResponse {
                             lead_id,
@@ -1036,6 +1040,7 @@ impl PingTreeRouter {
                             post_id,
                             buyer_id,
                             payload,
+                            lead_id_str,
                         },
                     );
                 }
@@ -1046,8 +1051,16 @@ impl PingTreeRouter {
                     lead_id = %self.lead.uuid,
                     "Write-behind queue unavailable, falling back to synchronous buyer response insert"
                 );
+                let batch_for_sync: Vec<BuyerResponseRow> = batch_responses
+                    .into_iter()
+                    .map(
+                        |(lead_id, ping_id, post_id, buyer_id, campaign_id, payload, _)| {
+                            (lead_id, ping_id, post_id, buyer_id, campaign_id, payload)
+                        },
+                    )
+                    .collect();
                 let result =
-                    PingTreeRouter::batch_insert_buyer_responses(pool.as_ref(), batch_responses)
+                    PingTreeRouter::batch_insert_buyer_responses(pool.as_ref(), batch_for_sync)
                         .await;
                 if let Err(_e) = &result {
                     #[cfg(feature = "tracing")]
@@ -1404,6 +1417,7 @@ impl PingTreeRouter {
                                 post_id: bresp.post_id.clone(),
                                 buyer_id: Some(campaign.buyer_id),
                                 payload: bresp_json,
+                                lead_id_str: self.lead.lead_id.clone(),
                             },
                         );
                         tracing::info!(
@@ -1897,13 +1911,14 @@ impl PingTreeRouter {
                     buyer_id_opt,
                     campaign_id,
                     resp_json,
+                    self.lead.lead_id.clone(),
                 ));
             }
 
             // Enqueue all responses to write-behind queue (will be batched automatically)
             if !batch_responses.is_empty() {
                 if let Some(queue) = &self.write_behind_queue {
-                    for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload) in
+                    for (lead_id, ping_id, post_id, buyer_id, campaign_id, payload, lead_id_str) in
                         batch_responses
                     {
                         queue.enqueue(
@@ -1914,6 +1929,7 @@ impl PingTreeRouter {
                                 post_id,
                                 buyer_id,
                                 payload,
+                                lead_id_str,
                             },
                         );
                     }
