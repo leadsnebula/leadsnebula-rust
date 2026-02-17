@@ -226,20 +226,53 @@ fn validation_error_human_message(field: &str) -> String {
     }
 }
 
-/// Persist a lead that failed validation so it appears in the leads report with error status and audit trail.
+/// Persist a failed lead (any non-sold status) so it appears in the leads report with audit trail.
+/// Used for validation_error, publisher_mismatch, invalid_format, and any early failure where we have a vertical.
+/// Resolves buyer_id/campaign_id from any campaign for this vertical (required by NOT NULL constraints).
 #[allow(clippy::too_many_arguments)]
-async fn persist_validation_error_lead(
+async fn persist_failed_lead(
     pool: &sqlx::PgPool,
     publisher_id: uuid::Uuid,
     vertical: &leadsnebula_core::models::vertical::Vertical,
     lead_data: &LeadData,
     request_type: &str,
-    missing_field: &str,
     request_body: &LeadRequest,
     response_body: &LeadResponse,
+    status: LeadStatus,
+    vertical_data: serde_json::Value,
+    ping_message: &str,
 ) -> Result<uuid::Uuid, sqlx::Error> {
     use rand::Rng;
-    let human_message = validation_error_human_message(missing_field);
+
+    // NOT NULL on leads.buyer_id/campaign_id (migration 20260112000004): resolve a campaign for this publisher's instance.
+    // Prefer campaign for this vertical; fallback to any campaign in the instance so error leads still persist when no vertical-specific campaign exists.
+    let instance_id: uuid::Uuid = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT instance_id FROM publishers WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(publisher_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| sqlx::Error::ColumnNotFound("publisher instance".into()))?;
+
+    let (buyer_id, campaign_id): (uuid::Uuid, uuid::Uuid) =
+        match sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+            "SELECT buyer_id, id FROM campaigns WHERE instance_id = $1 AND vertical = $2 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(instance_id)
+        .bind(&vertical.slug)
+        .fetch_optional(pool)
+        .await?
+        {
+            Some(row) => row,
+            None => sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+                "SELECT buyer_id, id FROM campaigns WHERE instance_id = $1 AND deleted_at IS NULL LIMIT 1",
+            )
+            .bind(instance_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| sqlx::Error::ColumnNotFound("campaign for instance".into()))?,
+        };
+
     let strategy = match request_type {
         "fullpost" => "fullPost",
         _ => "pingPost",
@@ -260,10 +293,6 @@ async fn persist_validation_error_lead(
     };
     let session_uuid = uuid::Uuid::new_v4();
     let session_id = format!("sess_{}", session_uuid);
-    let vertical_data = serde_json::json!({
-        "validation_error": human_message,
-        "missing_field": missing_field,
-    });
     let request_json = serde_json::to_value(request_body).unwrap_or_else(|_| serde_json::json!({}));
     let response_json =
         serde_json::to_value(response_body).unwrap_or_else(|_| serde_json::json!({}));
@@ -279,7 +308,7 @@ async fn persist_validation_error_lead(
             street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, $12, $13,
-            NULL, NULL, '', NOW(), NOW(),
+            $14, $15, '', NOW(), NOW(), NOW(),
             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
         )
         "#,
@@ -291,15 +320,18 @@ async fn persist_validation_error_lead(
     .bind(vertical.id)
     .bind(request_type)
     .bind(strategy)
-    .bind(LeadStatus::Error)
+    .bind(&status)
     .bind(lead_data.tcpa_consent.unwrap_or(false))
     .bind(lead_data.tcpa_language.as_deref().unwrap_or(""))
     .bind(lead_data.is_test.unwrap_or(false))
     .bind(&session_id)
     .bind(sqlx::types::Json(vertical_data))
+    .bind(buyer_id)
+    .bind(campaign_id)
     .execute(&mut *tx)
     .await?;
 
+    let status_str = status.as_str();
     let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
     let ping_id_text = format!("ERR_{}_{}", lead_uuid, timestamp);
     let ping_row: (i64,) = sqlx::query_as(
@@ -307,7 +339,7 @@ async fn persist_validation_error_lead(
     )
     .bind(&ping_id_text)
     .bind(lead_uuid)
-    .bind("error")
+    .bind(status_str)
     .fetch_one(&mut *tx)
     .await?;
     let ping_db_id = ping_row.0;
@@ -315,7 +347,7 @@ async fn persist_validation_error_lead(
     let payload = serde_json::json!({
         "request": request_json,
         "response": response_json,
-        "validation_error": human_message,
+        "validation_error": ping_message,
     });
     sqlx::query(
         "INSERT INTO ping_payloads (ping_id, lead_id, payload, created_at, updated_at) VALUES ($1::bigint, $2, $3, now(), now())",
@@ -328,6 +360,38 @@ async fn persist_validation_error_lead(
 
     tx.commit().await?;
     Ok(lead_uuid)
+}
+
+/// Persist a lead that failed validation (missing required field) so it appears in the leads report.
+#[allow(clippy::too_many_arguments)]
+async fn persist_validation_error_lead(
+    pool: &sqlx::PgPool,
+    publisher_id: uuid::Uuid,
+    vertical: &leadsnebula_core::models::vertical::Vertical,
+    lead_data: &LeadData,
+    request_type: &str,
+    missing_field: &str,
+    request_body: &LeadRequest,
+    response_body: &LeadResponse,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let human_message = validation_error_human_message(missing_field);
+    let vertical_data = serde_json::json!({
+        "validation_error": human_message,
+        "missing_field": missing_field,
+    });
+    persist_failed_lead(
+        pool,
+        publisher_id,
+        vertical,
+        lead_data,
+        request_type,
+        request_body,
+        response_body,
+        LeadStatus::Error,
+        vertical_data,
+        &human_message,
+    )
+    .await
 }
 
 /// Transform per_buyer_timings for verbose response: align status with main outcome, strip bid for fullpost.
@@ -812,7 +876,7 @@ async fn create_lead(
         let provided_uuid = uuid::Uuid::parse_str(provided_publisher_id).ok();
         if let Some(provided_uuid) = provided_uuid {
             if provided_uuid != publisher.id {
-                return Ok((StatusCode::BAD_REQUEST, Json(LeadResponse {
+                let response_body = LeadResponse {
                     status: StatusNode {
                         success: false,
                         status: "error".to_string(),
@@ -841,47 +905,120 @@ async fn create_lead(
                         None
                     },
                     http_status: Some(401),
-                })));
+                };
+                let request_body = LeadRequest {
+                    verbose: payload.verbose,
+                    lead: lead_data.clone(),
+                };
+                let pool = state.db_pool.clone();
+                let publisher_id = publisher.id;
+                let vertical_clone = vertical.clone();
+                let lead_data_clone = lead_data.clone();
+                let request_type_clone = request_type.clone();
+                let request_body_clone = request_body.clone();
+                let response_body_clone = response_body.clone();
+                let msg = "Publisher ID mismatch".to_string();
+                tokio::spawn(async move {
+                    let vertical_data = serde_json::json!({
+                        "error_kind": "publisher_mismatch",
+                        "message": &msg,
+                    });
+                    if let Err(e) = persist_failed_lead(
+                        pool.as_ref(),
+                        publisher_id,
+                        &vertical_clone,
+                        &lead_data_clone,
+                        &request_type_clone,
+                        &request_body_clone,
+                        &response_body_clone,
+                        LeadStatus::Error,
+                        vertical_data,
+                        msg.as_str(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to persist publisher_mismatch lead for audit: {}",
+                            e
+                        );
+                    }
+                });
+                return Ok((StatusCode::BAD_REQUEST, Json(response_body)));
             }
         } else {
             // Invalid UUID format
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(LeadResponse {
-                    status: StatusNode {
-                        success: false,
-                        status: "error".to_string(),
-                        message: Some(format!(
-                            "Invalid publisher_id format: {}",
-                            provided_publisher_id
-                        )),
-                        error: Some(format!(
-                            "Invalid UUID format for publisher_id: {}",
-                            provided_publisher_id
-                        )),
-                    },
-                    lead: LeadNode {
-                        promise_id: None,
-                        lead_id: None,
-                        lead_uuid: None,
-                        ping_id: None,
-                        bid: None,
-                        post_id: None,
-                        price: None,
-                    },
-                    verbose: if verbose_requested {
-                        Some(serde_json::json!({
-                            "error_code": "ERR_400",
-                            "timestamp": Utc::now().to_rfc3339(),
-                            "endpoint": "POST /api/v1/leads",
-                            "status_code": 400
-                        }))
-                    } else {
-                        None
-                    },
-                    http_status: Some(400),
-                }),
-            ));
+            let response_body = LeadResponse {
+                status: StatusNode {
+                    success: false,
+                    status: "error".to_string(),
+                    message: Some(format!(
+                        "Invalid publisher_id format: {}",
+                        provided_publisher_id
+                    )),
+                    error: Some(format!(
+                        "Invalid UUID format for publisher_id: {}",
+                        provided_publisher_id
+                    )),
+                },
+                lead: LeadNode {
+                    promise_id: None,
+                    lead_id: None,
+                    lead_uuid: None,
+                    ping_id: None,
+                    bid: None,
+                    post_id: None,
+                    price: None,
+                },
+                verbose: if verbose_requested {
+                    Some(serde_json::json!({
+                        "error_code": "ERR_400",
+                        "timestamp": Utc::now().to_rfc3339(),
+                        "endpoint": "POST /api/v1/leads",
+                        "status_code": 400
+                    }))
+                } else {
+                    None
+                },
+                http_status: Some(400),
+            };
+            let request_body = LeadRequest {
+                verbose: payload.verbose,
+                lead: lead_data.clone(),
+            };
+            let pool = state.db_pool.clone();
+            let publisher_id = publisher.id;
+            let vertical_clone = vertical.clone();
+            let lead_data_clone = lead_data.clone();
+            let request_type_clone = request_type.clone();
+            let request_body_clone = request_body.clone();
+            let response_body_clone = response_body.clone();
+            let msg = format!("Invalid publisher_id format: {}", provided_publisher_id);
+            tokio::spawn(async move {
+                let vertical_data = serde_json::json!({
+                    "error_kind": "invalid_publisher_id_format",
+                    "message": &msg,
+                });
+                if let Err(e) = persist_failed_lead(
+                    pool.as_ref(),
+                    publisher_id,
+                    &vertical_clone,
+                    &lead_data_clone,
+                    &request_type_clone,
+                    &request_body_clone,
+                    &response_body_clone,
+                    LeadStatus::Error,
+                    vertical_data,
+                    msg.as_str(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to persist invalid_publisher_id_format lead for audit: {}",
+                        e
+                    );
+                }
+            });
+            return Ok((StatusCode::BAD_REQUEST, Json(response_body)));
         }
     }
 
