@@ -64,5 +64,6 @@ webauthn = ["dep:webauthn-rs", "dep:url", "leadsnebula_core/webauthn"]
 mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
+chrono = { workspace = true }
 ctor = { workspace = true }
 dotenvy = { workspace = true }

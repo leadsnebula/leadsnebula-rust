@@ -647,3 +647,32 @@ async fn test_jwt_token_expiration_validation() {
     assert!(claims.exp > now);
     assert!(claims.exp - now >= 24 * 3600 - 10); // Allow 10 seconds tolerance
 }
+
+/// Ensures the password reset rate-limit query correctly decodes NULL reset_password_sent_at.
+/// Regression test: the column can be NULL (never sent); decoding as non-Option caused 500.
+#[tokio::test]
+async fn test_password_reset_rate_limit_query_accepts_null_sent_at() -> anyhow::Result<()> {
+    load_test_env();
+    if !common::has_database_url() {
+        eprintln!("⚠️  DATABASE_URL not set - skipping test_password_reset_rate_limit_query_accepts_null_sent_at");
+        return Ok(());
+    }
+    let pool = create_test_pool().await?;
+    let mut tx = common::begin_transaction_with_retry(&pool).await?;
+    let user_id = create_test_user(&mut *tx, "reset_rate_limit@test.invalid").await;
+    // Same query as send_password_reset_email: column is NULL for new users
+    let last_sent: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT reset_password_sent_at FROM instance_users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+    assert!(
+        last_sent.is_none(),
+        "new user should have NULL reset_password_sent_at"
+    );
+    tx.rollback().await?;
+    Ok(())
+}

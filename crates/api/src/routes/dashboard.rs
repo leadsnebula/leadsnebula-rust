@@ -134,6 +134,22 @@ fn webauthn_rp_id_and_origin(
     Ok((rp_id_used, origin))
 }
 
+/// Mask email for use in application logs (AUTO-MEMORY). Example: "u***@example.com"
+fn mask_email_for_log(email: &str) -> String {
+    let email = email.trim();
+    if email.is_empty() {
+        return "***".to_string();
+    }
+    if let Some(at) = email.find('@') {
+        let local = &email[..at];
+        let domain = &email[at..];
+        let visible = local.chars().take(1).collect::<String>();
+        format!("{}***{}", visible, domain)
+    } else {
+        "***".to_string()
+    }
+}
+
 // Helper function to check if user is admin
 // For now, checks if user owns the instance (instance_user_id matches)
 // TODO: Implement proper role-based access control when instance_user_roles table exists
@@ -498,15 +514,19 @@ async fn send_password_reset_email(
     .ok_or(StatusCode::UNAUTHORIZED)?;
 
     // Rate limit: do not send again if last reset email was sent within 5 minutes
+    // Column can be NULL (never sent), so decode as Option<DateTime>
     let last_sent: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT reset_password_sent_at FROM instance_users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(state.db_pool.as_ref())
-            .await
-            .map_err(|e| {
-                error!("Database error checking reset rate limit: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT reset_password_sent_at FROM instance_users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error checking reset rate limit: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .flatten();
     if let Some(ts) = last_sent {
         if chrono::Utc::now().signed_duration_since(ts).num_seconds() < 300 {
             return Ok(Json(serde_json::json!({
@@ -534,10 +554,35 @@ async fn send_password_reset_email(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let password_reset_service = PasswordResetService::new(
-        state.email_service.clone(),
-        state.config.password_reset_base_url.clone(),
-    );
+    // In development, use request Origin/Referer so the link in the email matches where the user requested from
+    let reset_base_url = if state.config.environment.eq_ignore_ascii_case("development") {
+        headers
+            .get("origin")
+            .or_else(|| headers.get("referer"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.trim())
+            .map(|s| {
+                // Strip path and query (e.g. https://localhost:3000/dashboard -> https://localhost:3000)
+                let s = s.trim_end_matches('/');
+                if let Some(colon_slash) = s.find("://") {
+                    let after_scheme = colon_slash + 3;
+                    let rest = &s[after_scheme..];
+                    if let Some(slash) = rest.find('/') {
+                        s[..after_scheme + slash].to_string()
+                    } else {
+                        s.to_string()
+                    }
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_else(|| state.config.password_reset_base_url.clone())
+    } else {
+        state.config.password_reset_base_url.clone()
+    };
+
+    let password_reset_service =
+        PasswordResetService::new(state.email_service.clone(), reset_base_url.clone());
     if let Err(e) = password_reset_service
         .send_reset_email(&user, &reset_token)
         .await
@@ -545,6 +590,10 @@ async fn send_password_reset_email(
         error!("Failed to send password reset email: {}", e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // Minimal application log when reset email is sent (AUTO-MEMORY: mask email in logs)
+    let masked = mask_email_for_log(&user.email);
+    tracing::info!("Password reset email sent for {}", masked);
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -1106,7 +1155,7 @@ async fn passkey_registration_options(
                         error!("Failed to parse localhost workaround URL: {}", e);
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
-                WebauthnBuilder::new(&rp_id, &builder_url)
+                let mut b = WebauthnBuilder::new(&rp_id, &builder_url)
                     .map_err(|e| {
                         error!(
                             "Failed to create WebAuthn builder (localhost workaround): {}",
@@ -1114,8 +1163,16 @@ async fn passkey_registration_options(
                         );
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?
-                    .append_allowed_origin(&url)
-                    .allow_any_port(true)
+                    .append_allowed_origin(&url);
+                for origin in [
+                    "http://localhost:3000",
+                    "https://localhost.localdomain:3000",
+                ] {
+                    if let Ok(u) = url::Url::parse(origin) {
+                        b = b.append_allowed_origin(&u);
+                    }
+                }
+                b.allow_any_port(true)
                     .rp_name("LeadsNebula")
                     .build()
                     .map_err(|e| {
@@ -1367,7 +1424,7 @@ async fn register_passkey(
                         error!("Failed to parse localhost workaround URL: {}", e);
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
-                WebauthnBuilder::new(&rp_id, &builder_url)
+                let mut b = WebauthnBuilder::new(&rp_id, &builder_url)
                     .map_err(|e| {
                         error!(
                             "Failed to create WebAuthn builder (localhost workaround): {}",
@@ -1375,8 +1432,16 @@ async fn register_passkey(
                         );
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?
-                    .append_allowed_origin(&url)
-                    .allow_any_port(true)
+                    .append_allowed_origin(&url);
+                for origin in [
+                    "http://localhost:3000",
+                    "https://localhost.localdomain:3000",
+                ] {
+                    if let Ok(u) = url::Url::parse(origin) {
+                        b = b.append_allowed_origin(&u);
+                    }
+                }
+                b.allow_any_port(true)
                     .rp_name("LeadsNebula")
                     .build()
                     .map_err(|e| {
@@ -2270,12 +2335,41 @@ async fn update_publisher(
             "ein_tin": after.ein_tin,
             "hmac_required": after.hmac_required,
         });
+        let changed_fields: std::collections::HashMap<String, serde_json::Value> = [
+            "name",
+            "email",
+            "status",
+            "representative_first_name",
+            "representative_last_name",
+            "address_street",
+            "address_city",
+            "address_state",
+            "address_zip",
+            "timezone",
+            "ein_tin",
+            "hmac_required",
+        ]
+        .iter()
+        .filter_map(|&key| {
+            let b = before_json.get(key)?;
+            let a = after_json.get(key)?;
+            if b != a {
+                Some((
+                    key.to_string(),
+                    serde_json::json!({ "before": b, "after": a }),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
         let audit_details = serde_json::json!({
             "action": "update",
             "target_type": "Publisher",
             "target_id": id.to_string(),
             "target_name": after.name,
             "actor": { "id": user.id.to_string(), "email": user.email },
+            "changes": changed_fields,
             "before": before_json,
             "after": after_json,
             "context": {
@@ -6074,6 +6168,9 @@ async fn update_buyer_rule_set(
                 } else {
                     "buyer_rule_set_deactivated"
                 }
+            } else if changed_fields.len() == 1 && changed_fields.contains_key("timeout_seconds") {
+                // Timeout applies to integration; keep separate from rule set content updates
+                "buyer_rule_set_timeout_updated"
             } else {
                 "buyer_rule_set_updated"
             };

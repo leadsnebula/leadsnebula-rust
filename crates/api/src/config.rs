@@ -364,7 +364,14 @@ impl AppConfig {
             ))
             .cloned()
             .or_else(|| std::env::var("PASSWORD_RESET_BASE_URL").ok())
-            .unwrap_or_else(|| "https://dashboard.leadsnebula.com".to_string());
+            .unwrap_or_else(|| {
+                // Local/dev: link in email should point to local dashboard so reset flow is testable
+                if env_normalized == "dev" {
+                    "http://localhost:3000".to_string()
+                } else {
+                    "https://dashboard.leadsnebula.com".to_string()
+                }
+            });
 
         // Redis pool size (default: 15, configurable via SSM)
         let redis_pool_size = params
