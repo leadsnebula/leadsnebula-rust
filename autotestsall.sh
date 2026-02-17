@@ -217,7 +217,7 @@ fi
 
 # Phase 1: DB-heavy integration tests (sequential, no migration contention)
 echo "Phase 1: DB integration tests (sequential)..."
-if ! cargo nextest run --test integration_auth --test integration_publisher_crud --test integration_leads_endpoint --test integration_carina_e2e --locked --all-features --run-ignored all --test-threads 1 -E 'not test(optimization_tests)' $NEXTEST_PROFILE; then
+if ! cargo nextest run --test integration_auth --test integration_publisher_crud --test integration_leads_endpoint --test integration_carina_e2e --test integration_email --locked --all-features --run-ignored all --test-threads 1 -E 'not test(optimization_tests)' $NEXTEST_PROFILE; then
     TEST_EXIT=1
 else
     TEST_EXIT=0
@@ -235,7 +235,7 @@ if [ $TEST_EXIT -eq 0 ]; then
         echo "Phase 2: Unit + lib + other tests ($TEST_THREADS threads)..."
     fi
     if ! cargo nextest run --all-targets --locked --all-features --run-ignored all --test-threads "$TEST_THREADS" \
-        -E 'not test(optimization_tests) and not test(integration_auth) and not test(integration_publisher_crud) and not test(integration_leads_endpoint) and not test(integration_carina_e2e)' \
+        -E 'not test(optimization_tests) and not test(integration_auth) and not test(integration_publisher_crud) and not test(integration_leads_endpoint) and not test(integration_carina_e2e) and not test(integration_email)' \
         $NEXTEST_PROFILE; then
         TEST_EXIT=1
     fi

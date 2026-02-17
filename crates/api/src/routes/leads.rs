@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use chrono::Utc;
+use leadsnebula_core::models::enums::LeadStatus;
 use leadsnebula_core::models::publisher::Publisher;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
@@ -196,6 +197,139 @@ fn missing_required_lead_field(lead: &LeadData, request_type: &str) -> Option<&'
     }
 }
 
+/// Human-readable message for validation error (for lead record and dashboard).
+fn validation_error_human_message(field: &str) -> String {
+    match field {
+        "ip_address" => "IP Address Missing".to_string(),
+        "email" => "Email Missing".to_string(),
+        "first_name" => "First Name Missing".to_string(),
+        "last_name" => "Last Name Missing".to_string(),
+        "cell_phone" => "Cell Phone Missing".to_string(),
+        "street_address" => "Street Address Missing".to_string(),
+        "city" => "City Missing".to_string(),
+        "state" => "State Missing".to_string(),
+        "zip" => "Zip Missing".to_string(),
+        "monthly_bill" => "Monthly Bill Missing".to_string(),
+        "own_home" => "Own Home Missing".to_string(),
+        "roof_shade" => "Roof Shade Missing".to_string(),
+        "utility_provider" => "Utility Provider Missing".to_string(),
+        "credit_rating" => "Credit Rating Missing".to_string(),
+        "tcpa_consent" => "TCPA Consent Missing".to_string(),
+        "tcpa_language" => "TCPA Language Missing".to_string(),
+        "jornaya_lead_id" => "Jornaya Lead ID Missing".to_string(),
+        "trusted_form_url" => "Trusted Form URL Missing".to_string(),
+        "property_type" => "Property Type Missing".to_string(),
+        "promise_id" => "Promise ID Missing".to_string(),
+        "publisher_id" => "Publisher ID Missing".to_string(),
+        "request_type" => "Request Type Missing".to_string(),
+        _ => format!("{} missing", field.replace('_', " ")),
+    }
+}
+
+/// Persist a lead that failed validation so it appears in the leads report with error status and audit trail.
+#[allow(clippy::too_many_arguments)]
+async fn persist_validation_error_lead(
+    pool: &sqlx::PgPool,
+    publisher_id: uuid::Uuid,
+    vertical: &leadsnebula_core::models::vertical::Vertical,
+    lead_data: &LeadData,
+    request_type: &str,
+    missing_field: &str,
+    request_body: &LeadRequest,
+    response_body: &LeadResponse,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    use rand::Rng;
+    let human_message = validation_error_human_message(missing_field);
+    let strategy = match request_type {
+        "fullpost" => "fullPost",
+        _ => "pingPost",
+    };
+    let lead_uuid = uuid::Uuid::new_v4();
+    let event_uuid = uuid::Uuid::new_v4();
+    let event_id = format!("evt_{}", event_uuid);
+    let lead_id = {
+        let mut lead_id = String::with_capacity(vertical.slug.len() + 9);
+        lead_id.push_str(&vertical.slug.to_uppercase());
+        lead_id.push('-');
+        let mut rng = rand::thread_rng();
+        for _ in 0..8 {
+            let c = rng.sample(Alphanumeric);
+            lead_id.push(char::from(c).to_ascii_uppercase());
+        }
+        lead_id
+    };
+    let session_uuid = uuid::Uuid::new_v4();
+    let session_id = format!("sess_{}", session_uuid);
+    let vertical_data = serde_json::json!({
+        "validation_error": human_message,
+        "missing_field": missing_field,
+    });
+    let request_json = serde_json::to_value(request_body).unwrap_or_else(|_| serde_json::json!({}));
+    let response_json =
+        serde_json::to_value(response_body).unwrap_or_else(|_| serde_json::json!({}));
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO leads (
+            uuid, event_id, lead_id, publisher_id, vertical_id, request_type, strategy, status,
+            promise_id, tcpa_consent, tcpa_language, is_test, session_id, vertical_data,
+            buyer_id, campaign_id, post_id, submitted_at, created_at,
+            first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted,
+            street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, $12, $13,
+            NULL, NULL, '', NOW(), NOW(),
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+        )
+        "#,
+    )
+    .bind(lead_uuid)
+    .bind(&event_id)
+    .bind(&lead_id)
+    .bind(publisher_id)
+    .bind(vertical.id)
+    .bind(request_type)
+    .bind(strategy)
+    .bind(LeadStatus::Error)
+    .bind(lead_data.tcpa_consent.unwrap_or(false))
+    .bind(lead_data.tcpa_language.as_deref().unwrap_or(""))
+    .bind(lead_data.is_test.unwrap_or(false))
+    .bind(&session_id)
+    .bind(sqlx::types::Json(vertical_data))
+    .execute(&mut *tx)
+    .await?;
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let ping_id_text = format!("ERR_{}_{}", lead_uuid, timestamp);
+    let ping_row: (i64,) = sqlx::query_as(
+        "INSERT INTO pings (ping_id, lead_id, promise_id, state, sent_at, created_at) VALUES ($1, $2, NULL, $3, now(), now()) RETURNING id",
+    )
+    .bind(&ping_id_text)
+    .bind(lead_uuid)
+    .bind("error")
+    .fetch_one(&mut *tx)
+    .await?;
+    let ping_db_id = ping_row.0;
+
+    let payload = serde_json::json!({
+        "request": request_json,
+        "response": response_json,
+        "validation_error": human_message,
+    });
+    sqlx::query(
+        "INSERT INTO ping_payloads (ping_id, lead_id, payload, created_at, updated_at) VALUES ($1::bigint, $2, $3, now(), now())",
+    )
+    .bind(ping_db_id)
+    .bind(lead_uuid)
+    .bind(sqlx::types::Json(payload))
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(lead_uuid)
+}
+
 /// Transform per_buyer_timings for verbose response: align status with main outcome, strip bid for fullpost.
 /// Ensures verbose is consistent (e.g. "sold" not "accepted") and fullpost never exposes bid.
 pub(crate) fn transform_per_buyer_timings_for_verbose(
@@ -221,7 +355,7 @@ pub(crate) fn transform_per_buyer_timings_for_verbose(
         .collect()
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct LeadRequest {
     pub verbose: Option<bool>,
     pub lead: LeadData,
@@ -261,7 +395,7 @@ pub struct LeadData {
     pub verbose: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct StatusNode {
     pub success: bool,
     pub status: String,
@@ -271,7 +405,7 @@ pub struct StatusNode {
     pub error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct LeadNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promise_id: Option<String>,
@@ -289,7 +423,7 @@ pub struct LeadNode {
     pub price: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct LeadResponse {
     // Preserve order: status, lead, verbose
     pub status: StatusNode,
@@ -753,37 +887,67 @@ async fn create_lead(
 
     // Validate required fields for this request type (API is source of truth)
     if let Some(field) = missing_required_lead_field(&lead_data, &request_type) {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(LeadResponse {
-                status: StatusNode {
-                    success: false,
-                    status: "error".to_string(),
-                    message: Some(format!("Missing required field: {}", field)),
-                    error: Some(format!("Missing required field: {}", field)),
-                },
-                lead: LeadNode {
-                    promise_id: None,
-                    lead_id: None,
-                    lead_uuid: None,
-                    ping_id: None,
-                    bid: None,
-                    post_id: None,
-                    price: None,
-                },
-                verbose: if verbose_requested {
-                    Some(serde_json::json!({
-                        "error_code": "ERR_400",
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "endpoint": "POST /api/v1/leads",
-                        "status_code": 400
-                    }))
-                } else {
-                    None
-                },
-                http_status: Some(400),
-            }),
-        ));
+        let error_message = format!("Missing required field: {}", field);
+        let response_body = LeadResponse {
+            status: StatusNode {
+                success: false,
+                status: "error".to_string(),
+                message: Some(error_message.clone()),
+                error: Some(error_message),
+            },
+            lead: LeadNode {
+                promise_id: None,
+                lead_id: None,
+                lead_uuid: None,
+                ping_id: None,
+                bid: None,
+                post_id: None,
+                price: None,
+            },
+            verbose: if verbose_requested {
+                Some(serde_json::json!({
+                    "error_code": "ERR_400",
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "endpoint": "POST /api/v1/leads",
+                    "status_code": 400
+                }))
+            } else {
+                None
+            },
+            http_status: Some(400),
+        };
+        let request_body = LeadRequest {
+            verbose: payload.verbose,
+            lead: lead_data.clone(),
+        };
+        let pool = state.db_pool.clone();
+        let publisher_id = publisher.id;
+        let vertical_clone = vertical.clone();
+        let lead_data_clone = lead_data.clone();
+        let request_type_clone = request_type.clone();
+        let field_owned = field.to_string();
+        let request_body_clone = request_body.clone();
+        let response_body_clone = response_body.clone();
+        tokio::spawn(async move {
+            if let Err(e) = persist_validation_error_lead(
+                pool.as_ref(),
+                publisher_id,
+                &vertical_clone,
+                &lead_data_clone,
+                &request_type_clone,
+                &field_owned,
+                &request_body_clone,
+                &response_body_clone,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to persist validation-error lead for audit (lead will not appear in report): {}",
+                    e
+                );
+            }
+        });
+        return Ok((StatusCode::BAD_REQUEST, Json(response_body)));
     }
 
     // Handle post request (update existing lead)

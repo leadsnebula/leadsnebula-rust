@@ -23,26 +23,32 @@ async fn main() -> Result<()> {
         tracing::info!("Loaded environment from .env.local (local development mode)");
     }
 
-    // Load DATABASE_URL from SSM (like main app) or fall back to env var
     let environment = std::env::var("ENVIRONMENT")
         .or_else(|_| std::env::var("ENV"))
         .unwrap_or_else(|_| "development".to_string());
 
-    let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
-    let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
-    let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
-    let params = ssm.get_parameters_by_path(&config_path).await?;
-
-    let database_url = params
-        .get(&format!("/leadsnebula/{}/rust/db/connection_url", env_normalized))
-        .cloned()
-        .or_else(|| std::env::var("DATABASE_URL").ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "DATABASE_URL not found in SSM at /leadsnebula/{}/rust/db/connection_url and not in environment variables",
+    // Prefer DATABASE_URL from env (CI/Neon ephemeral, local .env.local) so migrations run without SSM.
+    // Only call SSM when DATABASE_URL is not set (e.g. production/Fly.io).
+    let database_url = if let Ok(url) = std::env::var("DATABASE_URL") {
+        url
+    } else {
+        let env_normalized = leadsnebula_core::normalize_env_for_ssm(&environment);
+        let ssm = Arc::new(SsmService::new(environment.clone(), None).await?);
+        let config_path = format!("/leadsnebula/{}/rust/", env_normalized);
+        let params = ssm.get_parameters_by_path(&config_path).await?;
+        params
+            .get(&format!(
+                "/leadsnebula/{}/rust/db/connection_url",
                 env_normalized
-            )
-        })?;
+            ))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DATABASE_URL not set and not found in SSM at /leadsnebula/{}/rust/db/connection_url",
+                    env_normalized
+                )
+            })?
+    };
 
     // Use a simpler pool configuration for migrations (only need 1 connection)
     let pool = PgPoolOptions::new()

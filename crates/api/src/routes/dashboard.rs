@@ -7693,6 +7693,7 @@ async fn get_lead_details(
             .collect()
     } else if !ping_payloads_rows.is_empty() {
         // Fallback: Use ping_payloads table for historical leads (when buyer_responses don't exist)
+        // Includes validation-error leads: payload has "request", "response", "validation_error"
         ping_payloads_rows
             .iter()
             .map(|row| {
@@ -7709,9 +7710,39 @@ async fn get_lead_details(
                     .try_get::<Option<String>, _>("response_payload_encrypted")
                     .ok()
                     .flatten();
-                let request_payload =
-                    decrypt_payload(request_encrypted.clone()).or_else(|| payload_json.clone());
-                let response_payload = decrypt_payload(response_encrypted);
+
+                let (request_payload, response_payload, validation_status, validation_message) =
+                    if let Some(ref p) = payload_json {
+                        let has_validation_shape =
+                            p.get("request").is_some() && p.get("response").is_some();
+                        if has_validation_shape {
+                            (
+                                p.get("request").cloned(),
+                                p.get("response").cloned(),
+                                Some("error"),
+                                p.get("validation_error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Validation failed")
+                                    .to_string(),
+                            )
+                        } else {
+                            (
+                                decrypt_payload(request_encrypted.clone())
+                                    .or_else(|| Some(p.clone())),
+                                decrypt_payload(response_encrypted),
+                                None::<&str>,
+                                String::new(),
+                            )
+                        }
+                    } else {
+                        (
+                            decrypt_payload(request_encrypted.clone()),
+                            decrypt_payload(response_encrypted),
+                            None::<&str>,
+                            String::new(),
+                        )
+                    };
+
                 let bid = response_payload
                     .as_ref()
                     .and_then(|r| r.get("bid"))
@@ -7724,6 +7755,8 @@ async fn get_lead_details(
                     "campaign_name": None::<String>,
                     "bid": bid,
                     "processing_time_ms": None::<f64>,
+                    "status": validation_status,
+                    "message": validation_message,
                     "request_payload": request_payload,
                     "response_payload": response_payload,
                     "auction_timing": None::<serde_json::Value>,
