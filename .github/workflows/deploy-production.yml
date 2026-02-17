@@ -17,12 +17,25 @@ jobs:
   deploy:
     name: Deploy to Production Environment
     runs-on: ubuntu-latest
+    # Enable "Required reviewers" in Settings → Environments → production so a human must approve before this job runs
     environment: production
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "${{ secrets.FLY_API_TOKEN }}" ]; then
+            echo "ERROR: FLY_API_TOKEN secret is missing"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] || [ -z "${{ secrets.AWS_REGION }}" ]; then
+            echo "ERROR: AWS secrets (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION) required for production"
+            exit 1
+          fi
+          echo "Required secrets present"
 
       - name: Verify environment and config
         run: |
@@ -55,6 +68,22 @@ jobs:
           fi
           echo "APP_NAME=${APP_NAME}" >> $GITHUB_ENV
           echo "Deploying to: ${APP_NAME}"
+
+      - name: Validate SSM path for production (optional when AWS secrets set)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "AWS secrets not set - skipping SSM path validation (ensure SSM uses /leadsnebula/prod/... manually)"
+            exit 0
+          fi
+          if ! aws ssm get-parameters-by-path --path /leadsnebula/prod --max-results 1 --query 'Parameters[0].Name' --output text 2>/dev/null | grep -q '/leadsnebula/prod'; then
+            echo "ERROR: SSM path validation failed. Production deploy requires parameters under /leadsnebula/prod"
+            exit 1
+          fi
+          echo "SSM path /leadsnebula/prod validated"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -242,6 +271,20 @@ jobs:
           echo "  2. SSM parameters exist with 'prod' path (not 'production')"
           echo "  3. Fly.io machine has IAM permissions to access SSM"
 
+      - name: Record current image for rollback
+        id: rollback
+        run: |
+          PREV=$(flyctl releases list --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.[0].imageRef // empty')
+          if [ -n "$PREV" ]; then
+            echo "previous_image=$PREV" >> $GITHUB_OUTPUT
+            echo "Rollback image recorded: $PREV"
+          else
+            echo "previous_image=" >> $GITHUB_OUTPUT
+            echo "No previous release (first deploy?)"
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
       - name: Deploy to Fly.io Production
         run: |
           VERIFY_APP=$(grep '^app = ' fly.toml | cut -d'"' -f2)
@@ -292,6 +335,54 @@ jobs:
               sleep 2
             fi
           done
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Smoke test /live endpoint
+        run: |
+          APP_URL="https://${{ env.APP_NAME }}.fly.dev"
+          echo "Checking $APP_URL/live ..."
+          for i in {1..10}; do
+            if curl -sf --max-time 10 "$APP_URL/live" | grep -q '"status".*"alive"'; then
+              echo "✅ /live endpoint responded successfully"
+              exit 0
+            fi
+            echo "Attempt $i/10 - waiting 5s..."
+            sleep 5
+          done
+          echo "❌ /live endpoint did not respond after 10 attempts"
+          exit 1
+
+      - name: Upload deployment summary
+        if: always()
+        run: |
+          SUMMARY_FILE="deployment-summary-${{ github.run_id }}.txt"
+          : > "$SUMMARY_FILE"
+          if [ -n "${{ env.APP_NAME }}" ]; then
+            echo "=== flyctl status ===" >> "$SUMMARY_FILE"
+            flyctl status --app ${{ env.APP_NAME }} >> "$SUMMARY_FILE" 2>&1 || true
+            echo "" >> "$SUMMARY_FILE"
+            echo "=== Recent logs ===" >> "$SUMMARY_FILE"
+            flyctl logs --app ${{ env.APP_NAME }} --no-tail >> "$SUMMARY_FILE" 2>&1 || true
+          else
+            echo "Summary not available (job failed before APP_NAME was set)" >> "$SUMMARY_FILE"
+          fi
+          echo "Deployment summary written to $SUMMARY_FILE"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Upload deployment summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary-production-${{ github.run_id }}
+          path: deployment-summary-${{ github.run_id }}.txt
+
+      - name: Rollback on health failure
+        if: failure() && steps.rollback.outputs.previous_image != ''
+        run: |
+          echo "Health check failed - rolling back to previous image"
+          flyctl deploy --image "${{ steps.rollback.outputs.previous_image }}" --config fly.toml --app ${{ env.APP_NAME }} --remote-only=false --skip-release-command
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 

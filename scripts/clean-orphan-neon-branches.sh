@@ -55,6 +55,15 @@ if ! echo "$branches" | jq empty 2>/dev/null; then
   exit 1
 fi
 
+# Parse OLDER_THAN (e.g. 24h, 12h, 48h) into seconds
+OLD_SECONDS=86400
+if [[ "$OLDER_THAN" =~ ^([0-9]+)h$ ]]; then
+  OLD_SECONDS=$((${BASH_REMATCH[1]} * 3600))
+elif [[ "$OLDER_THAN" =~ ^([0-9]+)d$ ]]; then
+  OLD_SECONDS=$((${BASH_REMATCH[1]} * 86400))
+fi
+NOW_EPOCH=$(date +%s)
+
 # Use jq if available, otherwise print branches and exit
 if command -v jq >/dev/null 2>&1; then
   # Filter branches starting with "ci-" (CI ephemeral branches)
@@ -65,19 +74,24 @@ if command -v jq >/dev/null 2>&1; then
     exit 0
   fi
   
-  echo "Found CI branches:"
+  echo "Found CI branches (deleting only if older than $OLDER_THAN = ${OLD_SECONDS}s):"
   echo "$CI_BRANCHES" | while IFS='|' read -r name created; do
     echo "  - $name (created: $created)"
   done
   
-  # For now, delete all ci- branches (we could add date parsing later)
-  # The workflow runs daily, so branches older than 24h should be safe to delete
   echo ""
   echo "Deleting CI branches older than $OLDER_THAN..."
-  echo "$CI_BRANCHES" | while IFS='|' read -r name created; do
-    echo "Deleting branch $name (created at $created)"
-    $NEONCTL_CMD branches delete "$name" --project "$PROJECT_ID" --api-key "$NEONCTL_API_KEY" || echo "Failed to delete $name (may already be deleted)"
-  done
+  while IFS='|' read -r name created; do
+    # Parse created_at (ISO 8601) to epoch; skip if unparseable
+    CREATED_EPOCH=$(date -d "$created" +%s 2>/dev/null) || continue
+    AGE=$((NOW_EPOCH - CREATED_EPOCH))
+    if [ "$AGE" -ge "$OLD_SECONDS" ]; then
+      echo "Deleting branch $name (created $created, age ${AGE}s)"
+      $NEONCTL_CMD branches delete "$name" --project "$PROJECT_ID" --api-key "$NEONCTL_API_KEY" || echo "Failed to delete $name (may already be deleted)"
+    else
+      echo "Skipping $name (age ${AGE}s < ${OLD_SECONDS}s)"
+    fi
+  done <<< "$CI_BRANCHES"
   
   echo "Pruning complete"
 else

@@ -7,6 +7,12 @@ on:
       - completed
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip requiring Rust CI success (hotfix only; run tests locally first)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   deploy:
@@ -19,6 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate required secrets
+        run: |
+          if [ -z "${{ secrets.FLY_API_TOKEN }}" ]; then
+            echo "ERROR: FLY_API_TOKEN secret is missing. Set it in repo Settings → Secrets."
+            exit 1
+          fi
+          echo "Required secrets present"
+
       - name: Verify environment and config
         run: |
           if [ "${{ github.event_name }}" == "workflow_run" ]; then
@@ -26,6 +40,11 @@ jobs:
               echo "ERROR: Rust CI workflow did not complete successfully"
               exit 1
             fi
+          fi
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.skip_tests }}" == "true" ]; then
+            echo "Hotfix mode: skip_tests=true. Ensure you have run tests locally (e.g. autotestsall.sh) before deploying."
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.skip_tests }}" != "true" ]; then
+            echo "Manual run without skip_tests: Rust CI is not re-run; ensure main branch is green or run tests locally."
           fi
           if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "${{ github.event_name }}" != "workflow_run" ]; then
             echo "ERROR: This workflow only deploys after Rust CI succeeds or manual trigger"
@@ -49,15 +68,32 @@ jobs:
             exit 1
           fi
           echo "APP_NAME=${APP_NAME}" >> $GITHUB_ENV
-          
-          # Get the commit SHA from the workflow_run event or current commit
+
+      - name: Validate SSM path for dev (optional when AWS secrets set)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "AWS secrets not set - skipping SSM path validation (ensure SSM uses /leadsnebula/dev/... manually)"
+            exit 0
+          fi
+          if ! aws ssm get-parameters-by-path --path /leadsnebula/dev --max-results 1 --query 'Parameters[0].Name' --output text 2>/dev/null | grep -q '/leadsnebula/dev'; then
+            echo "ERROR: SSM path validation failed. Dev deploy requires parameters under /leadsnebula/dev (e.g. /leadsnebula/dev/rust/db/connection_url)"
+            exit 1
+          fi
+          echo "SSM path /leadsnebula/dev validated"
+
+      - name: Set commit SHA
+        run: |
           if [ "${{ github.event_name }}" == "workflow_run" ]; then
             COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
           else
             COMMIT_SHA="${{ github.sha }}"
           fi
           echo "COMMIT_SHA=${COMMIT_SHA}" >> $GITHUB_ENV
-          echo "Deploying to: ${APP_NAME} (commit: ${COMMIT_SHA})"
+          echo "Deploying to: ${{ env.APP_NAME }} (commit: ${COMMIT_SHA})"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -245,14 +281,22 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
 
+      - name: Record current image for rollback
+        id: rollback
+        run: |
+          PREV=$(flyctl releases list --app ${{ env.APP_NAME }} --json 2>/dev/null | jq -r '.[0].imageRef // empty')
+          if [ -n "$PREV" ]; then
+            echo "previous_image=$PREV" >> $GITHUB_OUTPUT
+            echo "Rollback image recorded: $PREV"
+          else
+            echo "previous_image=" >> $GITHUB_OUTPUT
+            echo "No previous release (first deploy?)"
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
       - name: Deploy to Fly.io Dev
         run: |
-          # NOTE: --skip-tests flag (planned for Phase 3)
-          # This flag would be manual-only for hotfixes after local validation.
-          # It would skip CI tests but requires local validate.sh/autotests.sh to pass first.
-          # This is a safety mechanism for rapid hotfix deployments when full CI is not needed.
-          # Implementation: Add --skip-tests input to workflow_dispatch, then conditionally skip test jobs.
-          
           VERIFY_APP=$(grep '^app = ' fly.dev.toml | cut -d'"' -f2)
           if [ "$VERIFY_APP" != "${{ env.APP_NAME }}" ]; then
             echo "ERROR: App name mismatch detected before deployment"
@@ -327,6 +371,54 @@ jobs:
                 ;;
             esac
           done
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Smoke test /live endpoint
+        run: |
+          APP_URL="https://${{ env.APP_NAME }}.fly.dev"
+          echo "Checking $APP_URL/live ..."
+          for i in {1..10}; do
+            if curl -sf --max-time 10 "$APP_URL/live" | grep -q '"status".*"alive"'; then
+              echo "✅ /live endpoint responded successfully"
+              exit 0
+            fi
+            echo "Attempt $i/10 - waiting 5s..."
+            sleep 5
+          done
+          echo "❌ /live endpoint did not respond after 10 attempts"
+          exit 1
+
+      - name: Upload deployment summary
+        if: always()
+        run: |
+          SUMMARY_FILE="deployment-summary-${{ github.run_id }}.txt"
+          : > "$SUMMARY_FILE"
+          if [ -n "${{ env.APP_NAME }}" ]; then
+            echo "=== flyctl status ===" >> "$SUMMARY_FILE"
+            flyctl status --app ${{ env.APP_NAME }} >> "$SUMMARY_FILE" 2>&1 || true
+            echo "" >> "$SUMMARY_FILE"
+            echo "=== Recent logs ===" >> "$SUMMARY_FILE"
+            flyctl logs --app ${{ env.APP_NAME }} --no-tail >> "$SUMMARY_FILE" 2>&1 || true
+          else
+            echo "Summary not available (job failed before APP_NAME was set)" >> "$SUMMARY_FILE"
+          fi
+          echo "Deployment summary written to $SUMMARY_FILE"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Upload deployment summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary-dev-${{ github.run_id }}
+          path: deployment-summary-${{ github.run_id }}.txt
+
+      - name: Rollback on health failure
+        if: failure() && steps.rollback.outputs.previous_image != ''
+        run: |
+          echo "Health check failed - rolling back to previous image"
+          flyctl deploy --image "${{ steps.rollback.outputs.previous_image }}" --config fly.dev.toml --app ${{ env.APP_NAME }} --remote-only=false --skip-release-command
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 

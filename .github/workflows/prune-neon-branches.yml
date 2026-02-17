@@ -4,7 +4,17 @@ name: 'Prune Neon branches'
 on:
   schedule:
     - cron: '0 1 * * *' # every day at 01:00 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      older_than:
+        description: 'Delete branches older than this'
+        required: false
+        default: '24h'
+        type: choice
+        options:
+          - '12h'
+          - '24h'
+          - '48h'
 
 jobs:
   prune:
@@ -51,6 +61,15 @@ jobs:
             echo "✅ Proceeding - authentication will be verified by actual branch operations"
           fi
 
-      - name: Prune branches (24h)
+      - name: Prune branches
+        id: prune
         run: |
-          ./scripts/clean-orphan-neon-branches.sh --project "$NEON_PROJECT_ID" --older-than 24h
+          OLDER="${{ github.event.inputs.older_than || '24h' }}"
+          ./scripts/clean-orphan-neon-branches.sh --project "$NEON_PROJECT_ID" --older-than "$OLDER"
+
+      - name: Notify on prune failure
+        if: failure()
+        run: |
+          echo "❌ Prune Neon branches job failed. Check the logs."
+          # Optional: add SLACK_WEBHOOK_URL secret and uncomment to post to Slack:
+          # curl -sS -X POST -d '{"text":"Prune Neon branches workflow failed"}' "${{ secrets.SLACK_WEBHOOK_URL }}" || true
