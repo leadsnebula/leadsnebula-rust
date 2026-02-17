@@ -1,0 +1,6 @@
+# cargo-audit configuration
+# https://docs.rs/crate/cargo-audit/latest
+
+[advisories]
+# RUSTSEC-2023-0071 (rsa): only pulled in by sqlx-mysql. We use Postgres only; no fix available.
+ignore = ["RUSTSEC-2023-0071"]
