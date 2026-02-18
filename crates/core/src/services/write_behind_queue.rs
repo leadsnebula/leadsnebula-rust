@@ -949,10 +949,11 @@ impl WriteBehindQueue {
                     tracing::error!("Failed to reset inprog_token for lead {}: {}", lead_id, e);
                 }
             } else {
-                // Standard update (with optional vertical_data)
+                // Standard update (with optional vertical_data; merge into existing so winning_bid is preserved)
                 if let Some(vd) = vertical_data {
                     // CRITICAL: buyer_id, campaign_id, and post_id are NOT NULL in schema
                     // Only update if we have valid values, otherwise use COALESCE to keep existing values
+                    // Merge vertical_data so keys like winning_bid are added without wiping auction_timing etc.
                     match sqlx::query(
                         r#"
                         UPDATE leads
@@ -962,7 +963,7 @@ impl WriteBehindQueue {
                             promise_id = COALESCE($5, promise_id), 
                             ping_id = COALESCE($6, ping_id), 
                             post_id = COALESCE($7, post_id), 
-                            vertical_data = $8, 
+                            vertical_data = COALESCE(vertical_data, '{}'::jsonb) || COALESCE($8::jsonb, '{}'::jsonb),
                             updated_at = NOW()
                         WHERE uuid = $1
                         "#,
@@ -1286,6 +1287,7 @@ impl WriteBehindQueue {
 
                 // Insert lead with explicit UUID (must match UUID returned to client).
                 // ON CONFLICT (lead_id): same lead_id is idempotent — update promise_id so post can find the lead.
+                // Test leads (status = test): when implementing revenue calculation, exclude test leads; when implementing reports, exclude test leads.
                 let lead_uuid_result = sqlx::query(
                     r#"
                     INSERT INTO leads (
@@ -1312,7 +1314,11 @@ impl WriteBehindQueue {
                 .bind(vertical_id)
                 .bind(request_type)
                 .bind(strategy)
-                .bind(LeadStatus::Processing)
+                .bind(if *is_test {
+                    LeadStatus::Test
+                } else {
+                    LeadStatus::Processing
+                })
                 .bind(promise_id.as_ref())
                 .bind(*tcpa_consent)
                 .bind(tcpa_language)

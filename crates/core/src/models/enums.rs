@@ -12,6 +12,8 @@ pub enum LeadStatus {
     Timeout,
     Invalid,
     Error,
+    /// Test leads (is_test = true): do not count toward revenue; exclude from reports.
+    Test,
 }
 
 impl LeadStatus {
@@ -24,6 +26,7 @@ impl LeadStatus {
             LeadStatus::Timeout => "timeout",
             LeadStatus::Invalid => "invalid",
             LeadStatus::Error => "error",
+            LeadStatus::Test => "test",
         }
     }
 }

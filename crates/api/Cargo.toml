@@ -46,7 +46,8 @@ webauthn-rs = { version = "0.4", optional = true, features = ["danger-allow-stat
 url = { version = "2", optional = true }
 
 # OpenAPI + Scalar documentation
-utoipa = { version = "5", features = ["uuid", "chrono"] }
+utoipa = { version = "5", features = ["uuid", "chrono", "preserve_order"] }
+indexmap = "2"
 utoipa-scalar = "0.3"
 
 # Optional features

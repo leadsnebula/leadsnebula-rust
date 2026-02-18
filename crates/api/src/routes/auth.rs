@@ -2,13 +2,16 @@
 // It will be used when we implement full app serving after AppState initialization
 #![allow(dead_code)]
 
+use axum::http::HeaderMap;
 use axum::{
     extract::rejection::JsonRejection, extract::State, http::StatusCode, response::Json,
     routing::post, Router,
 };
+use base64::Engine;
 use leadsnebula_core::auth::{hash_password, verify_password, JwtService};
 use leadsnebula_core::models::user::User;
 use leadsnebula_core::password_policy;
+use leadsnebula_core::password_reset::PasswordResetService;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tracing::error;
@@ -52,6 +55,20 @@ pub struct VerifyOtpLoginRequest {
 }
 
 #[derive(Deserialize)]
+pub struct ForgotPasswordRequest {
+    email: String,
+}
+
+#[derive(Serialize)]
+pub struct ForgotPasswordResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct ResetPasswordRequest {
     token: String,
     new_password: String,
@@ -68,6 +85,7 @@ pub fn auth_routes() -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/verify-otp-login", post(verify_otp_login))
+        .route("/api/auth/forgot-password", post(forgot_password))
         .route("/api/auth/reset-password", post(reset_password))
 }
 
@@ -542,6 +560,190 @@ async fn verify_otp_login(
         requires_otp: None,
         login_token: None,
         message: None,
+    }))
+}
+
+/// POST /api/auth/forgot-password — send password reset email by email address (public, no auth).
+/// Body: { email: string }. Always returns success to avoid leaking account existence.
+async fn forgot_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<ForgotPasswordRequest>, JsonRejection>,
+) -> Result<Json<ForgotPasswordResponse>, (StatusCode, Json<ForgotPasswordResponse>)> {
+    let payload = payload.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ForgotPasswordResponse {
+                success: false,
+                message: None,
+                error: Some("Invalid request. Send JSON with email.".to_string()),
+            }),
+        )
+    })?;
+    let email = payload.0.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ForgotPasswordResponse {
+                success: false,
+                message: None,
+                error: Some("Email is required.".to_string()),
+            }),
+        ));
+    }
+
+    let user: Option<User> = sqlx::query_as(
+        "SELECT id, email, encrypted_password, first_name, last_name, status, confirmed_at, created_at, updated_at FROM instance_users WHERE email = $1 AND status = 'active'",
+    )
+    .bind(&email)
+    .fetch_optional(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error looking up user for forgot-password: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ForgotPasswordResponse {
+                success: false,
+                message: None,
+                error: Some("Server error. Please try again.".to_string()),
+            }),
+        )
+    })?;
+
+    let Some(user) = user else {
+        return Ok(Json(ForgotPasswordResponse {
+            success: true,
+            message: Some(
+                "If an account with that email exists, a password reset link has been sent."
+                    .to_string(),
+            ),
+            error: None,
+        }));
+    };
+
+    let user_id = user.id;
+
+    let last_sent: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT reset_password_sent_at FROM instance_users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(state.db_pool.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error checking reset rate limit: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ForgotPasswordResponse {
+                    success: false,
+                    message: None,
+                    error: Some("Server error. Please try again.".to_string()),
+                }),
+            )
+        })?
+        .flatten();
+    if let Some(ts) = last_sent {
+        if chrono::Utc::now().signed_duration_since(ts).num_seconds() < 300 {
+            return Ok(Json(ForgotPasswordResponse {
+                success: true,
+                message: Some("If an account with that email exists, a reset link was already sent. Please check your inbox or try again later.".to_string()),
+                error: None,
+            }));
+        }
+    }
+
+    let reset_token = {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    };
+
+    sqlx::query(
+        "UPDATE instance_users SET reset_password_token = $1, reset_password_sent_at = NOW(), updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&reset_token)
+    .bind(user_id)
+    .execute(state.db_pool.as_ref())
+    .await
+    .map_err(|e| {
+        error!("Database error saving reset token: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ForgotPasswordResponse {
+                success: false,
+                message: None,
+                error: Some("Server error. Please try again.".to_string()),
+            }),
+        )
+    })?;
+
+    let reset_base_url = if state.config.environment.eq_ignore_ascii_case("development") {
+        headers
+            .get("origin")
+            .or_else(|| headers.get("referer"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.trim())
+            .map(|s| {
+                let s = s.trim_end_matches('/');
+                if let Some(colon_slash) = s.find("://") {
+                    let after_scheme = colon_slash + 3;
+                    let rest = &s[after_scheme..];
+                    if let Some(slash) = rest.find('/') {
+                        s[..after_scheme + slash].to_string()
+                    } else {
+                        s.to_string()
+                    }
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_else(|| state.config.password_reset_base_url.clone())
+    } else {
+        state.config.password_reset_base_url.clone()
+    };
+
+    let password_reset_service =
+        PasswordResetService::new(state.email_service.clone(), reset_base_url.clone());
+    if let Err(e) = password_reset_service
+        .send_reset_email(&user, &reset_token)
+        .await
+    {
+        error!("Failed to send password reset email: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ForgotPasswordResponse {
+                success: false,
+                message: None,
+                error: Some("Server error. Please try again.".to_string()),
+            }),
+        ));
+    }
+
+    fn mask_email_for_log(email: &str) -> String {
+        let email = email.trim();
+        if email.is_empty() {
+            return "***".to_string();
+        }
+        if let Some(at) = email.find('@') {
+            let local = &email[..at];
+            let visible = local.chars().take(1).collect::<String>();
+            format!("{}***{}", visible, &email[at..])
+        } else {
+            "***".to_string()
+        }
+    }
+    tracing::info!(
+        "Password reset email sent for {}",
+        mask_email_for_log(&user.email)
+    );
+
+    Ok(Json(ForgotPasswordResponse {
+        success: true,
+        message: Some(
+            "If an account with that email exists, a password reset link has been sent."
+                .to_string(),
+        ),
+        error: None,
     }))
 }
 

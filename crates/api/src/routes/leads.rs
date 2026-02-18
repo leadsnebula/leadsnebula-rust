@@ -426,6 +426,143 @@ pub struct LeadRequest {
     pub lead: LeadData,
 }
 
+/// Incoming request body: lead can be nested (grouped nodes) or flat. Parsed then normalized to LeadData.
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct LeadRequestIncoming {
+    pub verbose: Option<bool>,
+    #[serde(deserialize_with = "deserialize_lead_body")]
+    pub lead: LeadData,
+}
+
+/// Deserialize lead as either nested (request_properties, publisher_data, ...) or flat (all fields at top level).
+fn deserialize_lead_body<'de, D>(deserializer: D) -> Result<LeadData, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.get("request_properties").is_some()
+        && value.get("publisher_data").is_some()
+        && value.get("consumer_data").is_some()
+        && value.get("property_data").is_some()
+        && value.get("compliance").is_some()
+    {
+        let nested: LeadNested = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(nested.into())
+    } else {
+        let flat: LeadData = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(flat)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct LeadNested {
+    request_properties: Option<NestedRequestProperties>,
+    publisher_data: Option<NestedPublisherData>,
+    consumer_data: Option<NestedConsumerData>,
+    property_data: Option<NestedPropertyData>,
+    compliance: Option<NestedCompliance>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NestedRequestProperties {
+    vertical: Option<String>,
+    is_test: Option<bool>,
+    request_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NestedPublisherData {
+    publisher_id: Option<String>,
+    campaign_token: Option<String>,
+    lead_id: Option<String>,
+    promise_id: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NestedConsumerData {
+    first_name: Option<String>,
+    last_name: Option<String>,
+    email: Option<String>,
+    cell_phone: Option<String>,
+    street_address: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    zip: Option<String>,
+    credit_rating: Option<String>,
+    ip_address: Option<String>,
+    user_agent: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NestedPropertyData {
+    monthly_bill: Option<f64>,
+    own_home: Option<bool>,
+    property_type: Option<String>,
+    purchase_timeframe: Option<String>,
+    roof_shade: Option<String>,
+    roof_type: Option<String>,
+    utility_provider: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NestedCompliance {
+    tcpa_consent: Option<bool>,
+    tcpa_language: Option<String>,
+    jornaya_lead_id: Option<String>,
+    trusted_form_url: Option<String>,
+}
+
+impl From<LeadNested> for LeadData {
+    fn from(n: LeadNested) -> Self {
+        let r = n.request_properties.as_ref();
+        let p = n.publisher_data.as_ref();
+        let c = n.consumer_data.as_ref();
+        let prop = n.property_data.as_ref();
+        let comp = n.compliance.as_ref();
+        LeadData {
+            publisher_id: p.and_then(|x| x.publisher_id.clone()),
+            vertical: r.and_then(|x| x.vertical.clone()).unwrap_or_default(),
+            request_type: r.and_then(|x| x.request_type.clone()),
+            campaign_token: p.and_then(|x| x.campaign_token.clone()),
+            promise_id: p.and_then(|x| x.promise_id.clone()),
+            lead_id: p.and_then(|x| x.lead_id.clone()),
+            source: p.and_then(|x| x.source.clone()), // publisher website / traffic source
+            first_name: c.and_then(|x| x.first_name.clone()),
+            last_name: c.and_then(|x| x.last_name.clone()),
+            email: c.and_then(|x| x.email.clone()),
+            cell_phone: c.and_then(|x| x.cell_phone.clone()),
+            street_address: c.and_then(|x| x.street_address.clone()),
+            city: c.and_then(|x| x.city.clone()),
+            state: c.and_then(|x| x.state.clone()),
+            zip: c.and_then(|x| x.zip.clone()),
+            monthly_bill: prop.and_then(|x| x.monthly_bill),
+            credit_rating: c.and_then(|x| x.credit_rating.clone()),
+            own_home: prop.and_then(|x| x.own_home),
+            property_type: prop.and_then(|x| x.property_type.clone()),
+            roof_shade: prop.and_then(|x| x.roof_shade.clone()),
+            roof_type: prop.and_then(|x| x.roof_type.clone()),
+            utility_provider: prop.and_then(|x| x.utility_provider.clone()),
+            purchase_timeframe: prop.and_then(|x| x.purchase_timeframe.clone()),
+            ip_address: c.and_then(|x| x.ip_address.clone()),
+            tcpa_consent: comp.and_then(|x| x.tcpa_consent),
+            tcpa_language: comp.and_then(|x| x.tcpa_language.clone()),
+            jornaya_lead_id: comp.and_then(|x| x.jornaya_lead_id.clone()),
+            trusted_form_url: comp.and_then(|x| x.trusted_form_url.clone()),
+            is_test: r.and_then(|x| x.is_test),
+            verbose: None,
+            user_agent: c.and_then(|x| x.user_agent.clone()),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 #[allow(dead_code)] // Fields will be used as implementation expands
 pub struct LeadData {
@@ -435,6 +572,7 @@ pub struct LeadData {
     pub campaign_token: Option<String>,
     pub promise_id: Option<String>,
     pub lead_id: Option<String>,
+    pub source: Option<String>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub email: Option<String>,
@@ -457,7 +595,9 @@ pub struct LeadData {
     pub jornaya_lead_id: Option<String>,
     pub trusted_form_url: Option<String>,
     pub is_test: Option<bool>,
+    /// Ignored; use top-level `verbose` only. Kept for backward compatibility.
     pub verbose: Option<bool>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -512,9 +652,14 @@ async fn create_lead_ping(
     Extension(publisher): Extension<Publisher>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
-    Json(mut payload): Json<LeadRequest>,
+    Json(payload_in): Json<LeadRequestIncoming>,
 ) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
-    payload.lead.request_type = Some("ping".to_string());
+    let mut lead = payload_in.lead;
+    lead.request_type = Some("ping".to_string());
+    let payload = LeadRequest {
+        verbose: payload_in.verbose,
+        lead,
+    };
     create_lead(
         State(state),
         Extension(publisher),
@@ -530,9 +675,14 @@ async fn create_lead_post(
     Extension(publisher): Extension<Publisher>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
-    Json(mut payload): Json<LeadRequest>,
+    Json(payload_in): Json<LeadRequestIncoming>,
 ) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
-    payload.lead.request_type = Some("post".to_string());
+    let mut lead = payload_in.lead;
+    lead.request_type = Some("post".to_string());
+    let payload = LeadRequest {
+        verbose: payload_in.verbose,
+        lead,
+    };
     create_lead(
         State(state),
         Extension(publisher),
@@ -548,9 +698,14 @@ async fn create_lead_fullpost(
     Extension(publisher): Extension<Publisher>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
-    Json(mut payload): Json<LeadRequest>,
+    Json(payload_in): Json<LeadRequestIncoming>,
 ) -> Result<(StatusCode, Json<LeadResponse>), StatusCode> {
-    payload.lead.request_type = Some("fullpost".to_string());
+    let mut lead = payload_in.lead;
+    lead.request_type = Some("fullpost".to_string());
+    let payload = LeadRequest {
+        verbose: payload_in.verbose,
+        lead,
+    };
     create_lead(
         State(state),
         Extension(publisher),
@@ -1263,7 +1418,8 @@ async fn create_lead(
                             success: false,
                             status: "error".to_string(),
                             message: Some(
-                                "Lead has already been posted/sold or promise expired".to_string(),
+                                "The lead_id or promise_id have already been posted, or do not match your ping response. Use the lead_id and promise_id from your ping response."
+                                    .to_string(),
                             ),
                             error: Some("duplicate_or_expired_promise".to_string()),
                         },
@@ -1282,7 +1438,7 @@ async fn create_lead(
                                 "timestamp": Utc::now().to_rfc3339(),
                                 "endpoint": "POST /api/v1/leads",
                                 "status_code": 400,
-                                "note": "Duplicate post attempt or promise expired"
+                                "note": "lead_id or promise_id already posted or mismatch; use lead_id and promise_id from ping response"
                             }))
                         } else {
                             None
@@ -2232,34 +2388,23 @@ async fn create_lead(
     // Always available (not feature-gated) for production performance monitoring
     let critical_path_start = std::time::Instant::now();
 
-    // Generate identifiers only after pre-checks pass
+    // Generate identifiers only after pre-checks pass.
+    // Ping/fullpost: lead_id does not exist before the request; server generates it on arrival and returns it in the response.
+    // Post must use the same lead_id and promise_id from the ping response (no new lead_id on post).
     let id_generation_start = std::time::Instant::now();
-    // OPTIMIZED: Use String::with_capacity + push_str instead of format! for better performance
-    let lead_id = lead_data.lead_id.clone().unwrap_or_else(|| {
+    let lead_id = {
         let prefix = vertical.slug.to_uppercase();
-        // Pre-allocate string with estimated capacity (prefix + 8 chars + 1 dash)
         let mut result = String::with_capacity(prefix.len() + 9);
         result.push_str(&prefix);
         result.push('-');
-        // Generate random alphanumeric string directly to uppercase
         let mut rng = rand::thread_rng();
         for _ in 0..8 {
             let c = rng.sample(Alphanumeric);
             result.push(char::from(c).to_ascii_uppercase());
         }
         result
-    });
-
-    // When client sends lead_id, use deterministic UUID so duplicate lead_id is idempotent (post can find lead)
-    let lead_uuid = if let Some(ref lid) = lead_data.lead_id {
-        if !lid.is_empty() {
-            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, lid.as_bytes())
-        } else {
-            uuid::Uuid::new_v4()
-        }
-    } else {
-        uuid::Uuid::new_v4()
     };
+    let lead_uuid = uuid::Uuid::new_v4();
 
     tracing::debug!(
         lead_uuid = %lead_uuid,
@@ -2405,6 +2550,14 @@ async fn create_lead(
         "Queue enqueue completed"
     );
 
+    // User-Agent: from lead body or fallback to request header
+    let user_agent_for_lead = lead_data.user_agent.clone().or_else(|| {
+        headers
+            .get("User-Agent")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    });
+
     // ASYNC MODE: Return 202 Accepted immediately after enqueueing (routing happens in background)
     // This eliminates routing latency from response time (typically 2-400ms savings)
     // Client receives lead_uuid immediately and can poll for status if needed
@@ -2425,7 +2578,11 @@ async fn create_lead(
             buyer_id: buyer_id_opt,
             request_type: request_type.clone(),
             strategy: strategy.to_string(),
-            status: leadsnebula_core::models::enums::LeadStatus::Processing,
+            status: if lead_data.is_test.unwrap_or(false) {
+                leadsnebula_core::models::enums::LeadStatus::Test
+            } else {
+                leadsnebula_core::models::enums::LeadStatus::Processing
+            },
             promise_id: promise_id.clone(),
             ping_id: None,
             post_id: None,
@@ -2447,9 +2604,9 @@ async fn create_lead(
             tcpa_consent: lead_data.tcpa_consent.unwrap_or(false),
             tcpa_language: lead_data.tcpa_language.as_deref().unwrap_or("").to_string(),
             is_test: lead_data.is_test.unwrap_or(false),
-            user_agent: None,
+            user_agent: user_agent_for_lead.clone(),
             referrer: None,
-            website_url: None,
+            website_url: lead_data.source.clone(),
             click_id: None,
             url_consent: None,
             best_call_time: None,
@@ -2567,7 +2724,11 @@ async fn create_lead(
         buyer_id: buyer_id_opt,
         request_type: request_type.clone(), // Need to clone, used later
         strategy: strategy.to_string(),
-        status: leadsnebula_core::models::enums::LeadStatus::Processing,
+        status: if lead_data.is_test.unwrap_or(false) {
+            leadsnebula_core::models::enums::LeadStatus::Test
+        } else {
+            leadsnebula_core::models::enums::LeadStatus::Processing
+        },
         promise_id: promise_id.clone(),
         ping_id: None,
         post_id: None,
@@ -2589,9 +2750,9 @@ async fn create_lead(
         tcpa_consent: lead_data.tcpa_consent.unwrap_or(false),
         tcpa_language: lead_data.tcpa_language.as_deref().unwrap_or("").to_string(),
         is_test: lead_data.is_test.unwrap_or(false),
-        user_agent: None,
+        user_agent: user_agent_for_lead,
         referrer: None,
-        website_url: None,
+        website_url: lead_data.source.clone(),
         click_id: None,
         url_consent: None,
         best_call_time: None,
@@ -2680,15 +2841,15 @@ async fn create_lead(
                 price = round2(routing_result.price);
             }
 
-            // Build a clearer message. For accepted pings include winning bid when available.
-            // Note: Buyer name lookup removed to avoid blocking response (performance optimization)
-            // Buyer name can be included in verbose response if needed
+            // Build a clearer message. For accepted pings include winning bid and instruction to use same lead_id/promise_id in POST.
             let message = if routing_result.status == "accepted" {
-                if let Some(b) = bid {
-                    Some(format!("Ping Accepted with a bid of ${:.2}", b))
+                let base = if let Some(b) = bid {
+                    format!("Ping Accepted with a bid of ${:.2}", b)
                 } else {
-                    Some("Ping Accepted".to_string())
-                }
+                    "Ping Accepted".to_string()
+                };
+                let instruction = " Include the same lead_id and promise_id from this response in your POST request to complete the lead.";
+                Some(format!("{}{}", base, instruction))
             } else if routing_result.status == "sold" {
                 if let Some(p) = price {
                     Some(format!("Lead Sold for ${}", p))
@@ -3597,6 +3758,7 @@ mod tests {
             campaign_token: None,
             promise_id: None,
             lead_id: None,
+            source: None,
             first_name: None,
             last_name: None,
             email: None,
@@ -3620,6 +3782,7 @@ mod tests {
             trusted_form_url: Some("https://x".into()),
             is_test: None,
             verbose: None,
+            user_agent: None,
         }
     }
 
@@ -3631,6 +3794,7 @@ mod tests {
             campaign_token: None,
             promise_id: Some("prom_123".into()),
             lead_id: None,
+            source: None,
             first_name: Some("John".into()),
             last_name: Some("Doe".into()),
             email: Some("j@example.com".into()),
@@ -3654,6 +3818,7 @@ mod tests {
             trusted_form_url: Some("https://x".into()),
             is_test: None,
             verbose: None,
+            user_agent: None,
         }
     }
 
@@ -3665,6 +3830,7 @@ mod tests {
             campaign_token: None,
             promise_id: None,
             lead_id: None,
+            source: None,
             first_name: Some("John".into()),
             last_name: Some("Doe".into()),
             email: Some("j@example.com".into()),
@@ -3688,6 +3854,7 @@ mod tests {
             trusted_form_url: Some("https://x".into()),
             is_test: None,
             verbose: None,
+            user_agent: None,
         }
     }
 

@@ -363,12 +363,18 @@ impl BuyerRouter {
                 ));
             }
             use crate::services::pulsar::PulsarService;
+            let ping_bid = self
+                .lead
+                .vertical_data
+                .get("winning_bid")
+                .and_then(|v| v.as_f64());
             let post_start = std::time::Instant::now();
             let result = PulsarService::route_post_direct_sync(
                 &self.lead,
                 campaign,
                 promise_id,
                 self.preloaded_qual_config.clone(),
+                ping_bid, // Two-step: use winning_bid from ping; fullpost path passes it from response
             );
             let post_duration = post_start.elapsed().as_millis() as u64;
 
@@ -886,6 +892,9 @@ impl BuyerRouter {
         if let Some(lead_id) = &self.lead.lead_id {
             lead_obj.insert("lead_id".to_string(), serde_json::json!(lead_id));
         }
+        if let Some(source) = &self.lead.website_url {
+            lead_obj.insert("source".to_string(), serde_json::json!(source));
+        }
 
         // Zip and IP (required for ping)
         if let Some(zip) = &self.lead.zip_encrypted {
@@ -950,6 +959,11 @@ impl BuyerRouter {
             );
         }
 
+        // Optional: user_agent (non-required; passed through to Carina/Pulsar)
+        if let Some(ua) = &self.lead.user_agent {
+            lead_obj.insert("user_agent".to_string(), serde_json::json!(ua));
+        }
+
         serde_json::json!({
             "lead": lead_obj
         })
@@ -990,6 +1004,9 @@ impl BuyerRouter {
 
         if let Some(lead_id) = &self.lead.lead_id {
             lead_obj.insert("lead_id".to_string(), serde_json::json!(lead_id));
+        }
+        if let Some(source) = &self.lead.website_url {
+            lead_obj.insert("source".to_string(), serde_json::json!(source));
         }
 
         // PII fields (only in post)
@@ -1072,6 +1089,11 @@ impl BuyerRouter {
                 "trusted_form_url".to_string(),
                 serde_json::json!(trusted_form_url),
             );
+        }
+
+        // Optional: user_agent (non-required; passed through to Carina/Pulsar)
+        if let Some(ua) = &self.lead.user_agent {
+            lead_obj.insert("user_agent".to_string(), serde_json::json!(ua));
         }
 
         serde_json::json!({

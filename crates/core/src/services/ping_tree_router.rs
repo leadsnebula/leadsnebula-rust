@@ -1225,9 +1225,12 @@ impl PingTreeRouter {
             "Winner campaign found"
         );
 
+        // Bid to show in ping response and to use as post price (two-step). Stored so post uses same price.
+        let winning_bid = winner_response.price.or(winner_response.bid);
         // Enqueue lead update with winner to background queue (non-blocking)
         // This removes 120-554ms sync DB write from critical path
         if let Some(queue) = &self.write_behind_queue {
+            let vertical_data = winning_bid.map(|bid| serde_json::json!({ "winning_bid": bid }));
             queue.enqueue(
                 crate::services::write_behind_queue::BackgroundTask::LeadUpdate {
                     lead_id: self.lead.uuid,
@@ -1239,7 +1242,7 @@ impl PingTreeRouter {
                     post_id: None,
                     sold_at: false,
                     inprog_token: None,
-                    vertical_data: None, // Auction timing stored separately after routing completes
+                    vertical_data, // winning_bid so two-step post uses same price as ping bid
                 },
             );
         } else {
@@ -1249,7 +1252,7 @@ impl PingTreeRouter {
                 winner_campaign,
                 winner_response.promise_id.as_deref().unwrap_or(""),
                 winner_response.ping_id.as_deref(),
-                winner_response.price,
+                winning_bid,
             )
             .await?;
         }
@@ -1265,6 +1268,7 @@ impl PingTreeRouter {
             "Ping auction routing completed (lead update enqueued to background)"
         );
 
+        // For ping, buyer returns bid (not price). Expose as lead.bid; same value stored as winning_bid for post.
         Ok(RoutingResult {
             success: winner_response.success,
             status: Self::map_ping_status_to_lead_status(
@@ -1275,7 +1279,7 @@ impl PingTreeRouter {
             promise_id: winner_response.promise_id,
             ping_id: winner_response.ping_id,
             post_id: winner_response.post_id,
-            price: winner_response.price,
+            price: winning_bid,
             campaign_id: Some(winner_campaign_id),
             buyer_id: Some(winner_campaign.buyer_id),
             per_buyer_timings: if per_buyer_timings.is_empty() {
@@ -2139,7 +2143,7 @@ impl PingTreeRouter {
         status: LeadStatus,
         error: Option<&str>,
     ) -> Result<()> {
-        if self.lead.status == LeadStatus::Processing {
+        if self.lead.status == LeadStatus::Processing || self.lead.status == LeadStatus::Test {
             let mut vertical_data = self.lead.vertical_data.clone();
             if let Some(err) = error {
                 if let Some(obj) = vertical_data.as_object_mut() {
@@ -2172,8 +2176,9 @@ impl PingTreeRouter {
         campaign: &Campaign,
         promise_id: &str,
         ping_id: Option<&str>,
-        _price: Option<f64>,
+        winning_bid: Option<f64>,
     ) -> Result<()> {
+        let vertical_data = winning_bid.map(|bid| serde_json::json!({ "winning_bid": bid }));
         sqlx::query(
             r#"
             UPDATE leads 
@@ -2182,8 +2187,9 @@ impl PingTreeRouter {
                 buyer_id = $3,
                 promise_id = $4,
                 ping_id = $5,
+                vertical_data = COALESCE(vertical_data, '{}'::jsonb) || COALESCE($6::jsonb, '{}'::jsonb),
                 updated_at = NOW()
-            WHERE uuid = $6
+            WHERE uuid = $7
             "#,
         )
         .bind(&LeadStatus::PingAccepted)
@@ -2191,6 +2197,7 @@ impl PingTreeRouter {
         .bind(campaign.buyer_id)
         .bind(promise_id)
         .bind(ping_id)
+        .bind(vertical_data.as_ref().map(sqlx::types::Json))
         .bind(self.lead.uuid)
         .execute(pool)
         .await?;

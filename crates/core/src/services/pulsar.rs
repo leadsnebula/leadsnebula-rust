@@ -141,13 +141,15 @@ impl PulsarService {
         })
     }
 
-    /// Direct call to Pulsar for post requests (bypasses HTTP)
+    /// Direct call to Pulsar for post requests (bypasses HTTP).
+    /// When `ping_bid` is Some, post price is set to that value (e.g. from the ping response so price equals bid).
     pub async fn route_post_direct(
         _pool: Arc<PgPool>,
         lead: &Lead,
         _campaign: &Campaign,
         promise_id: &str,
         qualification_config: Option<BuyerQualificationConfig>,
+        ping_bid: Option<f64>,
     ) -> Result<BuyerResponse> {
         let lead_id = lead
             .lead_id
@@ -197,13 +199,15 @@ impl PulsarService {
         // Logging removed - non-critical and spawn overhead eliminated
         // If logging is needed, it should be done via write-behind queue at caller level
 
+        let price = ping_bid.or_else(|| Some((rand::random::<u32>() % 200 + 100) as f64));
+
         Ok(BuyerResponse {
             success: true,
             status: "sold".to_string(),
             ping_id: None,
             post_id: Some(post_id),
             promise_id: Some(promise_id.to_string()),
-            price: Some((rand::random::<u32>() % 200 + 100) as f64),
+            price,
             bid: None, // Post responses don't have bid
             error: None,
             message: Some("Lead accepted and sold".to_string()),
@@ -233,10 +237,16 @@ impl PulsarService {
             .promise_id
             .ok_or_else(|| anyhow::anyhow!("Ping succeeded but no promise_id returned"))?;
 
-        // Then do post
-        let post_response =
-            Self::route_post_direct(pool, lead, campaign, &promise_id, qualification_config)
-                .await?;
+        // Then do post; use ping bid as post price so price always equals bid
+        let post_response = Self::route_post_direct(
+            pool,
+            lead,
+            campaign,
+            &promise_id,
+            qualification_config,
+            ping_response.bid,
+        )
+        .await?;
 
         // Return post response (which includes both ping_id and post_id)
         Ok(BuyerResponse {
@@ -298,8 +308,13 @@ impl PulsarService {
         // Then do post (sync)
         #[cfg(all(feature = "tracing", debug_assertions))]
         let post_start = std::time::Instant::now();
-        let post_response =
-            Self::route_post_direct_sync(lead, campaign, &promise_id, qualification_config)?;
+        let post_response = Self::route_post_direct_sync(
+            lead,
+            campaign,
+            &promise_id,
+            qualification_config,
+            ping_response.bid,
+        )?;
         #[cfg(all(feature = "tracing", debug_assertions))]
         {
             let post_duration = post_start.elapsed().as_millis() as u64;
@@ -410,14 +425,15 @@ impl PulsarService {
         })
     }
 
-    /// SYNC version: Direct call to Pulsar for post requests (bypasses HTTP, no async overhead)
-    /// Returns instantly with random price + UUID promise
+    /// SYNC version: Direct call to Pulsar for post requests (bypasses HTTP, no async overhead).
+    /// When `ping_bid` is Some, post price is set to that value (price equals bid).
     #[inline(always)]
     pub fn route_post_direct_sync(
         lead: &Lead,
         _campaign: &Campaign,
         promise_id: &str,
         qualification_config: Option<BuyerQualificationConfig>,
+        ping_bid: Option<f64>,
     ) -> Result<BuyerResponse> {
         #[cfg(all(feature = "tracing", debug_assertions))]
         let total_start = std::time::Instant::now();
@@ -479,14 +495,15 @@ impl PulsarService {
             );
         }
 
-        // Return instantly with random price
+        let price = ping_bid.or_else(|| Some((rand::random::<u32>() % 200 + 100) as f64));
+
         Ok(BuyerResponse {
             success: true,
             status: "sold".to_string(),
             ping_id: None,
             post_id: Some(post_id),
             promise_id: Some(promise_id.to_string()),
-            price: Some((rand::random::<u32>() % 200 + 100) as f64),
+            price,
             bid: None,
             error: None,
             message: Some("Lead accepted and sold".to_string()),
