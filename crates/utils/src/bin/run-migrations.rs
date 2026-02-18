@@ -50,11 +50,20 @@ async fn main() -> Result<()> {
             })?
     };
 
-    // Use a simpler pool configuration for migrations (only need 1 connection)
+    // Use a simpler pool configuration for migrations (only need 1 connection).
+    // Set statement_timeout high so migrations and cleanup don't hit server default (e.g. Neon 60s).
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .min_connections(0) // Don't pre-establish connections for migrations
         .acquire_timeout(Duration::from_secs(10))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET statement_timeout = '300000'") // 5 minutes in ms
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&database_url)
         .await?;
 
@@ -130,70 +139,64 @@ async fn run_migrations(pool: &PgPool, migrations_dir: &Path, _test_mode: bool) 
         info!("Warning: Could not proactively clean up migrations: {}", e);
     }
 
-    // Create migrator - SQLx will validate migration files match database state
-    // Retry once if we encounter modified/missing migration errors
-    let migrator = match Migrator::new(migrations_dir).await {
-        Ok(m) => m,
-        Err(e) => {
-            let error_msg = e.to_string();
+    // Create migrator - SQLx will validate migration files match database state.
+    // Loop: if "modified" migrations are detected, remove their records and retry (handles multiple modified).
+    const MAX_MIGRATOR_RETRIES: u32 = 25;
+    let mut attempts = 0u32;
+    let migrator = loop {
+        match Migrator::new(migrations_dir).await {
+            Ok(m) => break m,
+            Err(e) => {
+                attempts += 1;
+                let error_msg = e.to_string();
 
-            // If error is about modified or missing migrations, try to clean up and retry once
-            if error_msg.contains("was previously applied but is missing")
-                || error_msg.contains("was previously applied but has been modified")
-            {
-                info!("Cleaning up inconsistent migration records and retrying...");
+                if error_msg.contains("was previously applied but is missing") {
+                    return Err(anyhow::anyhow!(
+                        "Database has migration records for files that no longer exist. \
+                        Error: {}. \
+                        To fix: restore the missing migration file or remove the orphaned record from _sqlx_migrations.",
+                        error_msg
+                    ));
+                }
 
-                // Extract and remove modified migration versions
                 if error_msg.contains("was previously applied but has been modified") {
-                    // Try multiple patterns to extract version number
-                    let mut modified_versions: Vec<i64> = Vec::new();
-
-                    // Pattern 1: "migration 20250101000007 was previously applied"
-                    for part in error_msg.split("migration") {
-                        if let Some(version_str) = part.split_whitespace().next() {
-                            if let Ok(version) = version_str.parse::<i64>() {
-                                modified_versions.push(version);
-                                break; // Found it, no need to continue
-                            }
-                        }
+                    if attempts > MAX_MIGRATOR_RETRIES {
+                        return Err(anyhow::anyhow!(
+                            "Database has migration records for files that have been modified. \
+                            Auto-retry failed after {} attempts. Error: {}",
+                            MAX_MIGRATOR_RETRIES,
+                            error_msg
+                        ));
                     }
-
-                    // Pattern 2: Try regex-like extraction "migration <number>"
+                    let modified_versions = extract_all_modified_migration_versions(&error_msg);
                     if modified_versions.is_empty() {
-                        if let Some(start) = error_msg.find("migration ") {
-                            let rest = &error_msg[start + 10..]; // "migration " is 10 chars
-                            if let Some(end) = rest.find(' ') {
-                                if let Ok(version) = rest[..end].parse::<i64>() {
-                                    modified_versions.push(version);
-                                }
-                            }
-                        }
+                        return Err(anyhow::anyhow!(
+                            "Database has migration records for files that have been modified. Error: {}",
+                            error_msg
+                        ));
                     }
-
                     for version in &modified_versions {
-                        if let Err(e) =
+                        info!(
+                            "Removing stale record for modified migration {}...",
+                            version
+                        );
+                        if let Err(err) =
                             sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
                                 .bind(version)
                                 .execute(pool)
                                 .await
                         {
-                            info!("Warning: Could not remove migration {}: {}", version, e);
+                            info!("Warning: Could not remove migration {}: {}", version, err);
                         }
                     }
+                    if let Err(cleanup_err) =
+                        cleanup_inconsistent_migrations(pool, migrations_dir).await
+                    {
+                        info!("Warning: Could not clean up migrations: {}", cleanup_err);
+                    }
+                    continue;
                 }
 
-                // Clean up orphaned migrations
-                if let Err(cleanup_err) =
-                    cleanup_inconsistent_migrations(pool, migrations_dir).await
-                {
-                    info!("Warning: Could not clean up migrations: {}", cleanup_err);
-                }
-
-                // Retry once
-                Migrator::new(migrations_dir).await.map_err(|e| {
-                    anyhow::anyhow!("Failed to create migrator after cleanup: {}", e)
-                })?
-            } else {
                 return Err(anyhow::anyhow!("Failed to create migrator: {}", e));
             }
         }
@@ -275,19 +278,40 @@ async fn run_migrations_inner(pool: &PgPool, migrator: Migrator) -> Result<()> {
                     error_msg
                 ))
             } else if error_msg.contains("was previously applied but has been modified") {
-                // Attempt one automatic recovery: remove the stale checksum record
-                // for the modified migration version, then retry once.
-                if let Some(version) = extract_modified_migration_version(&error_msg) {
-                    info!(
-                        "Detected modified migration {}. Removing stale record and retrying once...",
-                        version
-                    );
-
-                    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
-                        .bind(version)
-                        .execute(pool)
-                        .await?;
-
+                // Loop: remove stale checksum record(s) for modified migration(s), then retry run().
+                const MAX_RUN_RETRIES: u32 = 25;
+                let mut run_attempts = 0u32;
+                let mut last_error_msg = error_msg.clone();
+                loop {
+                    run_attempts += 1;
+                    let modified_versions =
+                        extract_all_modified_migration_versions(&last_error_msg);
+                    if modified_versions.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Database has migration records for files that have been modified. \
+                            Error: {}. \
+                            To fix: revert the migration file or create a new migration.",
+                            last_error_msg
+                        ));
+                    }
+                    if run_attempts > MAX_RUN_RETRIES {
+                        return Err(anyhow::anyhow!(
+                            "Database has migration records for files that have been modified and auto-retry failed after {} attempts. \
+                            Last error: {}",
+                            MAX_RUN_RETRIES,
+                            last_error_msg
+                        ));
+                    }
+                    for version in &modified_versions {
+                        info!(
+                            "Detected modified migration {}. Removing stale record and retrying...",
+                            version
+                        );
+                        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+                            .bind(version)
+                            .execute(pool)
+                            .await?;
+                    }
                     match migrator.run(pool).await {
                         Ok(_) => {
                             let still_pending = check_pending_migrations(pool, &migrator).await?;
@@ -298,26 +322,22 @@ async fn run_migrations_inner(pool: &PgPool, migrator: Migrator) -> Result<()> {
                                     still_pending
                                 ));
                             }
-                            info!("✅ Migration retry succeeded after stale record cleanup");
-                            Ok(())
+                            info!("✅ Migration run succeeded after stale record cleanup");
+                            return Ok(());
                         }
-                        Err(retry_err) => Err(anyhow::anyhow!(
-                            "Database has migration records for files that have been modified and auto-retry failed. \
-                            Original error: {}. Retry error: {}. \
-                            To fix: either revert the migration file to its original state or create a new migration.",
-                            error_msg,
-                            retry_err
-                        )),
+                        Err(retry_err) => {
+                            last_error_msg = retry_err.to_string();
+                            if !last_error_msg
+                                .contains("was previously applied but has been modified")
+                            {
+                                return Err(anyhow::anyhow!(
+                                    "Migration run failed after cleanup: {}",
+                                    last_error_msg
+                                ));
+                            }
+                            continue;
+                        }
                     }
-                } else {
-                    Err(anyhow::anyhow!(
-                        "Database has migration records for files that have been modified. \
-                        This indicates a migration file was changed after being applied. \
-                        Error: {}. \
-                        To fix: either revert the migration file to its original state or \
-                        create a new migration to make the desired changes.",
-                        error_msg
-                    ))
                 }
             } else {
                 Err(anyhow::anyhow!("Migration failed: {}", e))
@@ -326,27 +346,44 @@ async fn run_migrations_inner(pool: &PgPool, migrator: Migrator) -> Result<()> {
     }
 }
 
-fn extract_modified_migration_version(error_msg: &str) -> Option<i64> {
-    // Pattern 1: "... migration 20260126000001 was previously applied ..."
-    for (idx, part) in error_msg.split_whitespace().enumerate() {
-        if part == "migration" {
-            let next = error_msg.split_whitespace().nth(idx + 1)?;
-            if let Ok(version) = next.parse::<i64>() {
-                return Some(version);
+/// Extract all migration version numbers mentioned in a "was previously applied but has been modified" error.
+/// Handles messages that mention one or more versions (e.g. after a retry).
+fn extract_all_modified_migration_versions(error_msg: &str) -> Vec<i64> {
+    let mut versions = Vec::new();
+    // Pattern: "migration 20250101000007 was ..." - collect every "migration <number>"
+    let mut search_start = 0;
+    while let Some(offset) = error_msg[search_start..].find("migration ") {
+        let start = search_start + offset + 10; // after "migration "
+        let rest = &error_msg[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if !rest[..end].is_empty() {
+            if let Ok(v) = rest[..end].parse::<i64>() {
+                versions.push(v);
             }
         }
+        search_start = start + end;
+        if search_start >= error_msg.len() {
+            break;
+        }
     }
-
-    // Pattern 2 fallback: first long integer in message
-    error_msg
-        .split(|c: char| !c.is_ascii_digit())
-        .find_map(|token| {
-            if token.len() >= 8 {
-                token.parse::<i64>().ok()
-            } else {
-                None
-            }
-        })
+    if versions.is_empty() {
+        // Fallback: first long integer (e.g. 14 digits)
+        if let Some(v) = error_msg
+            .split(|c: char| !c.is_ascii_digit())
+            .find_map(|token| {
+                if token.len() >= 8 {
+                    token.parse::<i64>().ok()
+                } else {
+                    None
+                }
+            })
+        {
+            versions.push(v);
+        }
+    }
+    versions
 }
 
 /// Clean up inconsistent migration records (for test mode only)

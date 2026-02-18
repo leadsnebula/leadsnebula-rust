@@ -244,8 +244,8 @@ async fn persist_failed_lead(
 ) -> Result<uuid::Uuid, sqlx::Error> {
     use rand::Rng;
 
-    // NOT NULL on leads.buyer_id/campaign_id (migration 20260112000004): resolve a campaign for this publisher's instance.
-    // Prefer campaign for this vertical; fallback to any campaign in the instance so error leads still persist when no vertical-specific campaign exists.
+    // Resolve a campaign for this publisher's instance so we can set buyer_id/campaign_id when present.
+    // If the instance has no campaign, we persist the error lead with NULL buyer_id/campaign_id so it still appears in the leads report.
     let instance_id: uuid::Uuid = sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT instance_id FROM publishers WHERE id = $1 AND deleted_at IS NULL",
     )
@@ -254,7 +254,7 @@ async fn persist_failed_lead(
     .await?
     .ok_or_else(|| sqlx::Error::ColumnNotFound("publisher instance".into()))?;
 
-    let (buyer_id, campaign_id): (uuid::Uuid, uuid::Uuid) =
+    let (buyer_id, campaign_id): (Option<uuid::Uuid>, Option<uuid::Uuid>) =
         match sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
             "SELECT buyer_id, id FROM campaigns WHERE instance_id = $1 AND vertical = $2 AND deleted_at IS NULL LIMIT 1",
         )
@@ -263,14 +263,15 @@ async fn persist_failed_lead(
         .fetch_optional(pool)
         .await?
         {
-            Some(row) => row,
+            Some(row) => (Some(row.0), Some(row.1)),
             None => sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
                 "SELECT buyer_id, id FROM campaigns WHERE instance_id = $1 AND deleted_at IS NULL LIMIT 1",
             )
             .bind(instance_id)
             .fetch_optional(pool)
             .await?
-            .ok_or_else(|| sqlx::Error::ColumnNotFound("campaign for instance".into()))?,
+            .map(|row| (Some(row.0), Some(row.1)))
+            .unwrap_or((None, None)),
         };
 
     let strategy = match request_type {
