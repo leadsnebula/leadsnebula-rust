@@ -125,6 +125,8 @@ jobs:
     env:
       NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
       NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+      # Balance test binary size vs debug info (1 = line info for backtraces, faster than full debug)
+      CARGO_PROFILE_TEST_DEBUG: 1
 
     steps:
       - uses: actions/checkout@v4
@@ -325,6 +327,9 @@ jobs:
   test-unit:
     name: Unit Tests
     runs-on: ubuntu-latest
+    env:
+      # Balance test binary size vs debug info (1 = line info for backtraces, faster than full debug)
+      CARGO_PROFILE_TEST_DEBUG: 1
     steps:
       - uses: actions/checkout@v4
         with:

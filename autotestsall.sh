@@ -1,11 +1,14 @@
 #!/bin/bash
-# autotestsall.sh - Fast, efficient test suite runner
+# autotestsall.sh - Test suite only (no fmt/clippy/audit/build).
 # - Single compilation phase (build everything once)
 # - Single test execution phase (nextest runs all tests in parallel)
 # - Full features enabled (matches CI)
 # - Optional Neon ephemeral branch
+#
 # Usage: ./autotestsall.sh [--no-neon]
-
+#
+# For pre-deployment validation (fmt, clippy, audit, config, unit tests, release build),
+# run validate.sh first, then this script.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

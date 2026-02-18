@@ -85,7 +85,7 @@ All deleted source files have been restored:
 2. ✅ **`crates/api/tests/integration_carina_e2e.rs`**
    - Full test file restored
    - Compiles correctly
-   - Tests are available via `autotests.sh`
+   - Tests are available via `autotestsall.sh`
 
 3. ✅ **`.github/workflows/rust-ci.yml`**
    - CI/CD workflow restored

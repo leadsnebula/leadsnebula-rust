@@ -1,9 +1,9 @@
 #!/bin/bash
-# Pre-commit validation script
-# Run this before every commit to ensure CI will pass
+# validate.sh - Pre-deployment / pre-commit validation (no integration tests).
+# Run before commit or deploy to catch fmt, clippy, audit, config, and release-build issues.
 #
 # Usage:
-#   ./validate.sh          # Validation checks (formatting, linting, unit tests, configs)
+#   ./validate.sh          # Validation checks (formatting, linting, unit tests, configs, release build)
 #
 # Environment variables (for WSL stability):
 #   SKIP_CLEANUP=true      # Skip incremental artifact cleanup (NOT recommended - corrupt artifacts cause crashes)
@@ -14,14 +14,14 @@
 #   ULTRA_SAFE_MODE=true   # Ultra-safe mode: skip all heavy operations (clippy, tests, build)
 #                          # Only runs: formatting, module checks, config validation
 #
-# This script focuses on CI-style validation checks:
-#   - Code formatting and linting
-#   - Unit tests (no database required)
+# This script focuses on pre-deployment validation (CI-style checks, no DB):
+#   - Code formatting and linting (fmt, clippy)
+#   - Unit tests only (no database required)
 #   - Config validation (Cargo.toml, Dockerfile, workflows, Fly.io)
-#   - Build verification
+#   - Release build verification
 #
-# For full test suite including database integration tests:
-#   ./autotests.sh          # Creates ephemeral DB and runs all tests
+# For the full test suite (integration tests with DB), run after validate.sh:
+#   ./autotestsall.sh      # Optional Neon ephemeral branch; runs Phase 1 + Phase 2 tests
 #
 # 💡 WSL Users: Script auto-detects WSL and applies safer defaults:
 #    - SKIP_RELEASE_BUILD=true (skips resource-intensive release build)
@@ -144,7 +144,7 @@ fi
 echo "🔍 Running pre-commit validation checks..."
 echo ""
 echo "   This script validates code quality and runs unit tests (no database required)."
-echo "   For full test suite including database integration tests, run: ./autotests.sh"
+echo "   For full test suite including database integration tests, run: ./autotestsall.sh"
 echo ""
 
 ERRORS=0
@@ -353,12 +353,12 @@ if [ "${SKIP_TESTS:-false}" = "true" ]; then
 else
     echo "4️⃣  Running unit tests (with --locked)..."
     echo "   Note: This script runs unit tests only. For full test suite including database"
-    echo "   integration tests, run: ./autotests.sh"
+    echo "   integration tests, run: ./autotestsall.sh"
     echo ""
     echo "   ⚠️  Database tests may fail with:"
     echo "      - Migration table race conditions (_sqlx_migrations does not exist)"
     echo "      - PoolTimedOut errors (tests taking >60 seconds)"
-    echo "      Run ./autotests.sh to catch these issues before pushing"
+    echo "      Run ./autotestsall.sh to catch these issues before pushing"
     echo ""
 
     if command -v cargo-nextest > /dev/null 2>&1; then

@@ -13,6 +13,10 @@ on:
         required: false
         default: false
         type: boolean
+      hotfix_confirm:
+        description: "When skip_tests is true, type 'yes' here to confirm"
+        required: false
+        type: string
 
 jobs:
   deploy:
@@ -42,7 +46,11 @@ jobs:
             fi
           fi
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.skip_tests }}" == "true" ]; then
-            echo "Hotfix mode: skip_tests=true. Ensure you have run tests locally (e.g. autotestsall.sh) before deploying."
+            if [ "${{ github.event.inputs.hotfix_confirm }}" != "yes" ]; then
+              echo "ERROR: When skip_tests is true you must type 'yes' in the hotfix_confirm input to confirm."
+              exit 1
+            fi
+            echo "Hotfix mode: skip_tests=true, confirmed. Ensure you have run tests locally (e.g. autotestsall.sh) before deploying."
           elif [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.skip_tests }}" != "true" ]; then
             echo "Manual run without skip_tests: Rust CI is not re-run; ensure main branch is green or run tests locally."
           fi

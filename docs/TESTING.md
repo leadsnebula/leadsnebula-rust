@@ -1,8 +1,18 @@
 # Testing
 
-## Canonical test suite
+## Separation of concerns
+
+- **`validate.sh`** – Pre-deployment / pre-commit validation only (no integration tests): fmt, clippy, unit tests, config checks, release build. Run before commit or before using deploy’s “skip_tests” hotfix path.
+- **`autotestsall.sh`** – Test suite only: full integration + unit tests (Phase 1 + Phase 2), with optional Neon ephemeral DB. No fmt/clippy/audit/build; run after or alongside validate.sh for a full local gate.
+
+## Canonical test suite (autotestsall.sh)
 
 **`autotestsall.sh`** is the canonical full test suite. CI (Rust CI workflow) mirrors this behavior.
+
+### Usage
+
+- **Tests only:** `./autotestsall.sh` or `./autotestsall.sh --no-neon` (if `DATABASE_URL` is already set).
+- **Full pre-deployment locally:** run `./validate.sh` then `./autotestsall.sh` (or `./autotestsall.sh --no-neon` if you already have a DB).
 
 ### Phases
 
@@ -23,5 +33,5 @@ Tests that take 30–40s each are **skipped** unless `RUN_HEAVY_TESTS=true` is s
 
 ### Local vs CI
 
-- **Local:** `./autotestsall.sh` (optionally `--no-neon` if `DATABASE_URL` is already set).
-- **CI:** One ephemeral Neon branch per run; Phase 1 then Phase 2; coverage is generated in the same job after tests.
+- **Local:** Pre-validation: `./validate.sh`. Tests: `./autotestsall.sh` (optionally `--no-neon`). Full gate: validate.sh then autotestsall.sh.
+- **CI:** Lint (fmt + clippy), unit tests, integration (one ephemeral Neon branch; Phase 1 then Phase 2), coverage, then build release on push to dev. Audit runs in a separate job.
