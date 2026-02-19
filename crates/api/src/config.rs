@@ -189,6 +189,24 @@ impl AppConfig {
         };
         database_url = Self::sanitize_database_url(&database_url);
 
+        // Log which DB we're using (host + dbname only) so Fly/deployed logs show instance routing
+        let db_hint = database_url
+            .rsplit_once('@')
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .map(|(host_port, path)| {
+                format!(
+                    "{} / {}",
+                    host_port.split(':').next().unwrap_or("?"),
+                    path.split('?').next().unwrap_or("?")
+                )
+            })
+            .unwrap_or_else(|| "?".to_string());
+        tracing::info!(
+            environment = %environment,
+            database = %db_hint,
+            "Database URL resolved (confirm dev vs prod DB for lead instance routing)"
+        );
+
         // Redis URL: Always use prod path for both environments (shared Redis instance)
         // In local development (when .env.local exists), use REDIS_URL from .env.local
         // In deployed environments (Fly.io), always use SSM (no REDIS_URL secrets in Fly.io)

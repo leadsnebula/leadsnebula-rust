@@ -3,9 +3,10 @@
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
 use serde_json::json;
-use utoipa::openapi::path::ParameterIn;
+use utoipa::openapi::path::{ParameterBuilder, ParameterIn};
 use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
 use utoipa::openapi::RefOr;
+use utoipa::openapi::Required;
 use utoipa::Modify;
 use utoipa::OpenApi;
 
@@ -109,12 +110,28 @@ HMAC signing is optional. It must be enabled in your instance; if enabled, the s
 )]
 pub struct ApiDoc;
 
-/// Modifier that sets `schema.default` for the X-API-Key header so Scalar's try-it modal pre-fills the value.
+/// Modifier that ensures the X-API-Key header parameter exists with a default so Scalar's try-it pre-fills it.
+/// Lead paths do not declare it in #[utoipa::path], so we add it to each operation.
 struct XApiKeyDefaultModifier;
+
+fn x_api_key_parameter() -> utoipa::openapi::path::Parameter {
+    ParameterBuilder::new()
+        .name("X-API-Key")
+        .parameter_in(ParameterIn::Header)
+        .required(Required::True)
+        .description(Some("Your publisher API key (required)."))
+        .schema(Some(Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .default(Some(json!(TEST_API_KEY)))
+                .build(),
+        )))
+        .build()
+}
 
 impl Modify for XApiKeyDefaultModifier {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        let default_value = json!(TEST_API_KEY);
+        let api_key_param = x_api_key_parameter();
         for (_path, path_item) in openapi.paths.paths.iter_mut() {
             for op in path_item
                 .get
@@ -127,24 +144,42 @@ impl Modify for XApiKeyDefaultModifier {
                 .chain(path_item.options.iter_mut())
                 .chain(path_item.trace.iter_mut())
             {
-                if let Some(params) = op.parameters.as_mut() {
-                    for param in params.iter_mut() {
-                        if param.name == "X-API-Key" && param.parameter_in == ParameterIn::Header {
-                            match param.schema.as_mut() {
-                                Some(RefOr::T(Schema::Object(obj))) => {
-                                    obj.default = Some(default_value.clone());
+                let has_api_key = op
+                    .parameters
+                    .as_ref()
+                    .map(|p| {
+                        p.iter()
+                            .any(|x| x.name == "X-API-Key" && x.parameter_in == ParameterIn::Header)
+                    })
+                    .unwrap_or(false);
+                if has_api_key {
+                    if let Some(params) = op.parameters.as_mut() {
+                        for param in params.iter_mut() {
+                            if param.name == "X-API-Key"
+                                && param.parameter_in == ParameterIn::Header
+                            {
+                                let default_value = json!(TEST_API_KEY);
+                                match param.schema.as_mut() {
+                                    Some(RefOr::T(Schema::Object(obj))) => {
+                                        obj.default = Some(default_value.clone());
+                                    }
+                                    _ => {
+                                        param.schema = Some(RefOr::T(Schema::Object(
+                                            ObjectBuilder::new()
+                                                .schema_type(Type::String)
+                                                .default(Some(default_value))
+                                                .build(),
+                                        )));
+                                    }
                                 }
-                                _ => {
-                                    param.schema = Some(RefOr::T(Schema::Object(
-                                        ObjectBuilder::new()
-                                            .schema_type(Type::String)
-                                            .default(Some(default_value.clone()))
-                                            .build(),
-                                    )));
-                                }
+                                break;
                             }
                         }
                     }
+                } else {
+                    let mut params = op.parameters.take().unwrap_or_default();
+                    params.insert(0, api_key_param.clone());
+                    op.parameters = Some(params);
                 }
             }
         }
@@ -657,7 +692,7 @@ fn post_leads_ping() {}
 #[utoipa::path(
     post,
     path = "/api/v1/leads/post",
-    request_body(content = DocLeadPostRequest, description = "Post request. Include lead_id and promise_id from the ping response. Set verbose at the top level (outside the lead body) if needed.", example = json!({
+    request_body(content = DocLeadPostRequest, description = "Post request. promise_id is required (from the ping response); lead_id is optional but recommended. Set verbose at the top level (outside the lead body) if needed.", example = json!({
         "verbose": false,
         "lead": {
             "request_properties": { "vertical": "solar", "is_test": false, "request_type": "post" },
@@ -722,7 +757,7 @@ fn post_leads_ping() {}
     ),
     tag = "Solar",
     summary = "Post",
-    description = "Post. Required fields are in the request body. Use lead_id and promise_id from the prior ping response."
+    description = "Post. Required: promise_id (from ping response). Optional: lead_id (recommended from ping)."
 )]
 #[allow(dead_code)]
 fn post_leads_post() {}

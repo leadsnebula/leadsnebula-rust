@@ -276,19 +276,22 @@ async fn test_update_publisher() -> sqlx::Result<()> {
 }
 
 #[tokio::test]
-async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
+async fn test_publisher_email_may_be_shared_by_active_publishers() -> sqlx::Result<()> {
     if !common::has_database_url() {
-        eprintln!("⚠️  DATABASE_URL not set - skipping test_publisher_email_uniqueness_for_active");
+        eprintln!(
+            "⚠️  DATABASE_URL not set - skipping test_publisher_email_may_be_shared_by_active_publishers"
+        );
         return Ok(());
     }
     let pool = create_test_pool()
         .await
         .expect("Failed to create test pool");
     let mut tx = pool.begin().await?;
-    // Test that active publishers cannot have duplicate emails
+    // After migration 20260218000003, multiple active publishers may share the same email
+    // (e.g. Only Solar and Only Solar Dev). Verify the second insert succeeds.
     let instance_user_id = create_test_instance_user(&mut *tx).await;
     let instance_id = Uuid::new_v4();
-    let email = format!("unique{}@example.com", Uuid::new_v4());
+    let email = format!("shared{}@example.com", Uuid::new_v4());
 
     // Create instance
     sqlx::query(
@@ -327,7 +330,7 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
     .execute(&mut *tx)
     .await?;
 
-    // Try to create second publisher with same email (should fail)
+    // Create second publisher with same email (allowed since publishers_email_unique_not_deleted was dropped)
     let api_key2 = format!("pk_test_{}", Uuid::new_v4());
     let encrypted_key2 = encryption_service
         .encrypt(&api_key2)
@@ -351,8 +354,8 @@ async fn test_publisher_email_uniqueness_for_active() -> sqlx::Result<()> {
     .execute(&mut *tx)
     .await;
 
-    // Should fail due to unique constraint
-    assert!(result.is_err());
+    // Should succeed: duplicate email for active publishers is allowed
+    result.expect("Second publisher with same email should be allowed");
 
     // Rollback transaction to prevent test data from persisting
     tx.rollback().await?;

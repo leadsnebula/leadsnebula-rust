@@ -304,7 +304,7 @@ async fn persist_failed_lead(
         INSERT INTO leads (
             uuid, event_id, lead_id, publisher_id, vertical_id, request_type, strategy, status,
             promise_id, tcpa_consent, tcpa_language, is_test, session_id, vertical_data,
-            buyer_id, campaign_id, post_id, submitted_at, created_at,
+            buyer_id, campaign_id, post_id, submitted_at, created_at, updated_at,
             first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted,
             street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
         ) VALUES (
@@ -1234,9 +1234,11 @@ async fn create_lead(
             )
             .await
             {
-                tracing::warn!(
-                    "Failed to persist validation-error lead for audit (lead will not appear in report): {}",
-                    e
+                tracing::error!(
+                    publisher_id = %publisher_id,
+                    missing_field = %field_owned,
+                    error = %e,
+                    "Failed to persist validation-error lead: lead will not appear in dashboard. Check DB constraints and that publisher.instance_id is correct for this API's DATABASE_URL."
                 );
             }
         });

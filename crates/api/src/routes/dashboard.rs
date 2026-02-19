@@ -1806,7 +1806,11 @@ async fn list_publishers(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!("Found {} publishers", publishers.len());
+    info!(
+        instance_id = %instance_id,
+        count = publishers.len(),
+        "list_publishers: found publishers for instance"
+    );
 
     // If there are publishers, fetch all publisher vertical associations in one query (avoid N+1)
     let mut publisher_verticals_map: std::collections::HashMap<uuid::Uuid, Vec<VerticalInfo>> =
