@@ -350,8 +350,9 @@ async fn persist_failed_lead(
         "response": response_json,
         "validation_error": ping_message,
     });
+    // request_payload_encrypted is NOT NULL in DB; use empty string for validation-error audit row
     sqlx::query(
-        "INSERT INTO ping_payloads (ping_id, lead_id, payload, created_at, updated_at) VALUES ($1::bigint, $2, $3, now(), now())",
+        "INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at, updated_at) VALUES ($1::bigint, $2, $3, '', now(), now())",
     )
     .bind(ping_db_id)
     .bind(lead_uuid)

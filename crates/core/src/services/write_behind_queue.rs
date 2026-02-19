@@ -1081,12 +1081,13 @@ impl WriteBehindQueue {
                     .await;
 
                     // If UPDATE affected 0 rows, INSERT a new row (handles race condition)
+                    // request_payload_encrypted is NOT NULL on some DBs; use '' when not available
                     if let Ok(rows_affected) = update_result {
                         if rows_affected.rows_affected() == 0 {
                             let _ = sqlx::query(
                                 r#"
-                                INSERT INTO ping_payloads (lead_id, payload, response_payload_encrypted, external_ping_id, created_at, updated_at)
-                                VALUES ($1, COALESCE($2::jsonb, 'null'::jsonb), $3, $4, NOW(), NOW())
+                                INSERT INTO ping_payloads (lead_id, payload, request_payload_encrypted, response_payload_encrypted, external_ping_id, created_at, updated_at)
+                                VALUES ($1, COALESCE($2::jsonb, 'null'::jsonb), '', $3, $4, NOW(), NOW())
                                 "#,
                             )
                             .bind(lead_id)
@@ -1117,13 +1118,13 @@ impl WriteBehindQueue {
                     .execute(pool)
                     .await;
 
-                    // If UPDATE affected 0 rows, INSERT a new row
+                    // If UPDATE affected 0 rows, INSERT a new row. request_payload_encrypted NOT NULL: use ''
                     if let Ok(rows_affected) = update_result {
                         if rows_affected.rows_affected() == 0 {
                             let _ = sqlx::query(
                                 r#"
-                                INSERT INTO ping_payloads (lead_id, payload, response_payload_encrypted, external_ping_id, created_at, updated_at)
-                                VALUES ($1, $2, $3, $4, NOW(), NOW())
+                                INSERT INTO ping_payloads (lead_id, payload, request_payload_encrypted, response_payload_encrypted, external_ping_id, created_at, updated_at)
+                                VALUES ($1, $2, '', $3, $4, NOW(), NOW())
                                 "#,
                             )
                             .bind(lead_id)
@@ -1142,8 +1143,8 @@ impl WriteBehindQueue {
                 {
                     let _ = sqlx::query(
                         r#"
-                        INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at)
-                        VALUES ($1, $2, $3, $4, $5, now())
+                        INSERT INTO post_payloads (lead_id, post_id, payload, request_payload_encrypted, response_payload_encrypted, created_at, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, now(), now())
                         "#,
                     )
                     .bind(lead_id)
@@ -1156,8 +1157,8 @@ impl WriteBehindQueue {
                 } else {
                     let _ = sqlx::query(
                         r#"
-                        INSERT INTO post_payloads (lead_id, post_id, payload, created_at)
-                        VALUES ($1, $2, $3, now())
+                        INSERT INTO post_payloads (lead_id, post_id, payload, created_at, updated_at)
+                        VALUES ($1, $2, $3, now(), now())
                         "#,
                     )
                     .bind(lead_id)
@@ -1293,12 +1294,12 @@ impl WriteBehindQueue {
                     INSERT INTO leads (
                         uuid, event_id, lead_id, publisher_id, vertical_id, request_type, strategy, status,
                         promise_id, tcpa_consent, tcpa_language, is_test, session_id, vertical_data,
-                        buyer_id, campaign_id, post_id, submitted_at, created_at,
+                        buyer_id, campaign_id, post_id, submitted_at, created_at, updated_at,
                         first_name_encrypted, last_name_encrypted, email_encrypted, cell_phone_encrypted,
                         street_address_encrypted, city_encrypted, state_encrypted, zip_encrypted, ip_address_encrypted
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                        $15, $16, $17, NOW(), NOW(),
+                        $15, $16, $17, NOW(), NOW(), NOW(),
                         $18, $19, $20, $21, $22, $23, $24, $25, $26
                     )
                     ON CONFLICT (lead_id) DO UPDATE SET
@@ -1537,9 +1538,9 @@ impl WriteBehindQueue {
                                 .unwrap_or_else(|_| "{}".to_string())
                         });
 
-                    // ping_payloads.ping_id is bigint (pings.id) in DB; use explicit cast so param is always bigint
+                    // ping_payloads: ping_id stored as text (VARCHAR); request_payload_encrypted and updated_at required for NOT NULL
                     let ping_payload_result = sqlx::query(
-                        "INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at) VALUES ($1::bigint, $2, $3, $4, now())"
+                        "INSERT INTO ping_payloads (ping_id, lead_id, payload, request_payload_encrypted, created_at, updated_at) VALUES ($1::bigint, $2, $3, $4, now(), now())"
                     )
                     .bind(ping_id_val as i64)
                     .bind(lead_uuid)
