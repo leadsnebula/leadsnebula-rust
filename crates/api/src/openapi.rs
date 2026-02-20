@@ -94,6 +94,12 @@ HMAC signing is optional. It must be enabled in your instance; if enabled, the s
             DocLeadPostDataNested,
             DocLeadFullpostRequest,
             DocLeadFullpostDataNested,
+            DocRequestProperties,
+            DocPublisherDataPingFullpost,
+            DocPublisherData,
+            DocConsumerData,
+            DocPropertyData,
+            DocCompliance,
             DocLeadResponse,
             DocStatusNode,
             DocLeadNode,
@@ -105,7 +111,7 @@ HMAC signing is optional. It must be enabled in your instance; if enabled, the s
         &XApiKeyDefaultModifier,
         &InlineLeadSchemaModifier,
         &AddJsonExampleModifier,
-        &ReorderRequestSchemaModifier
+        &SetRequiredModifier
     )
 )]
 pub struct ApiDoc;
@@ -217,62 +223,195 @@ impl Modify for InlineLeadSchemaModifier {
     }
 }
 
-/// Reorder request body schema: top-level verbose then lead; inside lead: request_properties, publisher_data, consumer_data, property_data, compliance.
-struct ReorderRequestSchemaModifier;
+/// Per-request-type inlined group schemas with `required` set (built with immutable access to components).
+#[derive(Clone)]
+struct InlinedLeadGroups {
+    request_properties: utoipa::openapi::schema::Object,
+    publisher_data: utoipa::openapi::schema::Object,
+    consumer_data: utoipa::openapi::schema::Object,
+    property_data: utoipa::openapi::schema::Object,
+    compliance: utoipa::openapi::schema::Object,
+}
 
-impl Modify for ReorderRequestSchemaModifier {
+/// Builds one set of inlined group schemas with required arrays set for the given request type.
+fn build_inlined_lead_groups(
+    components: &utoipa::openapi::Components,
+    request_type: &str,
+) -> Option<InlinedLeadGroups> {
+    let schemas = &components.schemas;
+    let clone_schema = |name: &str| {
+        schemas.get(name).and_then(|r| match r {
+            RefOr::T(Schema::Object(o)) => Some(o.clone()),
+            _ => None,
+        })
+    };
+    let mut request_properties = clone_schema("DocRequestProperties")?;
+    let publisher_schema_name = match request_type {
+        "post" => "DocPublisherData",
+        _ => "DocPublisherDataPingFullpost",
+    };
+    let mut publisher_data = clone_schema(publisher_schema_name)?;
+    let mut consumer_data = clone_schema("DocConsumerData")?;
+    let mut property_data = clone_schema("DocPropertyData")?;
+    let mut compliance = clone_schema("DocCompliance")?;
+
+    request_properties.required = vec!["vertical".to_string(), "request_type".to_string()];
+    compliance.required = vec![
+        "tcpa_consent".to_string(),
+        "tcpa_language".to_string(),
+        "trusted_form_url".to_string(),
+    ];
+    match request_type {
+        "ping" => {
+            publisher_data.required = vec!["publisher_id".to_string()];
+            consumer_data.required = vec![
+                "zip".to_string(),
+                "ip_address".to_string(),
+                "credit_rating".to_string(),
+            ];
+            property_data.required = vec![
+                "monthly_bill".to_string(),
+                "own_home".to_string(),
+                "roof_shade".to_string(),
+            ];
+        }
+        "post" => {
+            publisher_data.required = vec![
+                "publisher_id".to_string(),
+                "lead_id".to_string(),
+                "promise_id".to_string(),
+            ];
+            consumer_data.required = vec![
+                "first_name".to_string(),
+                "last_name".to_string(),
+                "email".to_string(),
+                "cell_phone".to_string(),
+                "street_address".to_string(),
+                "city".to_string(),
+                "state".to_string(),
+                "zip".to_string(),
+                "ip_address".to_string(),
+                "credit_rating".to_string(),
+            ];
+            property_data.required = vec![
+                "monthly_bill".to_string(),
+                "own_home".to_string(),
+                "roof_shade".to_string(),
+                "utility_provider".to_string(),
+                "property_type".to_string(),
+            ];
+        }
+        _ => {
+            // fullpost
+            publisher_data.required = vec!["publisher_id".to_string()];
+            consumer_data.required = vec![
+                "first_name".to_string(),
+                "last_name".to_string(),
+                "email".to_string(),
+                "cell_phone".to_string(),
+                "street_address".to_string(),
+                "city".to_string(),
+                "state".to_string(),
+                "zip".to_string(),
+                "ip_address".to_string(),
+                "credit_rating".to_string(),
+            ];
+            property_data.required = vec![
+                "monthly_bill".to_string(),
+                "own_home".to_string(),
+                "roof_shade".to_string(),
+                "utility_provider".to_string(),
+            ];
+        }
+    }
+    Some(InlinedLeadGroups {
+        request_properties,
+        publisher_data,
+        consumer_data,
+        property_data,
+        compliance,
+    })
+}
+
+/// Required fields per group, aligned with Carina validation in leads.rs `missing_required_lead_field`.
+/// Replaces refs with the provided inlined group schemas and sets lead.required.
+fn set_required_for_lead_groups(
+    lead: &mut utoipa::openapi::schema::Object,
+    inlined: InlinedLeadGroups,
+) {
+    lead.properties.insert(
+        "request_properties".to_string(),
+        RefOr::T(Schema::Object(inlined.request_properties)),
+    );
+    lead.properties.insert(
+        "publisher_data".to_string(),
+        RefOr::T(Schema::Object(inlined.publisher_data)),
+    );
+    lead.properties.insert(
+        "consumer_data".to_string(),
+        RefOr::T(Schema::Object(inlined.consumer_data)),
+    );
+    lead.properties.insert(
+        "property_data".to_string(),
+        RefOr::T(Schema::Object(inlined.property_data)),
+    );
+    lead.properties.insert(
+        "compliance".to_string(),
+        RefOr::T(Schema::Object(inlined.compliance)),
+    );
+}
+
+/// Ensures request and lead schemas have explicit `required` arrays so Scalar shows the "Required" badge.
+/// Top-level: verbose, lead. Lead object: the five groups. Each group: per-request-type required fields from Carina.
+struct SetRequiredModifier;
+
+impl Modify for SetRequiredModifier {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let components = match openapi.components.as_mut() {
             Some(c) => c,
             None => return,
         };
-        let schemas = &mut components.schemas;
-        let top_order = ["verbose", "lead"];
-        let lead_order = [
-            "request_properties",
-            "publisher_data",
-            "consumer_data",
-            "property_data",
-            "compliance",
+        let top_required = vec!["verbose".to_string(), "lead".to_string()];
+        let lead_required = vec![
+            "request_properties".to_string(),
+            "publisher_data".to_string(),
+            "consumer_data".to_string(),
+            "property_data".to_string(),
+            "compliance".to_string(),
         ];
-        for name in [
-            "DocLeadPingRequest",
-            "DocLeadPostRequest",
-            "DocLeadFullpostRequest",
-        ] {
-            if let Some(RefOr::T(Schema::Object(obj))) = schemas.get_mut(name) {
-                reorder_properties(obj, &top_order);
+        let request_types = [
+            ("DocLeadPingRequest", "ping"),
+            ("DocLeadPostRequest", "post"),
+            ("DocLeadFullpostRequest", "fullpost"),
+        ];
+        // Build inlined group schemas with required set (immutable access only).
+        let inlined_by_type: Option<[InlinedLeadGroups; 3]> = [
+            build_inlined_lead_groups(components, "ping"),
+            build_inlined_lead_groups(components, "post"),
+            build_inlined_lead_groups(components, "fullpost"),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .and_then(|v| v.try_into().ok());
+        let Some([inlined_ping, inlined_post, inlined_fullpost]) = inlined_by_type else {
+            return;
+        };
+        let schemas = &mut components.schemas;
+        for (idx, (name, _request_type)) in request_types.iter().enumerate() {
+            let inlined = match idx {
+                0 => inlined_ping.clone(),
+                1 => inlined_post.clone(),
+                _ => inlined_fullpost.clone(),
+            };
+            if let Some(RefOr::T(Schema::Object(obj))) = schemas.get_mut(*name) {
+                obj.required = top_required.clone();
                 if let Some(RefOr::T(Schema::Object(lead))) = obj.properties.get_mut("lead") {
-                    reorder_properties(lead, &lead_order);
+                    lead.required = lead_required.clone();
+                    set_required_for_lead_groups(lead, inlined);
                 }
             }
         }
-        for name in [
-            "DocLeadPingDataNested",
-            "DocLeadPostDataNested",
-            "DocLeadFullpostDataNested",
-        ] {
-            if let Some(RefOr::T(Schema::Object(obj))) = schemas.get_mut(name) {
-                reorder_properties(obj, &lead_order);
-            }
-        }
     }
-}
-
-fn reorder_properties(obj: &mut utoipa::openapi::schema::Object, order: &[&str]) {
-    use indexmap::IndexMap;
-    let mut props = std::mem::take(&mut obj.properties);
-    // IndexMap preserves insertion order so the doc UI and Try-it show the desired order.
-    let mut new_props: IndexMap<String, RefOr<Schema>> = IndexMap::new();
-    for key in order {
-        if let Some(v) = props.shift_remove(*key) {
-            new_props.insert((*key).to_string(), v);
-        }
-    }
-    for (k, v) in props {
-        new_props.insert(k, v);
-    }
-    obj.properties = new_props;
 }
 
 /// Add a "JSON" named example to each lead request body so users can pick a preformatted JSON body.
@@ -346,7 +485,6 @@ impl Modify for AddJsonExampleModifier {
 
 // ----- Nested group schemas (Try-it shows these as separate nodes) -----
 
-/// Request properties. Do not duplicate these at the top level of the request; they belong only in this group inside the lead body.
 #[derive(utoipa::ToSchema)]
 #[allow(dead_code)]
 pub struct DocRequestProperties {
@@ -361,6 +499,19 @@ pub struct DocRequestProperties {
     pub request_type: Option<String>,
 }
 
+/// Publisher data for ping and fullpost (no lead_id or promise_id).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct DocPublisherDataPingFullpost {
+    #[schema(example = "a1b2c3d4-e5f6-4780-a123-456789abcdef")]
+    pub publisher_id: Option<String>,
+    #[schema(example = "camp_john_doe_solar")]
+    pub campaign_token: Option<String>,
+    #[schema(example = "https://example.com/solar-form")]
+    pub source: Option<String>,
+}
+
+/// Publisher data for post (includes lead_id and promise_id from ping response).
 #[derive(utoipa::ToSchema)]
 #[allow(dead_code)]
 pub struct DocPublisherData {
@@ -368,13 +519,10 @@ pub struct DocPublisherData {
     pub publisher_id: Option<String>,
     #[schema(example = "camp_john_doe_solar")]
     pub campaign_token: Option<String>,
-    /// Omit on ping and fullpost (server generates and returns it). Required on post; use the value from the ping response.
     #[schema(example = json!(null))]
     pub lead_id: Option<String>,
-    /// Required on post only; use the value from the ping response.
     #[schema(example = json!(null))]
     pub promise_id: Option<String>,
-    /// Publisher website or traffic source URL (e.g. the page where the lead was captured). Optional; passed through when supported.
     #[schema(example = "https://example.com/solar-form")]
     pub source: Option<String>,
 }
@@ -403,6 +551,7 @@ pub struct DocConsumerData {
     pub credit_rating: Option<String>,
     #[schema(example = "192.168.1.1")]
     pub ip_address: Option<String>,
+    /// User-Agent header or client identifier. Optional.
     #[schema(example = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")]
     pub user_agent: Option<String>,
 }
@@ -458,7 +607,7 @@ pub struct DocLeadPingRequest {
 #[allow(dead_code)]
 pub struct DocLeadPingDataNested {
     pub request_properties: DocRequestProperties,
-    pub publisher_data: DocPublisherData,
+    pub publisher_data: DocPublisherDataPingFullpost,
     pub consumer_data: DocConsumerData,
     pub property_data: DocPropertyData,
     pub compliance: DocCompliance,
@@ -498,7 +647,7 @@ pub struct DocLeadFullpostRequest {
 #[allow(dead_code)]
 pub struct DocLeadFullpostDataNested {
     pub request_properties: DocRequestProperties,
-    pub publisher_data: DocPublisherData,
+    pub publisher_data: DocPublisherDataPingFullpost,
     pub consumer_data: DocConsumerData,
     pub property_data: DocPropertyData,
     pub compliance: DocCompliance,
@@ -845,37 +994,6 @@ fn find_request_body_example_span(spec: &str, path_key: &str) -> Option<(usize, 
     Some((open_brace, close_brace))
 }
 
-/// Skips whitespace from position; returns first index that is not whitespace.
-fn skip_whitespace(spec: &str, mut i: usize) -> usize {
-    let bytes = spec.as_bytes();
-    while i < bytes.len()
-        && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t')
-    {
-        i += 1;
-    }
-    i
-}
-
-/// Given index of opening `"` in JSON string, return index of closing `"` (handles backslash escapes).
-fn find_string_end(spec: &str, open: usize) -> Option<usize> {
-    let bytes = spec.as_bytes();
-    if open >= bytes.len() || bytes[open] != b'"' {
-        return None;
-    }
-    let mut i = open + 1;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2;
-            continue;
-        }
-        if bytes[i] == b'"' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Given index of `{` in JSON string, return index of matching `}`. Skips strings and nested braces.
 fn find_matching_brace(spec: &str, open: usize) -> Option<usize> {
     let bytes = spec.as_bytes();
@@ -909,100 +1027,6 @@ fn find_matching_brace(spec: &str, open: usize) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-/// Desired order of keys inside "lead" in request schemas (main page and Try-it).
-const LEAD_PROPERTY_ORDER: [&str; 5] = [
-    "request_properties",
-    "publisher_data",
-    "consumer_data",
-    "property_data",
-    "compliance",
-];
-
-/// Finds the byte range of the "properties" object that is the value of "lead" inside
-/// components.schemas.<schema_name>. Returns (start, end) inclusive.
-fn find_lead_properties_span(spec: &str, schema_name: &str) -> Option<(usize, usize)> {
-    let schema_key = format!("\"{}\"", schema_name);
-    let after_schema = spec.find(&schema_key)? + schema_key.len();
-    let after_lead_key = spec[after_schema..].find("\"lead\"")? + after_schema;
-    let after_props_key = spec[after_lead_key..].find("\"properties\"")? + after_lead_key;
-    let colon = spec[after_props_key..].find(':')? + after_props_key;
-    let open_brace = spec[colon + 1..].find('{')? + (colon + 1);
-    let close_brace = find_matching_brace(spec, open_brace)?;
-    Some((open_brace, close_brace))
-}
-
-/// Extracts a JSON value starting at the given position (after the key's colon). Returns (value slice, end index inclusive).
-fn extract_json_value(spec: &str, start: usize) -> Option<(&str, usize)> {
-    let start = skip_whitespace(spec, start);
-    let bytes = spec.as_bytes();
-    if start >= bytes.len() {
-        return None;
-    }
-    let end = match bytes[start] {
-        b'{' => find_matching_brace(spec, start)?,
-        b'"' => find_string_end(spec, start)?,
-        _ => return None,
-    };
-    Some((&spec[start..=end], end))
-}
-
-/// Reorders the "properties" object inside "lead" for each request schema so the main page
-/// (and any consumer that respects key order) shows: request_properties, publisher_data, consumer_data, property_data, compliance.
-fn reorder_lead_properties_in_spec(spec: &str) -> String {
-    const SCHEMA_NAMES: [&str; 3] = [
-        "DocLeadPingRequest",
-        "DocLeadPostRequest",
-        "DocLeadFullpostRequest",
-    ];
-    let mut spans: Vec<(usize, usize, String)> = Vec::new();
-    for &schema_name in &SCHEMA_NAMES {
-        let (props_start, props_end) = match find_lead_properties_span(spec, schema_name) {
-            Some(s) => s,
-            None => continue,
-        };
-        let content = &spec[props_start..=props_end];
-        let mut values: Vec<String> = Vec::new();
-        for &key in &LEAD_PROPERTY_ORDER {
-            let key_quoted = format!("\"{}\"", key);
-            let key_pattern = format!("{}:", key_quoted);
-            let pos_in_content = match content.find(&key_pattern) {
-                Some(p) => p,
-                None => continue,
-            };
-            let value_start_in_spec = props_start + pos_in_content + key_pattern.len();
-            let (value_slice, _) = match extract_json_value(spec, value_start_in_spec) {
-                Some(v) => v,
-                None => continue,
-            };
-            values.push(value_slice.to_string());
-        }
-        if values.len() != 5 {
-            continue;
-        }
-        let reordered = format!(
-            "{{\"{}\":{},\"{}\":{},\"{}\":{},\"{}\":{},\"{}\":{}}}",
-            LEAD_PROPERTY_ORDER[0],
-            values[0],
-            LEAD_PROPERTY_ORDER[1],
-            values[1],
-            LEAD_PROPERTY_ORDER[2],
-            values[2],
-            LEAD_PROPERTY_ORDER[3],
-            values[3],
-            LEAD_PROPERTY_ORDER[4],
-            values[4],
-        );
-        spans.push((props_start, props_end, reordered));
-    }
-    // Replace from end to start so indices stay valid.
-    spans.sort_by_key(|(s, _e, _)| std::cmp::Reverse(*s));
-    let mut out = spec.to_string();
-    for (start, end, replacement) in spans {
-        out.replace_range(start..=end, &replacement);
-    }
-    out
 }
 
 /// Replaces request-body examples in the serialized OpenAPI spec with pre-ordered JSON so the
@@ -1049,17 +1073,15 @@ pub async fn serve_scalar_html(_state: State<AppState>) -> impl IntoResponse {
     let openapi = ApiDoc::openapi();
     let spec_str = serde_json::to_string(&openapi).expect("OpenAPI serialization");
     let spec_str = replace_request_body_examples(&spec_str);
-    let spec_str = reorder_lead_properties_in_spec(&spec_str);
     let html = SCALAR_HTML_TEMPLATE.replace("$spec", &spec_str);
     Html(html)
 }
 
-/// Serves the OpenAPI spec as JSON at GET /documentation/openapi.json (same example and schema order as doc).
+/// Serves the OpenAPI spec as JSON at GET /documentation/openapi.json
 pub async fn serve_openapi_json(_state: State<AppState>) -> impl IntoResponse {
     let openapi = ApiDoc::openapi();
     let spec_str = serde_json::to_string(&openapi).expect("OpenAPI serialization");
     let spec_str = replace_request_body_examples(&spec_str);
-    let spec_str = reorder_lead_properties_in_spec(&spec_str);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1076,16 +1098,14 @@ mod tests {
     use utoipa::openapi::RefOr;
     use utoipa::openapi::Schema;
 
-    /// Asserts that after modifiers, the request body schemas have property order: verbose, lead;
-    /// and inside lead: request_properties, publisher_data, consumer_data, property_data, compliance.
+    /// Ensures request and lead schemas have required arrays so Scalar shows the Required badge.
     #[test]
-    fn openapi_request_schema_property_order() {
+    fn openapi_request_schema_required_arrays() {
         let openapi = ApiDoc::openapi();
         let components = openapi.components.as_ref().expect("components");
         let schemas = &components.schemas;
-
-        let top_order: &[&str] = &["verbose", "lead"];
-        let lead_order: &[&str] = &[
+        let top_required: &[&str] = &["verbose", "lead"];
+        let lead_required: &[&str] = &[
             "request_properties",
             "publisher_data",
             "consumer_data",
@@ -1101,22 +1121,35 @@ mod tests {
             let RefOr::T(Schema::Object(obj)) = schemas.get(req_name).expect(req_name) else {
                 panic!("{} is not an Object schema", req_name);
             };
-            let keys: Vec<&str> = obj.properties.keys().map(String::as_str).collect();
             assert_eq!(
-                keys.as_slice(),
-                top_order,
-                "{} top-level property order",
+                obj.required.as_slice(),
+                top_required,
+                "{} must have required [verbose, lead]",
                 req_name
             );
-
             let RefOr::T(Schema::Object(lead)) = obj.properties.get("lead").expect("lead") else {
                 panic!("{} lead is not an Object", req_name);
             };
-            let lead_keys: Vec<&str> = lead.properties.keys().map(String::as_str).collect();
+            assert!(
+                !lead.required.is_empty(),
+                "{} lead schema must have required array for Scalar Required badge",
+                req_name
+            );
             assert_eq!(
-                lead_keys.as_slice(),
-                lead_order,
-                "{} lead property order",
+                lead.required.as_slice(),
+                lead_required,
+                "{} lead required",
+                req_name
+            );
+            // Nested groups must have required arrays for individual fields (Scalar Required badge)
+            let RefOr::T(Schema::Object(compliance)) =
+                lead.properties.get("compliance").expect("compliance")
+            else {
+                panic!("{} lead.compliance is not an Object", req_name);
+            };
+            assert!(
+                !compliance.required.is_empty(),
+                "{} lead.compliance must have required array",
                 req_name
             );
         }
@@ -1137,26 +1170,6 @@ mod tests {
         assert!(
             modified.contains(PING_EXAMPLE_JSON),
             "embedded spec should contain PING_EXAMPLE_JSON verbatim"
-        );
-    }
-
-    /// Ensures the embedded spec has lead.properties in doc order so the main page shows
-    /// request_properties, publisher_data, consumer_data, property_data, compliance.
-    #[test]
-    fn embedded_spec_lead_properties_order() {
-        let openapi = ApiDoc::openapi();
-        let spec_str = serde_json::to_string(&openapi).expect("serialization");
-        let modified = reorder_lead_properties_in_spec(&spec_str);
-        // In components.schemas the lead.properties object should start with "request_properties".
-        let schema_marker = "\"DocLeadFullpostRequest\"";
-        let schema_pos = modified
-            .find(schema_marker)
-            .expect("spec has DocLeadFullpostRequest");
-        let rest = &modified[schema_pos..];
-        let lead_props_marker = r#""properties":{"request_properties":"#;
-        assert!(
-            rest.contains(lead_props_marker),
-            "after reorder, lead.properties should start with request_properties"
         );
     }
 }

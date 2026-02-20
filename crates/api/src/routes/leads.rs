@@ -131,7 +131,6 @@ fn missing_required_lead_field(lead: &LeadData, request_type: &str) -> Option<&'
                 ("tcpa_consent", lead.tcpa_consent.is_some()),
                 ("tcpa_language", lead.tcpa_language.is_some()),
                 ("credit_rating", lead.credit_rating.is_some()),
-                ("jornaya_lead_id", lead.jornaya_lead_id.is_some()),
                 ("trusted_form_url", lead.trusted_form_url.is_some()),
             ];
             for (name, present) in r {
@@ -161,7 +160,6 @@ fn missing_required_lead_field(lead: &LeadData, request_type: &str) -> Option<&'
                 ("credit_rating", lead.credit_rating.is_some()),
                 ("tcpa_consent", lead.tcpa_consent.is_some()),
                 ("tcpa_language", lead.tcpa_language.is_some()),
-                ("jornaya_lead_id", lead.jornaya_lead_id.is_some()),
                 ("trusted_form_url", lead.trusted_form_url.is_some()),
             ];
             for (name, present) in r {
@@ -184,7 +182,6 @@ fn missing_required_lead_field(lead: &LeadData, request_type: &str) -> Option<&'
                 ("credit_rating", lead.credit_rating.is_some()),
                 ("tcpa_consent", lead.tcpa_consent.is_some()),
                 ("tcpa_language", lead.tcpa_language.is_some()),
-                ("jornaya_lead_id", lead.jornaya_lead_id.is_some()),
                 ("trusted_form_url", lead.trusted_form_url.is_some()),
             ];
             for (name, present) in r {
@@ -226,9 +223,51 @@ fn validation_error_human_message(field: &str) -> String {
     }
 }
 
+/// Fetch PII encryption key from SSM (same derivation as fullpost path) for persisting error leads with PII.
+async fn fetch_pii_encryption_key(
+    ssm: &leadsnebula_core::ssm::SsmService,
+    environment: &str,
+) -> Option<Arc<Vec<u8>>> {
+    let env_norm = leadsnebula_core::normalize_env_for_ssm(environment);
+    let det_path = format!(
+        "/leadsnebula/{}/carina/encryption/deterministic_key_v1",
+        env_norm
+    );
+    let salt_path = format!(
+        "/leadsnebula/{}/carina/encryption/key_derivation_salt_v1",
+        env_norm
+    );
+    let det_key = get_ssm_parameter_cached(ssm, &det_path, true)
+        .await
+        .ok()
+        .flatten()?;
+    let salt = get_ssm_parameter_cached(ssm, &salt_path, true)
+        .await
+        .ok()
+        .flatten()?;
+    let derived =
+        leadsnebula_core::encryption::EncryptionService::derive_key_from_secret(&det_key, &salt);
+    Some(Arc::new(derived.to_vec()))
+}
+
+/// Encrypt a PII string when key is present; return None if key missing or value empty.
+fn encrypt_pii_opt(key: Option<&Arc<Vec<u8>>>, value: Option<&str>) -> Option<String> {
+    let key = key?;
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    leadsnebula_core::encryption::EncryptionService::encrypt_envelope(
+        key.as_ref().as_slice(),
+        value,
+        true,
+    )
+    .ok()
+}
+
 /// Persist a failed lead (any non-sold status) so it appears in the leads report with audit trail.
 /// Used for validation_error, publisher_mismatch, invalid_format, and any early failure where we have a vertical.
-/// Resolves buyer_id/campaign_id from any campaign for this vertical (required by NOT NULL constraints).
+/// When pii_encryption_key is Some, PII from lead_data is encrypted and stored so the lead details show real data (e.g. fullpost validation error).
 #[allow(clippy::too_many_arguments)]
 async fn persist_failed_lead(
     pool: &sqlx::PgPool,
@@ -241,8 +280,20 @@ async fn persist_failed_lead(
     status: LeadStatus,
     vertical_data: serde_json::Value,
     ping_message: &str,
+    pii_encryption_key: Option<Arc<Vec<u8>>>,
 ) -> Result<uuid::Uuid, sqlx::Error> {
     use rand::Rng;
+
+    let key_ref = pii_encryption_key.as_ref();
+    let first_name_encrypted = encrypt_pii_opt(key_ref, lead_data.first_name.as_deref());
+    let last_name_encrypted = encrypt_pii_opt(key_ref, lead_data.last_name.as_deref());
+    let email_encrypted = encrypt_pii_opt(key_ref, lead_data.email.as_deref());
+    let cell_phone_encrypted = encrypt_pii_opt(key_ref, lead_data.cell_phone.as_deref());
+    let street_address_encrypted = encrypt_pii_opt(key_ref, lead_data.street_address.as_deref());
+    let city_encrypted = encrypt_pii_opt(key_ref, lead_data.city.as_deref());
+    let state_encrypted = encrypt_pii_opt(key_ref, lead_data.state.as_deref());
+    let zip_encrypted = encrypt_pii_opt(key_ref, lead_data.zip.as_deref());
+    let ip_address_encrypted = encrypt_pii_opt(key_ref, lead_data.ip_address.as_deref());
 
     // Resolve a campaign for this publisher's instance so we can set buyer_id/campaign_id when present.
     // If the instance has no campaign, we persist the error lead with NULL buyer_id/campaign_id so it still appears in the leads report.
@@ -310,7 +361,7 @@ async fn persist_failed_lead(
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, $12, $13,
             $14, $15, '', NOW(), NOW(), NOW(),
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+            $16, $17, $18, $19, $20, $21, $22, $23, $24
         )
         "#,
     )
@@ -329,6 +380,15 @@ async fn persist_failed_lead(
     .bind(sqlx::types::Json(vertical_data))
     .bind(buyer_id)
     .bind(campaign_id)
+    .bind(&first_name_encrypted)
+    .bind(&last_name_encrypted)
+    .bind(&email_encrypted)
+    .bind(&cell_phone_encrypted)
+    .bind(&street_address_encrypted)
+    .bind(&city_encrypted)
+    .bind(&state_encrypted)
+    .bind(&zip_encrypted)
+    .bind(&ip_address_encrypted)
     .execute(&mut *tx)
     .await?;
 
@@ -365,6 +425,7 @@ async fn persist_failed_lead(
 }
 
 /// Persist a lead that failed validation (missing required field) so it appears in the leads report.
+/// Fetches PII encryption key from SSM when available so full lead data (e.g. fullpost) is stored.
 #[allow(clippy::too_many_arguments)]
 async fn persist_validation_error_lead(
     pool: &sqlx::PgPool,
@@ -375,12 +436,15 @@ async fn persist_validation_error_lead(
     missing_field: &str,
     request_body: &LeadRequest,
     response_body: &LeadResponse,
+    ssm: std::sync::Arc<leadsnebula_core::ssm::SsmService>,
+    environment: &str,
 ) -> Result<uuid::Uuid, sqlx::Error> {
     let human_message = validation_error_human_message(missing_field);
     let vertical_data = serde_json::json!({
         "validation_error": human_message,
         "missing_field": missing_field,
     });
+    let pii_key = fetch_pii_encryption_key(ssm.as_ref(), environment).await;
     persist_failed_lead(
         pool,
         publisher_id,
@@ -392,6 +456,7 @@ async fn persist_validation_error_lead(
         LeadStatus::Error,
         vertical_data,
         &human_message,
+        pii_key,
     )
     .await
 }
@@ -1091,6 +1156,7 @@ async fn create_lead(
                         LeadStatus::Error,
                         vertical_data,
                         msg.as_str(),
+                        None,
                     )
                     .await
                     {
@@ -1166,6 +1232,7 @@ async fn create_lead(
                     LeadStatus::Error,
                     vertical_data,
                     msg.as_str(),
+                    None,
                 )
                 .await
                 {
@@ -1222,6 +1289,8 @@ async fn create_lead(
         let field_owned = field.to_string();
         let request_body_clone = request_body.clone();
         let response_body_clone = response_body.clone();
+        let ssm = state.ssm.clone();
+        let environment = state.config.environment.clone();
         tokio::spawn(async move {
             if let Err(e) = persist_validation_error_lead(
                 pool.as_ref(),
@@ -1232,6 +1301,8 @@ async fn create_lead(
                 &field_owned,
                 &request_body_clone,
                 &response_body_clone,
+                ssm,
+                &environment,
             )
             .await
             {
